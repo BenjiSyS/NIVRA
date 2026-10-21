@@ -33,6 +33,10 @@ export default function Generate() {
   const [cfg, setCfg] = useState(3)
   const [fps, setFps] = useState(8)
   const [upscale, setUpscale] = useState(4)
+  const [width, setWidth] = useState(0)
+  const [height, setHeight] = useState(0)
+  const [seconds, setSeconds] = useState(0)
+  const [sampler, setSampler] = useState('')
 
   const models = store.models
   const active = models.find((m) => m.active)
@@ -66,7 +70,7 @@ export default function Generate() {
 
   const submit = async () => {
     const r = await run(
-      () => api.post<{ job_id: string }>(`${pbase(pid)}/generate`, { prompt: prompt.trim(), seed, steps, cfg_scale: cfg, fps, upscale, model_version: model || undefined }),
+      () => api.post<{ job_id: string }>(`${pbase(pid)}/generate`, { prompt: prompt.trim(), seed, steps, cfg_scale: cfg, fps, upscale, model_version: model || undefined, width: width || undefined, height: height || undefined, seconds: seconds || undefined, sampler: sampler || undefined }),
       'Generation queued',
     )
     if (r) {
@@ -109,7 +113,11 @@ export default function Generate() {
           <Field label="Steps" hint="1 to 200">{(id) => <input id={id} className="input" type="number" min={1} max={200} value={steps} onChange={(e) => setSteps(+e.target.value || 1)} />}</Field>
           <Field label="Guidance (cfg)" hint="0 to 20">{(id) => <input id={id} className="input" type="number" min={0} max={20} step={0.5} value={cfg} onChange={(e) => setCfg(+e.target.value)} />}</Field>
           <Field label="Frames per second" hint="1 to 60">{(id) => <input id={id} className="input" type="number" min={1} max={60} value={fps} onChange={(e) => setFps(+e.target.value || 1)} />}</Field>
-          <Field label="Upscale" hint="Pixel scale 1 to 8">{(id) => <input id={id} className="input" type="number" min={1} max={8} value={upscale} onChange={(e) => setUpscale(+e.target.value || 1)} />}</Field>
+          <Field label="Upscale" hint="Small models only: pixel scale 1 to 8">{(id) => <input id={id} className="input" type="number" min={1} max={8} value={upscale} onChange={(e) => setUpscale(+e.target.value || 1)} />}</Field>
+          <Field label="Width (HD)" hint="HD models: 0 = model default (1280)">{(id) => <input id={id} className="input" type="number" min={0} max={1920} step={32} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
+          <Field label="Height (HD)" hint="HD models: 0 = model default (720)">{(id) => <input id={id} className="input" type="number" min={0} max={1088} step={32} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
+          <Field label="Seconds (HD)" hint="HD models: 0 = model default (8)">{(id) => <input id={id} className="input" type="number" min={0} max={30} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
+          <Field label="Sampler (HD)" hint="ab2 needs fewer steps">{(id) => <select id={id} className="input" value={sampler} onChange={(e) => setSampler(e.target.value)}><option value="">default</option><option value="ab2">ab2</option><option value="euler">euler</option></select>}</Field>
         </div>
         <div className="row">
           <button className="btn primary" disabled={!can('operator') || busy || !prompt.trim() || !model}>Generate</button>

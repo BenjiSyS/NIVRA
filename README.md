@@ -143,6 +143,31 @@ See [QUICKSTART.md](QUICKSTART.md) — where everything lives, start/stop, addin
 
 ## 8. Windows Installation
 
+### One file: `Nivra-Setup.bat` (recommended for other people)
+
+Send someone only [`Nivra-Setup.bat`](Nivra-Setup.bat). Double-clicking it:
+
+1. installs Git with winget if it is missing (it asks first),
+2. clones Nivra into `%USERPROFILE%\Nivra` (or the folder given as the first argument),
+3. installs missing tools with winget (Go and Node.js to build, Python 3.12 to run the model),
+4. detects the hardware: an NVIDIA GPU gets CUDA PyTorch, matched to the GPU generation; anything
+   else gets CPU PyTorch,
+5. builds `Nivra.exe` in the Nivra folder and adds Desktop and Start menu shortcuts.
+
+Running it again updates Nivra (`git pull`) and rebuilds. `NIVRA_SETUP_YES=1` answers every question
+with yes. Nothing starts automatically at boot.
+
+**The Nivra App (`Nivra.exe`)** opens a window where you type a prompt and the video comes back as the
+reply, like a chat. It is not a chatbot: the text goes to the video model. The first time, enter the
+controller URL and a personal API token (Studio → Settings → API tokens). Generation runs on whichever
+worker computer the controller picks (one controller, many workers), so a laptop without a GPU can
+still use a GPU computer elsewhere. The same window has **This computer as a worker**: enroll it with a
+project code and it trains and generates for everyone too. It only gets jobs that fit its RAM/VRAM
+budget, so HD jobs that need a GPU never land on a CPU-only computer. Closing the window or
+**Quit Nivra** stops the app and this computer's worker. Details: [docs/getting-started/APP_UI.md](docs/getting-started/APP_UI.md).
+
+### Manual
+
 1. Install Git (optional) and download/clone Nivra.
 2. Double-click `install.bat` and choose **2 — Worker** (or **1 — Controller** if you have PostgreSQL).
 3. Answer whether to enable AI jobs (installs CPU or CUDA PyTorch into `%LOCALAPPDATA%\Nivra\venv`).

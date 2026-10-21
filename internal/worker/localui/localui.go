@@ -29,6 +29,8 @@ type Server struct {
 	A   *agent.Agent
 	UI  fs.FS
 	Log *slog.Logger
+	// App, when set, serves the Nivra App (chat-style generation) at /app.
+	App *App
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -151,9 +153,15 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, 200, s.A.Status())
 	})
+	if s.App != nil {
+		s.App.Register(mux)
+	}
 	mux.HandleFunc("/local/api/", func(w http.ResponseWriter, r *http.Request) { writeErr(w, 404, "no such route") })
 	if s.UI != nil {
 		mux.Handle("/", spa(s.UI, "worker.html"))
+		app := spa(s.UI, "app.html")
+		mux.Handle("GET /app", app)
+		mux.Handle("GET /app/", app)
 	}
 	return s.guard(mux)
 }

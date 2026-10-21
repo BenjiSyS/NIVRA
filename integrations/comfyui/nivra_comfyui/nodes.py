@@ -61,6 +61,19 @@ def _bundles() -> list[str]:
     return out or ["(no Nivra bundles in models/nivra)"]
 
 
+def _import_hd():
+    _import_nivra()
+    from nivra.inference import hd_bundle
+    return hd_bundle
+
+
+def _is_hd_dir(path: str) -> bool:
+    try:
+        return _import_hd().read_manifest_if_hd(os.path.join(path, "model_version.json")) is not None
+    except ImportError:
+        return False
+
+
 def _devices() -> list[str]:
     devs = ["auto", "cpu"]
     if torch.cuda.is_available():
@@ -81,8 +94,9 @@ def _frames_to_image(frames_u8: np.ndarray) -> torch.Tensor:
 class NivraModel:
     """Loaded bundle plus the device it lives on."""
 
-    def __init__(self, bundle, device: str, name: str):
-        self.bundle, self.device, self.name = bundle, device, name
+    def __init__(self, bundle, device: str, name: str, is_hd: bool = False):
+        # bundle: nivra.inference.bundle.Bundle (small) or nivra.inference.hd.HDPipeline (is_hd)
+        self.bundle, self.device, self.name, self.is_hd = bundle, device, name, is_hd
 
 
 class NivraModelLoader:
@@ -100,11 +114,12 @@ class NivraModelLoader:
         if not os.path.isdir(path):
             raise ValueError(f"Nivra bundle not found: {path}. Put a bundle directory into models/nivra/.")
         dev = _resolve_device(device)
+        hd = _is_hd_dir(path)
         try:
-            b = nb.load_bundle(path, device=dev)
+            b = _import_hd().load_hd_bundle(path, device=dev) if hd else nb.load_bundle(path, device=dev)
         except nb.BundleError as e:
             raise ValueError(f"Invalid or incompatible Nivra bundle '{bundle}': {e}") from e
-        return (NivraModel(b, dev, bundle),)
+        return (NivraModel(b, dev, bundle, hd),)
 
 
 class NivraTextToVideo:
@@ -122,9 +137,23 @@ class NivraTextToVideo:
             "steps": ("INT", {"default": 30, "min": 1, "max": 200}),
             "cfg_scale": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             "decode_tile": ("INT", {"default": 0, "min": 0, "max": 16}),
+        }, "optional": {
+            # HD models only (0 / "model default" = the bundle's own default); ignored for small models
+            "width": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 8}),
+            "height": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 8}),
+            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 60.0, "step": 0.1}),
+            "fps": ("INT", {"default": 0, "min": 0, "max": 60}),
+            "sampler": (["model default", "euler", "ab2"],),
         }}
 
-    def run(self, model, prompt, seed, steps, cfg_scale, decode_tile):
+    def run(self, model, prompt, seed, steps, cfg_scale, decode_tile, width=0, height=0, seconds=0.0, fps=0,
+            sampler="model default"):
+        if getattr(model, "is_hd", False):
+            kw = {k: v for k, v in (("width", width), ("height", height), ("seconds", seconds), ("fps", fps)) if v}
+            if sampler in ("euler", "ab2"):
+                kw["sampler"] = sampler
+            res = model.bundle.generate(prompt, seed=seed, steps=steps, cfg_scale=cfg_scale, **kw)
+            return (_frames_to_image(res.frames), res.state)
         _, ng, _ = _import_nivra()
         res = ng.generate(model.bundle, prompt, seed=seed, steps=steps, cfg_scale=cfg_scale, tile=decode_tile, device=model.device)
         if res.meta.get("unknown_words"):
@@ -150,6 +179,8 @@ class NivraImageToVideo:
         }}
 
     def run(self, model, image, prompt, seed, steps, cfg_scale):
+        if getattr(model, "is_hd", False):
+            raise ValueError("Nivra Image-to-Video is not available for HD models yet")
         _, ng, _ = _import_nivra()
         size = model.bundle.cfg["data"]["size"]
         img = image[0]  # first image of the batch, [H,W,3] 0..1
@@ -177,6 +208,9 @@ class NivraVideoContinuation:
         }}
 
     def run(self, model, state, known_latent_frames, prompt=""):
+        if getattr(model, "is_hd", False):
+            res = model.bundle.continue_video(state, prompt=prompt or None, known_latent_frames=known_latent_frames)
+            return (_frames_to_image(res.frames), res.state)
         _, ng, _ = _import_nivra()
         res = ng.continue_video(model.bundle, state, prompt=prompt or None, known_latent_frames=known_latent_frames, device=model.device)
         return (_frames_to_image(res.frames), res.state)

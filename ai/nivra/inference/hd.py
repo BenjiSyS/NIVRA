@@ -321,6 +321,9 @@ class HDPipeline:
             raise StateError(f"state used text encoder {state.vocab_hash}, pipeline has {self.text_encoder.id}")
         K = min(int(known_latent_frames), state.recent_latents.shape[1])
         known = state.recent_latents[:, -K:]
+        if kw.get("width") is None and kw.get("height") is None:     # keep the previous segment's (padded) frame size
+            sf = self.vae.cfg.spatial_factor
+            kw["height"], kw["width"] = state.recent_latents.shape[2] * sf, state.recent_latents.shape[3] * sf
         kw.setdefault("steps", state.steps)
         kw.setdefault("cfg_scale", state.cfg_scale)
         res = self.generate(state.prompt if prompt is None else prompt,

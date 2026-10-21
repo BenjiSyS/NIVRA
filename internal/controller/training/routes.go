@@ -263,7 +263,7 @@ func (s *Service) handleCheckpoints(w http.ResponseWriter, req *http.Request, a 
 func (s *Service) handleModels(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
 	rows, err := s.d.DB.Query(req.Context(), `SELECT v.id, v.run_id::text, COALESCE(NULLIF(v.display_name, ''), r.name), v.architecture_id, v.version_number, v.parent_version::text,
 			v.weights_artifact::text, v.manifest_artifact::text, v.verification_state, v.created_at, COALESCE(m.parameter_count, 0),
-			p.active_model_version = v.id
+			p.active_model_version = v.id, COALESCE(v.manifest->>'family', '')
 		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id LEFT JOIN model_architectures m ON m.id=v.architecture_id
 		JOIN projects p ON p.id=v.project_id
 		WHERE v.project_id=$1 ORDER BY v.created_at DESC LIMIT 500`, a.ProjectID)
@@ -279,10 +279,11 @@ func (s *Service) handleModels(w http.ResponseWriter, req *http.Request, a *api.
 		var created time.Time
 		var params int64
 		var active *bool
-		if rows.Scan(&id, &run, &rname, &arch, &num, &parent, &wts, &man, &verif, &created, &params, &active) == nil {
+		var family string
+		if rows.Scan(&id, &run, &rname, &arch, &num, &parent, &wts, &man, &verif, &created, &params, &active, &family) == nil {
 			out = append(out, map[string]any{"id": id, "run_id": run, "run_name": rname, "architecture": arch, "version_number": num,
 				"parent_version": parent, "weights_artifact": wts, "manifest_artifact": man, "verification_state": verif,
-				"created_at": created, "parameter_count": params, "active": active != nil && *active})
+				"created_at": created, "parameter_count": params, "active": active != nil && *active, "family": family})
 		}
 	}
 	rows.Close()
@@ -365,6 +366,47 @@ func (s *Service) versionInputs(ctx context.Context, projectID, versionID string
 	return []protocol.ArtifactRef{{ID: *wts, Role: "weights"}, {ID: *man, Role: "manifest"}, {ID: *vae, Role: "vae_weights"}}, versionID, nil
 }
 
+// modelReq are scheduling requirements derived from a model version's manifest.
+type modelReq struct {
+	HD     bool
+	RAMMB  int
+	VRAMMB int
+}
+
+// modelRequirements reads family/min_vram_mb from the manifest so HD jobs go
+// only to workers whose GPU budget can run them.
+func (s *Service) modelRequirements(ctx context.Context, versionID string) modelReq {
+	out := modelReq{RAMMB: 1024}
+	var raw []byte
+	if err := s.d.DB.QueryRow(ctx, `SELECT manifest FROM model_versions WHERE id=$1`, versionID).Scan(&raw); err != nil {
+		return out
+	}
+	var m struct {
+		Family    string  `json:"family"`
+		MinVRAMMB float64 `json:"min_vram_mb"`
+		MinRAMMB  float64 `json:"min_ram_mb"`
+		Params    float64 `json:"param_count"`
+		VAEParams float64 `json:"vae_param_count"`
+	}
+	_ = json.Unmarshal(raw, &m)
+	if m.Family == "hd" {
+		out.HD = true
+		out.VRAMMB = int(m.MinVRAMMB)
+		out.RAMMB = hdRAMMB(m.Params, m.VAEParams)
+		if m.MinRAMMB > 0 {
+			out.RAMMB = int(m.MinRAMMB)
+		}
+	}
+	return out
+}
+
+// hdRAMMB estimates host RAM for an HD generation: the DiT and VAE loaded in
+// fp32 (the CPU path; GPU workers stage weights through RAM too) with 25%
+// headroom, plus 1 GiB for Python, the text encoder and video encoding.
+func hdRAMMB(params, vaeParams float64) int {
+	return 1024 + int((params+vaeParams)*4*1.25/(1<<20))
+}
+
 func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *api.Router, a *api.AdminCtx) {
 	var body struct {
 		Prompt       string  `json:"prompt"`
@@ -374,6 +416,11 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 		FPS          int     `json:"fps"`
 		Upscale      int     `json:"upscale"`
 		ModelVersion string  `json:"model_version"`
+		// HD models only (ignored by small models).
+		Width   int     `json:"width"`
+		Height  int     `json:"height"`
+		Seconds float64 `json:"seconds"`
+		Sampler string  `json:"sampler"`
 	}
 	if err := api.DecodeJSON(w, req, 8192, &body); err != nil {
 		api.WriteErr(w, 400, protocol.ErrBadRequest, "malformed request")
@@ -398,13 +445,33 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 	if body.FPS > 0 {
 		params["fps"] = body.FPS
 	}
-	if body.Upscale > 0 {
+	req2 := s.modelRequirements(req.Context(), mv)
+	if req2.HD {
+		// HD bundles: native resolution/duration, no nearest-neighbour upscale.
+		if body.Width < 0 || body.Width > 1920 || body.Height < 0 || body.Height > 1088 || body.Seconds < 0 || body.Seconds > 30 {
+			api.WriteErr(w, 400, protocol.ErrValidation, "width <= 1920, height <= 1088, seconds <= 30")
+			return
+		}
+		if body.Width > 0 {
+			params["width"] = body.Width
+		}
+		if body.Height > 0 {
+			params["height"] = body.Height
+		}
+		if body.Seconds > 0 {
+			params["seconds"] = body.Seconds
+		}
+		if body.Sampler == "euler" || body.Sampler == "ab2" {
+			params["sampler"] = body.Sampler
+		}
+	} else if body.Upscale > 0 {
 		params["upscale"] = body.Upscale
 	}
 	pb, _ := json.Marshal(params)
 	uid := a.Session.User.ID
 	id, err := s.sched.Create(req.Context(), nil, scheduler.NewJob{ProjectID: a.ProjectID, JobType: "ai.generate", Params: pb, Inputs: inputs,
-		ModelVersion: &mv, Priority: 20, ReqRAMMB: 1024, LeaseSeconds: 600, CreatedBy: &uid})
+		ModelVersion: &mv, Priority: 20, ReqRAMMB: req2.RAMMB, ReqVRAMMB: req2.VRAMMB, ReqGPU: req2.VRAMMB > 0,
+		LeaseSeconds: 900, CreatedBy: &uid})
 	if err != nil {
 		api.WriteErr(w, 400, protocol.ErrValidation, err.Error())
 		return

@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// Two HTML entries (Studio and Worker) share code in src/shared.
+// Three HTML entries (Studio, Worker and App) share code in src/shared.
 // The Go binaries embed internal/webui/dist, so the build writes there.
 export default defineConfig({
   plugins: [react()],
@@ -12,7 +12,7 @@ export default defineConfig({
     sourcemap: false,
     modulePreload: { polyfill: false }, // no inline script injection (strict CSP)
     rollupOptions: {
-      input: { studio: 'studio.html', worker: 'worker.html' },
+      input: { studio: 'studio.html', worker: 'worker.html', app: 'app.html' },
     },
   },
   server: {

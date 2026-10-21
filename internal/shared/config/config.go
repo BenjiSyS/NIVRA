@@ -83,7 +83,7 @@ func DefaultController() Controller {
 		DisconnectAfterMissed:   3,
 		SessionTTLMinutes:       60,
 		AdminSessionTTLHours:    12,
-		MaxUploadBytes:          2 << 30,
+		MaxUploadBytes:          16 << 30, // HD model weights reach several GB
 		UploadBytesPerSec:       0,
 		MaxConcurrentUploads:    8,
 		WorkerMetricsRetainDays: 7,

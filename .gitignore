@@ -41,3 +41,4 @@ controller-secrets.json
 Thumbs.db
 .idea/
 .vscode/
+/logs/

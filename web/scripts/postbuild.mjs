@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 const dist = new URL('../../internal/webui/dist/', import.meta.url)
 writeFileSync(new URL('.keep', dist), '')
-for (const f of ['studio.html', 'worker.html']) {
+for (const f of ['studio.html', 'worker.html', 'app.html']) {
   if (!existsSync(new URL(f, dist))) {
     console.error(`build output is missing ${f} in ${fileURLToPath(dist)}`)
     process.exit(1)

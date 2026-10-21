@@ -57,6 +57,7 @@ Usage:
   nivra generate             --bundle DIR --prompt TEXT [--out clip.mp4]            (runs on this computer)
   nivra migrate status|apply                      Inspect or apply database migrations
   nivra worker run           [--config FILE] [--open]   Start the worker and its local website
+  nivra app                  [--no-window]  (Nivra App: generate + this computer as a worker)
   nivra worker enroll        --url URL --code CODE [--name NAME]
   nivra doctor               [--role controller|worker] [--config FILE]
   nivra repair               [--role controller|worker] [--config FILE]
@@ -68,6 +69,10 @@ relative to the current directory, or the path in NIVRA_CONFIG.
 `
 
 func main() {
+	if len(os.Args) < 2 && defaultCommand != "" {
+		prepareGUI()
+		os.Args = append(os.Args, defaultCommand)
+	}
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
 		os.Exit(2)
@@ -93,6 +98,8 @@ func main() {
 		err = cmdGenerate(ctx, args)
 	case "migrate":
 		err = cmdMigrate(ctx, args)
+	case "app":
+		err = cmdApp(ctx, args)
 	case "worker":
 		err = cmdWorker(ctx, args)
 	case "doctor":

@@ -66,6 +66,61 @@ encoded first frame (library API only; tested, no CLI command). Quality of conti
 inputs `weights`, `manifest`, `vae_weights`; outputs `<name>.mp4` + `<name>.json`; artifacts `video`,
 `video_metadata`; the stop file is polled between sampling steps (exit 3).
 
+## Nivra HD bundles
+
+`nivra-hd/1` models (HC-VAE + DiT, configs `nivra_hd_tiny`, `nivra_medium`, `nivra_large`) use the same bundle
+shape as the small model so the Go controller can store and ship them unchanged (it reads `weights_sha256`,
+`vae_sha256`, `config_name`, `architecture_version`, `tokenizer_version`, `param_count`).
+
+| file | content |
+| --- | --- |
+| `model_version.json` | schema `nivra.model_version/1`, `family: "hd"` |
+| `weights.safetensors` | NivraDiT state dict (float32, or float16 for the large configs) |
+| `vae.safetensors` | HC-VAE state dict + metadata `{kind, config}` (the artifact the controller sha-checks) |
+| `text_encoder/` | optional NivraText checkpoint directory (`config.json`, `tokenizer.json`, `model.safetensors`) |
+
+Manifest fields: `schema`, `family` (`"hd"`), `version_id` (`v000000-<weights sha12>`), `round` (0),
+`parent_version_id`, `architecture_version` (`nivra-hd/1`), `config_name`, `config` (the full HD config, with the
+VAE calibration), `config_hash`, `tokenizer_version` and `vocab_hash` (both = the text-encoder id), `param_count`
+(DiT), `vae_param_count`, `tensor_shapes` (DiT, checked against the file header before hashing/loading),
+`weights_file`, `weights_dtype`, `weights_sha256`, `outer_state_file`/`outer_state_sha256` (null),
+`vae_sha256`, `applied_update_ids`, `created_unix`, `min_vram_mb` (fp16 DiT-sampling-phase estimate from the budget
+formulas at the default resolution: weights + one block's activations + 0.7 GiB CUDA overhead; 0 for models under
+10 M parameters, i.e. CPU is fine; Medium 4059; an estimate, never measured on a GPU), `default_resolution`
+(`[width, height]`), `default_seconds`, `default_fps`, and `text_encoder`
+`{id, kind: stub|nivra|external, path (relative to the bundle or null), name, sha256, license, dim, max_len}`.
+
+`load_hd_bundle(dir | (weights, manifest, vae) | {weights, manifest, vae_weights}, device, **opts)` returns an
+`HDPipeline`; it refuses (BundleError, exec exit 5) a weights or VAE sha256 mismatch, a tensor-shape mismatch, a VAE
+whose embedded config differs from the manifest, and an unresolvable or mismatching text encoder. The
+`HDPipeline` options are `fp16`, `int8`, `offload`, `attn_chunk`, `vae_tile`, ... (on CPU: float32, no offload).
+
+Text encoder resolution (a worker receives only the three files, so the encoder is never inferred from a directory):
+* `stub`: rebuilt from the manifest (hashed words, no language knowledge; tests and dry runs only).
+* `nivra`: `<bundle dir>/<text_encoder.path>` when the bundle directory is available, otherwise
+  `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>`. The checkpoint id and the sha256 of its `model.safetensors` must match
+  the manifest.
+* `external`: `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>` only, with its `NIVRA_LICENSE.json` (see
+  `nivra/text/external.py`); never copied into a bundle and never downloaded.
+Embedding the encoder in `weights.safetensors` was rejected: the tokenizer and config would have to be packed in too and
+every encoder change would alter the DiT artifact hash the controller tracks.
+
+```
+python -m nivra.cli init-hd-bundle --config nivra_hd_tiny --out DIR [--text-encoder stub|nivra:CKPT|external:DIR] [--seed N]
+python -m nivra.cli generate --bundle DIR --prompt "..." --out OUT [--width W --height H --seconds S --fps F
+       --steps N --cfg C --sampler euler|ab2 --fp16/--no-fp16 --offload none|blocks]
+```
+`init-hd-bundle` writes a random-init bundle for plumbing tests (not a trained model). Models above 20 M parameters
+are written tensor by tensor in float16, so Medium (2.2 GB) needs about 0.4 GB RAM to write (measured). Loading
+Medium builds the model in host RAM first (about 3.7 GB float32 on CPU, half of that for a float16 build on CUDA hosts),
+which does not fit comfortably next to other work on an 8 GB machine; only the tiny config was run end to end here.
+For HD bundles `generate` defaults come from the bundle (Medium 1280x720, 8 s, 30 fps, 30 steps, cfg 5.0);
+`--upscale` must be omitted or 1 and `--tile` is ignored. HD-only flags on a small bundle exit 2. The executor
+(`ai.generate`, `docs/training/DISTRIBUTED.md` 1.7) and the ComfyUI nodes (Model Loader detects HD bundles; Text-to-Video
+has optional `width`/`height`/`seconds`/`fps`/`sampler`, 0 / "model default" = bundle default, ignored for small
+models; Video Continuation works, keeping the previous segment's padded frame size; Image-to-Video is small-only) use
+the same loader. Continuation of an HD video via the library: `HDPipeline.continue_video`.
+
 ## Hardware profiles
 
 Measured on this machine (the only hardware used): Intel i5-8250U, 4 cores / 8 threads, 8 GB RAM, no GPU,

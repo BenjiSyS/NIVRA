@@ -48,6 +48,10 @@ func cmdGenerate(ctx context.Context, args []string) error {
 	fps := fs.Int("fps", 8, "frames per second of the MP4")
 	upscale := fs.Int("upscale", 4, "nearest-neighbour upscale factor for viewing")
 	out := fs.String("out", "nivra.mp4", "output MP4 path")
+	width := fs.Int("width", 0, "HD models: output width (default from the model, e.g. 1280)")
+	height := fs.Int("height", 0, "HD models: output height (default from the model, e.g. 720)")
+	seconds := fs.Float64("seconds", 0, "HD models: duration in seconds (default from the model, e.g. 8)")
+	sampler := fs.String("sampler", "", "HD models: euler or ab2")
 	python := fs.String("python", "", "Python interpreter (local mode; default from config/worker.json)")
 	_ = fs.Parse(args)
 	if strings.TrimSpace(*prompt) == "" {
@@ -58,6 +62,19 @@ func cmdGenerate(ctx context.Context, args []string) error {
 	case *bundle != "":
 		return generateLocal(ctx, *bundle, *python, *prompt, *seed, *steps, *cfg, *fps, *upscale, *out)
 	case *url != "":
+		hd = map[string]any{}
+		if *width > 0 {
+			hd["width"] = *width
+		}
+		if *height > 0 {
+			hd["height"] = *height
+		}
+		if *seconds > 0 {
+			hd["seconds"] = *seconds
+		}
+		if *sampler != "" {
+			hd["sampler"] = *sampler
+		}
 		return generateRemote(ctx, *url, *user, *project, *model, *prompt, *seed, *steps, *cfg, *fps, *upscale, *out)
 	default:
 		fs.Usage()
@@ -101,6 +118,9 @@ func generateLocal(ctx context.Context, bundle, python, prompt string, seed, ste
 	fmt.Printf("saved %s\n", out)
 	return nil
 }
+
+// hd holds optional HD-model parameters (width, height, seconds, sampler).
+var hd map[string]any
 
 type remote struct {
 	base  string
@@ -192,6 +212,9 @@ func generateRemote(ctx context.Context, url, user, project, model, prompt strin
 		return fmt.Errorf("project %q not found", project)
 	}
 	body := map[string]any{"prompt": prompt, "seed": seed, "steps": steps, "cfg_scale": cfg, "fps": fps, "upscale": upscale}
+	for k, v := range hd {
+		body[k] = v
+	}
 	if model != "" {
 		body["model_version"] = model
 	}

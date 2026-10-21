@@ -142,14 +142,28 @@ class NivraRemoteTextToVideo:
         }, "optional": {
             "project": ("STRING", {"default": ""}),
             "model_version": ("STRING", {"default": ""}),
+            "width": ("INT", {"default": 0, "min": 0, "max": 1920, "step": 32}),
+            "height": ("INT", {"default": 0, "min": 0, "max": 1088, "step": 32}),
+            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5}),
+            "sampler": (["default", "ab2", "euler"],),
         }}
 
-    def run(self, controller_url, prompt, seed, steps, cfg_scale, upscale, timeout_minutes, project="", model_version=""):
+    def run(self, controller_url, prompt, seed, steps, cfg_scale, upscale, timeout_minutes, project="", model_version="",
+            width=0, height=0, seconds=0.0, sampler="default"):
         cl = NivraClient(controller_url, load_token())
         pid = cl.project_id(project)
         body = {"prompt": prompt, "seed": int(seed), "steps": int(steps), "cfg_scale": float(cfg_scale), "upscale": int(upscale)}
         if model_version.strip():
             body["model_version"] = model_version.strip()
+        # HD models (1280x720, 8 s by default); 0 keeps the model default. Ignored by small models.
+        if width:
+            body["width"] = int(width)
+        if height:
+            body["height"] = int(height)
+        if seconds:
+            body["seconds"] = float(seconds)
+        if sampler in ("ab2", "euler"):
+            body["sampler"] = sampler
         job = cl.post(f"/projects/{pid}/generate", body)["job_id"]
         print(f"[Nivra] queued remote generation {job}")
         deadline = time.time() + timeout_minutes * 60

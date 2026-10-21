@@ -182,7 +182,11 @@ SCHEMAS = {
     "ai.generate": dict(
         params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "steps": I(30, min=1, max=200),
                 "cfg_scale": F(3.0, min=0.0, max=20.0), "fps": I(8, min=1, max=60), "upscale": I(4, min=1, max=8),
-                "tile": I(0, min=0, max=16), "name": S("video", maxlen=64)},
+                "tile": I(0, min=0, max=16), "name": S("video", maxlen=64),
+                # HD models only (rejected for small bundles); None = the bundle's own default
+                "width": I(None, min=16, max=4096), "height": I(None, min=16, max=4096),
+                "seconds": F(None, exclusive_min=0.0, max=60.0), "sampler": S(None, choices=["euler", "ab2"]),
+                "fp16": B(None), "offload": S(None, choices=["none", "blocks"])},
         inputs={"weights": True, "manifest": True, "vae_weights": True}),
 }
 
@@ -413,9 +417,67 @@ def _bundle(ctx: Ctx):
         raise InputInvalid(str(e))
 
 
+HD_ONLY_PARAMS = ("width", "height", "seconds", "sampler", "fp16", "offload")
+HD_STAGE_WEIGHTS = {"text": (0.0, 0.02), "sample": (0.02, 0.78), "decode": (0.80, 0.18), "write": (0.98, 0.02)}
+
+
+def _hd_manifest(ctx: Ctx):
+    """The HD manifest dict if inputs.manifest is one, else None (small bundles / unreadable: old code path)."""
+    from .inference.hd_bundle import read_manifest_if_hd
+    try:
+        return read_manifest_if_hd(ctx.path("manifest"))
+    except InputInvalid:
+        return None
+
+
+def h_generate_hd(ctx: Ctx, p: dict, m: dict) -> dict:
+    from .inference.bundle import BundleError
+    from .inference.hd_bundle import hd_summary, load_hd_bundle_files, save_hd_result
+    from .inference.sampler import Stopped
+    given = ctx.job.get("params", {})
+    if "upscale" in given and p["upscale"] != 1:
+        raise SpecError("params.upscale must be 1 for HD models")
+    over = {}
+    if p["fp16"] is not None:
+        over["fp16"] = p["fp16"]
+    if p["offload"] is not None:
+        over["offload"] = p["offload"] == "blocks"
+    try:
+        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(), **over)
+    except BundleError as e:
+        raise InputInvalid(str(e))
+    ctx.check_stop()
+
+    def on_progress(stage, i, n):
+        start, span = HD_STAGE_WEIGHTS.get(stage, (0.0, 0.0))
+        ctx.em.progress(stage, start + span * (i / max(1, n)), i, n)
+
+    kw = {k: p[k] for k in ("steps", "cfg_scale", "fps") if k in given}     # else: the bundle's own defaults
+    for k in ("width", "height", "seconds", "sampler"):
+        if p[k] is not None:
+            kw[k] = p[k]
+    mp4 = ctx.out / f"{p['name']}.mp4"
+    try:
+        res = pipe.generate(p["prompt"], seed=p["seed"], out_path=mp4, on_progress=on_progress,
+                            should_stop=ctx.should_stop, **kw)
+    except Stopped:
+        raise JobStopped("stopped during generation")
+    meta = save_hd_result(res, ctx.out, p["name"])
+    ctx.em.artifact("video", mp4)
+    ctx.em.artifact("video_metadata", ctx.out / f"{p['name']}.json")
+    return hd_summary(meta)
+
+
 def h_generate(ctx: Ctx, p: dict) -> dict:
     from .inference.generate import generate, save_result
     from .inference.sampler import Stopped
+    hd = _hd_manifest(ctx)
+    given = ctx.job.get("params", {})
+    if hd is not None:
+        return h_generate_hd(ctx, p, hd)
+    bad = [k for k in HD_ONLY_PARAMS if k in given]
+    if bad:
+        raise SpecError(f"params {bad} are only valid for HD models")
     b = _bundle(ctx)
     ctx.check_stop()
     try:

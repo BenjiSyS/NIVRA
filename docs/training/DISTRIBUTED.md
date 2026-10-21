@@ -242,6 +242,20 @@ inputs: `weights`, `manifest`, `vae_weights` (all R).
 outputs: `<name>.mp4`, `<name>.json` (sidecar). artifacts: `video`, `video_metadata`.
 summary: `{frames, fps, seconds_sampling, seconds_decode, unknown_words}`.
 
+HD bundles (`model_version.json` with `"family": "hd"`, architecture `nivra-hd/1`; format in
+`docs/inference/INFERENCE.md`, "Nivra HD bundles") are routed automatically to the HD pipeline. Extra optional
+params, valid for HD only and rejected (exit 2) for small bundles: `width`, `height` int 16..4096,
+`seconds` float (0, 60], `sampler` `euler` | `ab2`, `fp16` bool (CUDA only), `offload` `none` | `blocks` (CUDA only).
+For HD, `steps`/`cfg_scale`/`fps` default to the bundle's own defaults when not sent (30 / 5.0 / 30 for Medium),
+`upscale` must be omitted or 1 (exit 2 otherwise), `tile` is ignored (decode tiling comes from the bundle config).
+The frame count is 1 + 8k covering `seconds * fps`. Progress events: `text`, `sample` (one per step), `decode`
+(one per latent chunk), `write`; the stop file / `limits.max_seconds` are polled every sampling step and decode chunk.
+Summary: `{frames, fps, width, height, seconds, seconds_text, seconds_sampling, seconds_decode, peak_rss_mb,
+cuda_max_allocated_mb (CUDA only), model_version_id, text_encoder, sampler, steps, family: "hd"}`. Artifacts are
+the same (`video`, `video_metadata`). The text encoder is resolved on the worker (inputs are only the three files):
+`stub` from the manifest, `nivra`/`external` from `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>`; a missing or
+mismatching encoder is `INPUT_INVALID` (exit 5), as is a weights/VAE sha256 mismatch.
+
 ## 2. Reference sequence for a distributed round
 
 1. `ai.init_model` -> `model_version.json` v0 (+ `vae.safetensors`).
