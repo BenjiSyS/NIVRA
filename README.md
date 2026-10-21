@@ -252,9 +252,56 @@ Bundles are produced locally by training runs.
 
 ## 24. Text-to-Video Generation
 
-From Studio (Generate page — runs on a worker with the AI executor), from the CLI
-(`python -m nivra.cli generate --bundle DIR --prompt "..." --out DIR`) or from ComfyUI.
-See [docs/inference/INFERENCE.md](docs/inference/INFERENCE.md).
+Generation (using a trained model, no training) can run **on the computer you are using** or **on
+another computer connected to your Nivra controller** — for example: you type a prompt on a laptop or
+phone, the Raspberry Pi controller queues it, and a worker PC (ideally the one with a GPU) renders the
+video and sends the MP4 back.
+
+### A. Use a model on another computer (through the controller)
+
+One-time setup:
+
+1. **Controller** running (see [Raspberry Pi Controller](#10-raspberry-pi-controller)).
+2. **Worker computer**: install with AI enabled (`install.bat` → 2 — Worker → answer `y` to AI jobs, or
+   `bash install.sh --role worker --with-ai`), start it (`start.bat` / `bash start.sh worker`), and enter
+   the project code. Its Hardware tab must say "AI executor ready".
+3. **A model**: in Nivra Studio → **Models** → **Import bundle**, choose the three files of a trained
+   bundle (`weights.safetensors`, `model_version.json`, `vae.safetensors`) and keep "Use as the default
+   model for generation" ticked. (On the controller host the same is
+   `bin/nivra model import --project Nivra --bundle path/to/bundle`.) Models produced by distributed
+   training runs appear here automatically.
+
+Then generate from any computer:
+
+* **Browser:** open Nivra Studio → **Generate**, type a prompt, press Generate. Progress is live; the
+  video plays in the page and can be downloaded. Any idle worker with the AI executor picks the job up
+  and downloads the model automatically the first time (cached afterwards).
+* **Command line** (no install needed except the `nivra` binary):
+
+  ```bash
+  nivra generate --url https://studio.benjiserver.com --user alice --prompt "two blue squares move up" --out clip.mp4
+  ```
+
+  The password is asked for (or read from `NIVRA_PASSWORD`). Accounts need the **operator** role:
+  `bin/nivra admin create --username alice --role operator` on the controller.
+
+### B. Use a model on this computer only (no controller)
+
+After a worker install with AI enabled:
+
+```bash
+nivra generate --bundle path/to/model-bundle --prompt "en röd cirkel rör sig från vänster till höger" --out clip.mp4
+```
+
+(The same works with Python directly: `python -m nivra.cli generate --bundle DIR --prompt "..." --out DIR`.)
+
+### Which computer does the work?
+
+The controller sends each generation to an idle connected worker whose AI executor works and whose
+RAM/VRAM budget fits the job. To force generation onto one machine, pause the others in Studio or
+lower their budgets. Generated videos are stored on the controller and listed on the Generate page.
+
+More details and measured timings: [docs/inference/INFERENCE.md](docs/inference/INFERENCE.md).
 
 ## 25. Prompt Guide
 

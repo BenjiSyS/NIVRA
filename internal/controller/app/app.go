@@ -308,3 +308,11 @@ func (rt *Runtime) Serve(ctx context.Context, opts Options) error {
 	log.Info("controller stopped cleanly")
 	return err
 }
+
+// Close releases the database, log file and instance lock of a Runtime that
+// was built but not served (CLI tools).
+func (rt *Runtime) Close() {
+	rt.Deps.DB.Close()
+	rt.logFile.Close()
+	rt.lock.Release()
+}

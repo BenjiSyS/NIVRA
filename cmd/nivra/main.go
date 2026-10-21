@@ -50,6 +50,9 @@ Usage:
   nivra project list                              List projects and codes
   nivra project rotate-code  --name NAME          Revoke the code and issue a new one
   nivra job create           --project NAME --type TYPE [--params JSON] [--count N]
+  nivra model import         --project NAME --bundle DIR [--name NAME] [--activate]
+  nivra generate             --url URL --user NAME --prompt TEXT [--out clip.mp4]   (runs on a connected worker)
+  nivra generate             --bundle DIR --prompt TEXT [--out clip.mp4]            (runs on this computer)
   nivra migrate status|apply                      Inspect or apply database migrations
   nivra worker run           [--config FILE] [--open]   Start the worker and its local website
   nivra worker enroll        --url URL --code CODE [--name NAME]
@@ -82,6 +85,10 @@ func main() {
 		err = cmdProject(ctx, args)
 	case "job":
 		err = cmdJob(ctx, args)
+	case "model":
+		err = cmdModel(ctx, args)
+	case "generate":
+		err = cmdGenerate(ctx, args)
 	case "migrate":
 		err = cmdMigrate(ctx, args)
 	case "worker":
@@ -344,6 +351,42 @@ func cmdJob(ctx context.Context, args []string) error {
 		}
 		fmt.Println(id)
 	}
+	return nil
+}
+
+func cmdModel(ctx context.Context, args []string) error {
+	verb, rest := sub(args)
+	fs := flag.NewFlagSet("model", flag.ExitOnError)
+	proj := fs.String("project", "", "project name or id")
+	dir := fs.String("bundle", "", "bundle directory (weights.safetensors, model_version.json, vae.safetensors)")
+	name := fs.String("name", "", "display name (default: bundle folder name)")
+	activate := fs.Bool("activate", true, "make it the project's default model for generation")
+	_ = fs.Parse(rest)
+	if verb != "import" || *dir == "" {
+		return errors.New("usage: nivra model import --project NAME --bundle DIR [--name NAME] [--activate=true]")
+	}
+	if *name == "" {
+		*name = filepath.Base(filepath.Clean(*dir))
+	}
+	cfg, err := config.LoadController(defaultConfig("controller"))
+	if err != nil {
+		return err
+	}
+	rt, err := app.Build(ctx, cfg, app.Options{LogWriter: io.Discard})
+	if err != nil {
+		return fmt.Errorf("%w (stop the running controller first, or import through Nivra Studio)", err)
+	}
+	defer rt.Close()
+	p, err := findProject(ctx, rt.Projects, *proj)
+	if err != nil {
+		return err
+	}
+	svc := training.NewService(rt)
+	id, err := svc.ImportBundleDir(ctx, core.Actor{Type: "system", ID: "cli"}, p.ID, *name, *dir, *activate)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported model %q as version %s (active for generation: %v)\n", *name, id, *activate)
 	return nil
 }
 

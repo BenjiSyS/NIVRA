@@ -150,6 +150,7 @@ func (s *Service) Register(r *api.Router) {
 		}
 		api.WriteJSON(w, 200, map[string]any{"updates": out})
 	})
+	s.registerModelRoutes(r)
 	r.Admin("GET", "/checkpoints", auth.RoleViewer, s.handleCheckpoints)
 	r.Admin("GET", "/models", auth.RoleViewer, s.handleModels)
 	r.Admin("GET", "/artifacts", auth.RoleViewer, s.handleListArtifacts)
@@ -260,7 +261,7 @@ func (s *Service) handleCheckpoints(w http.ResponseWriter, req *http.Request, a 
 }
 
 func (s *Service) handleModels(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
-	rows, err := s.d.DB.Query(req.Context(), `SELECT v.id, v.run_id::text, r.name, v.architecture_id, v.version_number, v.parent_version::text,
+	rows, err := s.d.DB.Query(req.Context(), `SELECT v.id, v.run_id::text, COALESCE(NULLIF(v.display_name, ''), r.name), v.architecture_id, v.version_number, v.parent_version::text,
 			v.weights_artifact::text, v.manifest_artifact::text, v.verification_state, v.created_at, COALESCE(m.parameter_count, 0),
 			p.active_model_version = v.id
 		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id LEFT JOIN model_architectures m ON m.id=v.architecture_id
@@ -353,7 +354,7 @@ func (s *Service) versionInputs(ctx context.Context, projectID, versionID string
 		}
 	}
 	var wts, man, vae *string
-	err := s.d.DB.QueryRow(ctx, `SELECT v.weights_artifact::text, v.manifest_artifact::text, r.vae_artifact::text
+	err := s.d.DB.QueryRow(ctx, `SELECT v.weights_artifact::text, v.manifest_artifact::text, COALESCE(v.vae_artifact, r.vae_artifact)::text
 		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id WHERE v.id=$1 AND v.project_id=$2`, versionID, projectID).Scan(&wts, &man, &vae)
 	if errors.Is(err, pgx.ErrNoRows) || wts == nil || man == nil || vae == nil {
 		return nil, "", fmt.Errorf("%w: model version not found or incomplete", ErrBadConfig)

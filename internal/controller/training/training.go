@@ -499,3 +499,8 @@ func (s *Service) Overview(ctx context.Context, projectID string) map[string]any
 	}
 	return out
 }
+
+// NewService builds the training service without starting its loop (CLI tools).
+func NewService(rt *app.Runtime) *Service {
+	return &Service{d: rt.Deps, sched: rt.Sched, store: rt.Artifacts, kick: make(chan struct{}, 1)}
+}
