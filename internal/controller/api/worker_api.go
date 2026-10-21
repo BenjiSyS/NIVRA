@@ -41,7 +41,7 @@ func (s *Server) handleEnrollBegin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEnrollComplete(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.enrollIP.allow(ip) {
+	if !s.completeIP.allow(ip) {
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many enrollment attempts")
 		return
 	}
@@ -67,12 +67,17 @@ func (s *Server) handleEnrollComplete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWorkerSession(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.enrollIP.allow("session:" + ip) {
+	if !s.sessionIP.allow(ip) {
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many session requests")
 		return
 	}
 	var req protocol.SessionRequest
 	if readEnvelope(w, r, nil, protocol.MsgSession, &req) != nil {
+		return
+	}
+	if !s.sessionDevice.allow(req.DeviceID) {
+		w.Header().Set("Retry-After", "10")
+		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many session requests for this device")
 		return
 	}
 	resp, err := s.Enroll.OpenSession(r.Context(), req, ip)

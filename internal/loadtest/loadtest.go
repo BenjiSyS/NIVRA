@@ -30,17 +30,28 @@ import (
 
 type stats struct {
 	mu   sync.Mutex
-	lat  map[string][]time.Duration
-	errs map[string]int
+	lat    map[string][]time.Duration
+	errs   map[string]int
+	causes map[string]int
 }
 
-func newStats() *stats { return &stats{lat: map[string][]time.Duration{}, errs: map[string]int{}} }
+func newStats() *stats {
+	return &stats{lat: map[string][]time.Duration{}, errs: map[string]int{}, causes: map[string]int{}}
+}
 
 func (s *stats) observe(op string, d time.Duration, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
 		s.errs[op]++
+		cause := err.Error()
+		var ae *protocol.APIError
+		if errors.As(err, &ae) {
+			cause = fmt.Sprintf("HTTP %d %s", ae.Status, ae.Code)
+		} else if len(cause) > 80 {
+			cause = cause[:80]
+		}
+		s.causes[op+": "+cause]++
 		return
 	}
 	s.lat[op] = append(s.lat[op], d)
@@ -78,6 +89,12 @@ func (s *stats) report(w *os.File, elapsed time.Duration) {
 		fmt.Fprintf(w, "%-22s %8d %8d %10s %10s %10s %10s\n", op, len(ds), s.errs[op],
 			pct(ds, .5).Round(time.Millisecond/10), pct(ds, .95).Round(time.Millisecond/10),
 			pct(ds, .99).Round(time.Millisecond/10), mx.Round(time.Millisecond/10))
+	}
+	if len(s.causes) > 0 {
+		fmt.Fprintln(w, "\nerror causes:")
+		for k, v := range s.causes {
+			fmt.Fprintf(w, "  %6d  %s\n", v, k)
+		}
 	}
 	fmt.Fprintf(w, "elapsed %s\n", elapsed.Round(time.Second))
 }

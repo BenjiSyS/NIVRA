@@ -48,12 +48,15 @@ type Server struct {
 
 	exts []Extension
 
-	enrollIP     *limiter
-	enrollGlobal *limiter
-	loginIP      *limiter
-	loginUser    *limiter
-	workerRate   *limiter
-	adminRate    *limiter
+	enrollIP      *limiter // enrollment/begin: guards project-code guessing
+	enrollGlobal  *limiter
+	completeIP    *limiter // enrollment/complete: needs a valid challenge anyway
+	sessionDevice *limiter // worker/session per device
+	sessionIP     *limiter // worker/session per source address (NAT-friendly)
+	loginIP       *limiter
+	loginUser     *limiter
+	workerRate    *limiter
+	adminRate     *limiter
 
 	httpSrv *http.Server
 }
@@ -77,12 +80,15 @@ func New(c Config) *Server {
 	return &Server{
 		d: c.Deps, Auth: c.Auth, Projects: c.Projects, Enroll: c.Enroll, Sched: c.Sched, Workers: c.Workers,
 		Telemetry: c.Telemetry, Artifacts: c.Artifacts, UI: c.UI, Started: time.Now(),
-		enrollIP:     perMinute(cfg.EnrollAttemptsPerMinute),
-		enrollGlobal: perMinute(cfg.EnrollAttemptsPerMinute * 20),
-		loginIP:      perMinute(cfg.LoginAttemptsPerMinute),
-		loginUser:    perMinute(cfg.LoginAttemptsPerMinute),
-		workerRate:   newLimiter(float64(cfg.WorkerRequestsPerSecond), cfg.WorkerRequestsPerSecond*2),
-		adminRate:    newLimiter(50, 100),
+		enrollIP:      perMinute(cfg.EnrollAttemptsPerMinute),
+		enrollGlobal:  perMinute(cfg.EnrollAttemptsPerMinute * 20),
+		completeIP:    perMinute(cfg.EnrollAttemptsPerMinute * 6),
+		sessionDevice: perMinute(12),
+		sessionIP:     perMinute(1200),
+		loginIP:       perMinute(cfg.LoginAttemptsPerMinute),
+		loginUser:     perMinute(cfg.LoginAttemptsPerMinute),
+		workerRate:    newLimiter(float64(cfg.WorkerRequestsPerSecond), cfg.WorkerRequestsPerSecond*2),
+		adminRate:     newLimiter(50, 100),
 	}
 }
 
