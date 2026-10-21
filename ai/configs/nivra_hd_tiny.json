@@ -1,0 +1,22 @@
+{
+  "name": "nivra_hd_tiny",
+  "arch_version": "nivra-hd/1",
+  "vae": {"latent_channels": 8, "channels": [8, 8, 16, 16, 16, 16], "temporal_down": [1, 2, 3],
+          "n_res": 1, "n_res_dec": 1},
+  "model": {"dim": 32, "depth": 2, "heads": 2, "mlp_ratio": 2.0, "patch": [1, 1, 1], "text_dim": 16,
+            "qk_norm": true},
+  "inference": {"width": 96, "height": 64, "seconds": 0.53, "fps": 30, "steps": 4, "cfg_scale": 3.0,
+                "sampler": "ab2", "shift_base_tokens": 16, "fp16": true, "int8": false, "offload": false,
+                "attn_chunk": 0, "mlp_chunk": 0, "vae_t_chunk": 1, "vae_tile": 0, "vae_overlap": 1,
+                "vae_margin": null},
+  "train": {
+    "stages": [
+      {"name": "s1_32p", "height": 32, "width": 64, "frames": 9, "steps": 4},
+      {"name": "s2_64p", "height": 64, "width": 64, "frames": 17, "steps": 4}
+    ],
+    "batch_size": 2, "grad_accum": 1, "lr": 3e-3, "weight_decay": 0.0, "warmup": 2, "grad_clip": 1.0,
+    "optimizer": "adamw", "grad_checkpoint": true, "fp16": true, "caption_dropout": 0.1,
+    "shift_base_tokens": 16, "vae_lr": 2e-3, "vae_kl_weight": 1e-6, "vae_perc_weight": 0.5,
+    "vae_tdiff_weight": 0.5, "save_every": 4, "keep_last": 3
+  }
+}
