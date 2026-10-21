@@ -27,6 +27,8 @@ def save_vae(path, vae: VideoVAE, extra: dict | None = None) -> str:
 def load_vae(path) -> VideoVAE:
     path = Path(path)
     try:
+        if path.stat().st_size > (1 << 30):
+            raise ModelFileError("VAE file larger than 1 GiB")
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata() or {}
         cfg = VAEConfig.from_dict(json.loads(meta["config"]))

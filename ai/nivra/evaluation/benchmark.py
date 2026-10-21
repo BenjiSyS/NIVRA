@@ -19,7 +19,8 @@ DEFAULT_PROMPTS = CONFIG_DIR / "benchmark_prompts.json"
 
 
 def load_prompts(path=None) -> list:
-    d = json.loads(Path(path or DEFAULT_PROMPTS).read_text(encoding="utf-8"))
+    from ..distributed.version import read_json_limited
+    d = read_json_limited(path or DEFAULT_PROMPTS)
     return d["prompts"]
 
 

@@ -94,7 +94,7 @@ def sample_spec(rng: np.random.Generator, cfg: SynthConfig) -> SceneSpec:
         ok = True
         for i in range(n):
             for j in range(i + 1, n):
-                d = np.hypot((paths[i][0] - paths[j][0]) * REF_SIZE, (paths[i][1] - paths[j][1]) * REF_SIZE)
+                d = np.sqrt(((paths[i][0] - paths[j][0]) * REF_SIZE) ** 2 + ((paths[i][1] - paths[j][1]) * REF_SIZE) ** 2)
                 if d.min() < ents[i].radius + ents[j].radius + margin:
                     ok = False
         if ok:
@@ -103,8 +103,8 @@ def sample_spec(rng: np.random.Generator, cfg: SynthConfig) -> SceneSpec:
 
 
 # triangle (apex up): outward unit normals of the two slanted edges
-_NR = np.array([1.55, -0.95]) / np.hypot(1.55, 0.95)
-_NL = np.array([-1.55, -0.95]) / np.hypot(1.55, 0.95)
+_NR = np.array([1.55, -0.95]) / np.sqrt(1.55 * 1.55 + 0.95 * 0.95)
+_NL = np.array([-1.55, -0.95]) / np.sqrt(1.55 * 1.55 + 0.95 * 0.95)
 
 
 def _coverage(shape: str, px, py, r, X, Y):

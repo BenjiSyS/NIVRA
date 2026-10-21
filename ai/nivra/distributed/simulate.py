@@ -62,8 +62,8 @@ def main(argv=None):
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--heldout-clips", type=int, default=64)
     a = ap.parse_args(argv)
-    base = Path(a.base)
-    out = Path(a.out)
+    base = Path(a.base).resolve()
+    out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     vae = base / "vae.safetensors"
     cur = base

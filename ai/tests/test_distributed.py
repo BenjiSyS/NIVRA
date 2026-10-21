@@ -39,13 +39,13 @@ def run_agg(env, root, ups, out, base_dir=None, base_m=None, outer=None, **kw):
 
 def test_two_updates_mean_and_nesterov_outer_step(tiny_env, tmp_path):
     d, m, base = _base(tiny_env)
-    u1 = make_update(tmp_path, "u1", m, "a", 0.1)
-    u2 = make_update(tmp_path, "u2", m, "b", 0.3)
+    u1 = make_update(tmp_path, "u1", m, "a", 0.01)
+    u2 = make_update(tmp_path, "u2", m, "b", 0.03)
     s = run_agg(tiny_env, tmp_path, [u1, u2], tmp_path / "v1")
     assert s["aggregation_method"] == "mean" and s["aggregated_count"] == 2 and not s["rejected"]
     assert s["applied_update_ids"] == ["a", "b"]
     new = load_file(str(tmp_path / "v1" / "weights.safetensors"))
-    D = 0.2
+    D = 0.02
     expected_shift = 0.7 * (D + 0.9 * D)           # outer lr 0.7, nesterov, zero initial momentum
     for k in base:
         assert torch.allclose(base[k] - new[k], torch.full_like(base[k], expected_shift), atol=1e-6), k
@@ -54,10 +54,10 @@ def test_two_updates_mean_and_nesterov_outer_step(tiny_env, tmp_path):
     assert m1["weights_sha256"] == ver.sha256_file(tmp_path / "v1" / "weights.safetensors")
     # round 2 with persisted outer momentum
     v1 = tmp_path / "v1"
-    u3 = make_update(tmp_path, "u3", m1, "c", 0.5)
+    u3 = make_update(tmp_path, "u3", m1, "c", 0.02)
     s2 = run_agg(tiny_env, tmp_path, [u3], tmp_path / "v2", base_dir=v1, outer=v1 / "outer_state.safetensors")
     new2 = load_file(str(tmp_path / "v2" / "weights.safetensors"))
-    m_prev, g = D, 0.5
+    m_prev, g = D, 0.02
     mom = 0.9 * m_prev + g
     shift = 0.7 * (g + 0.9 * mom)
     for k in new:
@@ -77,12 +77,12 @@ def test_stale_update_rejected(tiny_env, tmp_path):
 
 def test_duplicate_update_id_rejected_within_and_across_versions(tiny_env, tmp_path):
     d, m, _ = _base(tiny_env)
-    a1 = make_update(tmp_path, "a1", m, "same", 0.1)
-    a2 = make_update(tmp_path, "a2", m, "same", 0.2)
+    a1 = make_update(tmp_path, "a1", m, "same", 0.01)
+    a2 = make_update(tmp_path, "a2", m, "same", 0.02)
     s = run_agg(tiny_env, tmp_path, [a1, a2], tmp_path / "v1")
     assert s["applied_update_ids"] == ["same"] and s["rejected"][0]["reason"] == "duplicate_update_id"
     m1 = ver.read_manifest(tmp_path / "v1" / "model_version.json")
-    again = make_update(tmp_path, "a3", m1, "same", 0.1)          # right base version, but id already applied
+    again = make_update(tmp_path, "a3", m1, "same", 0.01)          # right base version, but id already applied
     s2 = run_agg(tiny_env, tmp_path, [again], tmp_path / "v2", base_dir=tmp_path / "v1")
     assert s2["no_op"] and s2["rejected"][0]["reason"] == "duplicate_update_id"
 
@@ -90,7 +90,7 @@ def test_duplicate_update_id_rejected_within_and_across_versions(tiny_env, tmp_p
 def test_nan_and_wrong_shape_rejected(tiny_env, tmp_path):
     d, m, _ = _base(tiny_env)
     bad = make_update(tmp_path, "nan", m, "nan1", 0.1, nan=True)
-    good = make_update(tmp_path, "ok", m, "ok1", 0.1)
+    good = make_update(tmp_path, "ok", m, "ok1", 0.01)
     s = run_agg(tiny_env, tmp_path, [bad, good], tmp_path / "v1")
     assert s["applied_update_ids"] == ["ok1"]
     assert {r["update_id"]: r["reason"] for r in s["rejected"]} == {"nan1": "non_finite"}
@@ -119,7 +119,7 @@ def test_tampered_update_file_rejected(tiny_env, tmp_path):
 
 def test_norm_outlier_and_trimmed_mean(tiny_env, tmp_path):
     d, m, base = _base(tiny_env)
-    ups = [make_update(tmp_path, f"u{i}", m, f"id{i}", v) for i, v in enumerate((0.1, 0.2, 0.3))]
+    ups = [make_update(tmp_path, f"u{i}", m, f"id{i}", v) for i, v in enumerate((0.01, 0.02, 0.03))]
     ups.append(make_update(tmp_path, "huge", m, "huge", 500.0))
     s = run_agg(tiny_env, tmp_path, ups, tmp_path / "v1")
     assert {r["update_id"]: r["reason"] for r in s["rejected"]} == {"huge": "norm_outlier"}
@@ -161,3 +161,106 @@ def test_real_local_train_produces_valid_update_and_aggregates(tiny_env, tmp_pat
     assert any(t.abs().max() > 0 for t in delta.values())
     s = run_agg(tiny_env, tmp_path, [ents], tmp_path / "v1")
     assert s["applied_update_ids"] == ["real1"]
+
+
+# ------------------------------------------------------------------ hardening (absolute bounds, resource limits)
+def _raw_update(root, name, m, delta, uid, **meta_over):
+    meta = {"update_id": uid, "base_version_id": m["version_id"], "base_weights_sha256": m["weights_sha256"],
+            "architecture_version": m["architecture_version"], "vocab_hash": m["vocab_hash"], "inner_steps": 1, "samples": 1}
+    meta.update(meta_over)
+    write_update(Path(root) / name, delta, meta)
+    d = Path(root) / name
+    return {"path": d / "update.safetensors", "manifest_path": d / "update.json"}
+
+
+def test_absolute_norm_bound_without_peers(tiny_env, tmp_path):
+    d, m, base = _base(tiny_env)
+    huge = make_update(tmp_path, "huge", m, "huge1", 1e3)             # single update, zero peers
+    v = validate_update(huge["path"], huge["manifest_path"], m)
+    assert not v.valid and "norm_outlier" in v.codes
+    s = run_agg(tiny_env, tmp_path, [huge], tmp_path / "o")
+    assert s["no_op"] and s["rejected"][0]["reason"] == "norm_outlier"
+    ok = make_update(tmp_path, "ok", m, "ok1", 0.01)
+    assert validate_update(ok["path"], ok["manifest_path"], m).valid
+    assert not validate_update(ok["path"], ok["manifest_path"], m, max_rel_norm=1e-4).valid   # configurable
+
+
+def test_single_tensor_blowup_rejected(tiny_env, tmp_path):
+    d, m, base = _base(tiny_env)
+    delta = {k: torch.zeros(tuple(sh)) for k, sh in m["tensor_shapes"].items()}
+    first = next(iter(delta))
+    delta[first].view(-1)[0] = 1e30
+    u = _raw_update(tmp_path, "blow", m, delta, "blow1")
+    v = validate_update(u["path"], u["manifest_path"], m)
+    assert not v.valid and "tensor_norm_outlier" in v.codes
+    assert "tensor_norm_outlier" in validate_update(u["path"], u["manifest_path"], m, base_weights=base).codes
+
+
+def test_zero_update_rejected(tiny_env, tmp_path):
+    d, m, _ = _base(tiny_env)
+    z = _raw_update(tmp_path, "z", m, {k: torch.zeros(tuple(sh)) for k, sh in m["tensor_shapes"].items()}, "zero1")
+    assert "zero_update" in validate_update(z["path"], z["manifest_path"], m).codes
+    s = run_agg(tiny_env, tmp_path, [z], tmp_path / "o")
+    assert s["no_op"] and s["rejected"][0]["reason"] == "zero_update"
+
+
+def test_aggregate_clips_to_twice_median_norm(tiny_env, tmp_path):
+    d, m, base = _base(tiny_env)
+    ups = [make_update(tmp_path, f"c{i}", m, f"c{i}", v) for i, v in enumerate((0.01, 0.01, 0.04))]
+    s = run_agg(tiny_env, tmp_path, ups, tmp_path / "v1", aggregation="mean", momentum=0.0, nesterov=False, outer_lr=1.0)
+    assert s["clipped_update_ids"] == ["c2"]                              # 0.04 > 2 x median(0.01)
+    new = load_file(str(tmp_path / "v1" / "weights.safetensors"))
+    k = next(iter(base))
+    assert torch.allclose(base[k] - new[k], torch.full_like(base[k], (0.01 + 0.01 + 0.02) / 3), atol=1e-6)
+
+
+def test_oversized_manifest_rejected_before_parsing(tiny_env, tmp_path):
+    d, m, _ = _base(tiny_env)
+    u = make_update(tmp_path, "big", m, "big1", 0.01)
+    u["manifest_path"].write_text('{"x": "' + "a" * (2 << 20) + '"}')
+    v = validate_update(u["path"], u["manifest_path"], m)
+    assert not v.valid and v.codes == ["manifest_too_large"]
+    s = run_agg(tiny_env, tmp_path, [u], tmp_path / "o")
+    assert s["no_op"] and s["rejected"][0]["reason"] == "manifest_too_large"
+    big = tmp_path / "model_version.json"
+    big.write_text('{"x": "' + "a" * (2 << 20) + '"}')
+    with pytest.raises(ver.ManifestTooLarge):
+        ver.read_manifest(big)
+
+
+def test_header_checked_before_tensors_are_loaded(tiny_env, tmp_path, monkeypatch):
+    import nivra.distributed.update as upd
+    from safetensors.torch import save_file
+    d, m, _ = _base(tiny_env)
+    delta = {k: torch.zeros(tuple(sh)) for k, sh in m["tensor_shapes"].items()}
+    delta[next(iter(delta))] = torch.ones(7)
+    u = _raw_update(tmp_path, "hdr", m, delta, "hdr1")
+    u2 = _raw_update(tmp_path, "h16", m, {k: torch.zeros(tuple(sh)) for k, sh in m["tensor_shapes"].items()}, "h16")
+    save_file({k: torch.zeros(tuple(sh), dtype=torch.float16) for k, sh in m["tensor_shapes"].items()}, str(u2["path"]))
+    mj = json.loads(u2["manifest_path"].read_text())
+    mj["update_sha256"] = ver.sha256_file(u2["path"])
+    u2["manifest_path"].write_text(json.dumps(mj))
+    u3 = make_update(tmp_path, "bud", m, "bud1", 0.01)
+
+    def boom(*a, **k):
+        raise AssertionError("tensors were loaded before the header check")
+    monkeypatch.setattr(upd, "load_file", boom)
+    v = validate_update(u["path"], u["manifest_path"], m)
+    assert not v.valid and v.codes == ["shape_mismatch"]
+    v2 = validate_update(u2["path"], u2["manifest_path"], m)
+    assert not v2.valid and "F32" in v2.reasons[0][1]
+    assert "size_limit" in validate_update(u3["path"], u3["manifest_path"], m, max_bytes=1000).codes
+
+
+def test_executor_oversized_manifest_exit_5(tiny_env, tmp_path):
+    from test_exec_protocol import run_job, last
+    d, m, _ = _base(tiny_env)
+    u = make_update(tmp_path, "x", m, "x1", 0.01)
+    big = tmp_path / "big.json"
+    big.write_text('{"x": "' + "a" * (2 << 20) + '"}')
+    code, ev, _, _ = run_job(tmp_path, "ai.validate_update", {}, {"update": str(u["path"]), "update_manifest": str(big),
+                                                                   "base_manifest": str(d / "model_version.json")})
+    assert code == 5 and last(ev)["code"] == "INPUT_INVALID"
+    code, ev, _, _ = run_job(tmp_path, "ai.validate_update", {}, {"update": str(u["path"]), "update_manifest": str(u["manifest_path"]),
+                                                                   "base_manifest": str(big)}, name="b2")
+    assert code == 5

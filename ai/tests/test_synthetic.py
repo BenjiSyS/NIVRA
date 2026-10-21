@@ -110,3 +110,22 @@ def test_tokenizer_roundtrip_and_versioning(tmp_path):
 def test_dataset_view():
     ds = SynthDataset(9, 100, 5)
     assert np.array_equal(ds.sample(2).video, make_sample(9, 102).video)
+
+
+def test_pinned_content_hash_is_platform_independent():
+    """Pinned digests: the controller re-generates shards on aarch64/Linux (torch 2.6) and must get identical
+    bytes. The generator uses only numpy PCG64 + IEEE-exact elementwise float ops (no libm transcendental
+    functions, no torch)."""
+    from nivra.data.synthetic import content_hash, SynthConfig
+    assert content_hash(123, 0, 12) == "90fa0742ccfa4bb43350660b1b35e3fef77a69a11ab04dcf1214cc8e461839a6"
+    assert content_hash(5, 10, 6, SynthConfig(frames=8, size=32)) == \
+        "05db9443b43f99ec2fa8d631f376279702806caaa166188dc7b4c53a40463191"
+
+
+def test_synthetic_module_does_not_import_torch():
+    import subprocess, sys
+    from pathlib import Path
+    code = "import sys; import nivra.data.synthetic, nivra.cli; print('torch' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(Path(__file__).resolve().parent.parent))
+    assert out.stdout.strip() == "False", out.stderr

@@ -165,14 +165,14 @@ SCHEMAS = {
                 "grad_clip": F(1.0, exclusive_min=0.0, max=100.0), "seed": I(0, min=0), "eval_clips": I(16, min=0, max=256)},
         inputs={"base_weights": True, "base_manifest": True, "vae_weights": True}),
     "ai.validate_update": dict(
-        params={"max_norm_ratio": F(5.0, min=1.0), "max_bytes": I(1 << 30, min=1), "max_norm": F(None, exclusive_min=0.0),
+        params={"max_norm_ratio": F(5.0, min=1.0), "max_bytes": I(1 << 30, min=1), "max_norm": F(None, exclusive_min=0.0), "max_rel_norm": F(0.5, exclusive_min=0.0),
                 "peer_norms": {"type": "floatlist", "default": None}, "expected_base_version_id": S(None, maxlen=128)},
         inputs={"update": True, "update_manifest": True, "base_manifest": True, "base_weights": False}),
     "ai.aggregate": dict(
         params={"outer_lr": F(0.7, exclusive_min=0.0, max=10.0), "momentum": F(0.9, min=0.0, max=0.9999), "nesterov": B(True),
                 "aggregation": S("auto", choices=["auto", "mean", "trimmed_mean"]), "trim_ratio": F(0.2, min=0.0, max=0.45),
                 "max_norm_ratio": F(5.0, min=1.0), "max_bytes": I(1 << 30, min=1), "version_id": S(None, maxlen=128),
-                "eval_heldout": B(False)},
+                "max_rel_norm": F(0.5, exclusive_min=0.0), "eval_heldout": B(False)},
         inputs={"base_weights": True, "base_manifest": True, "outer_state": False, "updates": True, "vae_weights": False}),
     "ai.evaluate": dict(
         params={"mode": S(req=True, choices=["adherence", "reconstruction", "detector"]), "num_prompts": I(16, min=1, max=200),
@@ -296,7 +296,6 @@ def h_dataset_shard(ctx: Ctx, p: dict) -> dict:
     from .data.synthetic import SynthConfig, make_sample, manifest as dmanifest
     scfg = SynthConfig(frames=p["frames"], size=p["size"])
     vids, caps, specs = [], [], []
-    h = hashlib.sha256()
     for i in range(p["count"]):
         if i % 16 == 0:
             ctx.check_stop()
@@ -305,15 +304,20 @@ def h_dataset_shard(ctx: Ctx, p: dict) -> dict:
         vids.append(s.video)
         caps.append(s.captions)
         specs.append(s.spec.to_dict())
-        h.update(s.video.tobytes())
-        h.update(json.dumps(s.spec.to_dict(), sort_keys=True).encode())
-    save_file({"videos": torch.from_numpy(np.stack(vids))}, str(ctx.out / "shard.safetensors"))
+    arr = np.ascontiguousarray(np.stack(vids), dtype=np.uint8)
+    # content_sha256 = sha256 of exactly the bytes of the `videos` tensor stored in shard.safetensors
+    content_sha = hashlib.sha256(arr.tobytes()).hexdigest()
+    # deterministic file: no metadata, no timestamps; safetensors orders the header by (dtype, name)
+    save_file({"videos": torch.from_numpy(arr)}, str(ctx.out / "shard.safetensors"))
+    from .distributed.version import sha256_file
+    file_sha = sha256_file(ctx.out / "shard.safetensors")
     m = dmanifest(p["seed"], p["start"], p["count"], scfg)
-    m.update(content_sha256=h.hexdigest(), captions=caps, specs=specs)
+    m.update(content_sha256=content_sha, shard_file_sha256=file_sha, captions=caps, specs=specs)
     (ctx.out / "shard.json").write_text(json.dumps(m, ensure_ascii=False))
     ctx.em.artifact("dataset_shard", ctx.out / "shard.safetensors")
     ctx.em.artifact("dataset_manifest", ctx.out / "shard.json")
-    return {"count": p["count"], "fingerprint": m["fingerprint"], "content_sha256": m["content_sha256"]}
+    return {"count": p["count"], "fingerprint": m["fingerprint"], "content_sha256": content_sha,
+            "shard_file_sha256": file_sha}
 
 
 def h_local_train(ctx: Ctx, p: dict) -> dict:
@@ -358,7 +362,10 @@ def h_validate_update(ctx: Ctx, p: dict) -> dict:
             raise InputInvalid(str(e))
     v = validate_update(ctx.path("update"), ctx.path("update_manifest"), bm, peer_norms=p["peer_norms"],
                         max_norm_ratio=p["max_norm_ratio"], max_bytes=p["max_bytes"], max_norm=p["max_norm"],
-                        expected_base_version_id=p["expected_base_version_id"], base_weights=bw)
+                        expected_base_version_id=p["expected_base_version_id"], base_weights=bw,
+                        max_rel_norm=p["max_rel_norm"])
+    if "manifest_too_large" in v.codes:
+        raise InputInvalid(v.reason_strings()[0])
     return {"valid": v.valid, "reasons": v.reason_strings(), "reason_codes": v.codes, "l2_norm": v.l2_norm,
             "update_id": v.update_id, "num_tensors": v.num_tensors, "bytes": v.bytes}
 
@@ -382,7 +389,7 @@ def h_aggregate(ctx: Ctx, p: dict) -> dict:
                       outer_state_path=ctx.path("outer_state", required=False), outer_lr=p["outer_lr"],
                       momentum=p["momentum"], nesterov=p["nesterov"], aggregation=p["aggregation"],
                       trim_ratio=p["trim_ratio"], max_norm_ratio=p["max_norm_ratio"], max_bytes=p["max_bytes"],
-                      version_id=p["version_id"])
+                      version_id=p["version_id"], max_rel_norm=p["max_rel_norm"])
     except (ver.VersionError, OSError) as e:
         raise InputInvalid(str(e))
     if not s["no_op"]:

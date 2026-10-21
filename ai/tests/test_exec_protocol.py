@@ -114,6 +114,17 @@ def test_dataset_shard(tmp_path):
     assert m["count"] == 6 and len(m["captions"]) == 6 and m["fingerprint"] == last(ev)["summary"]["fingerprint"]
     code2, ev2, _, _ = run_job(tmp_path, "ai.dataset_shard", {"seed": 5, "start": 10, "count": 6, "frames": 8, "size": 32}, name="again")
     assert last(ev2)["summary"]["content_sha256"] == last(ev)["summary"]["content_sha256"]    # deterministic
+    # pinned digests (platform independence): content_sha256 = sha256 of the raw `videos` tensor bytes,
+    # shard_file_sha256 = sha256 of the shard.safetensors file (deterministic header, no timestamps)
+    summ = last(ev)["summary"]
+    assert summ["content_sha256"] == "a7e9dc0ab7b355ed1450f943e9d37ec87e9974c1207ba1f0fd2188f456116ae5"
+    assert summ["shard_file_sha256"] == "ff5fd1059e14c7beb6de4ba404c935c6a90d7229aaad73f9ed0edc9eec872454"
+    assert hashlib.sha256((out / "shard.safetensors").read_bytes()).hexdigest() == summ["shard_file_sha256"]
+    from safetensors.torch import load_file
+    vids = load_file(str(out / "shard.safetensors"))["videos"]
+    assert tuple(vids.shape) == (6, 8, 32, 32, 3) and hashlib.sha256(vids.numpy().tobytes()).hexdigest() == summ["content_sha256"]
+    assert m["content_sha256"] == summ["content_sha256"] and m["shard_file_sha256"] == summ["shard_file_sha256"]
+    assert last(ev2)["summary"]["shard_file_sha256"] == summ["shard_file_sha256"]
 
 
 @pytest.fixture(scope="module")

@@ -76,3 +76,24 @@ have never been executed** - this machine has no CUDA GPU. Treat them as unverif
 * Everything here was measured on a 4-core laptop CPU; see `docs/research/EXPERIMENTS.md`.
 * VAE tiled decoding is approximate (GroupNorm statistics are per tile).
 * The trainer skips a step if the clipped gradient norm is non-finite (counted in `skipped`).
+
+## Results of the reference run (6000 steps)
+Measured numbers, commands and failure modes are in `docs/research/EXPERIMENTS.md`: VAE 471,211 params, held-out PSNR
+29.48 dB; generator 2,414,352 params, held-out flow loss 0.297 (raw) / 0.299 (EMA), about 1.0 s/step median on the
+4-core CPU (contended). Prompt adherence of the result is weak (entity recall 0.19 vs 0.00 for an untrained model on 24
+prompts; no video fully correct).
+
+## Model bundle / release
+`runs/small/gen/export/` (written at the end of `train`) is copied to `runs/release/nivra-small-<step>/`
+(`weights.safetensors`, `model_version.json`, `vae.safetensors`) - the exact input of the `ai.generate` / `ai.evaluate`
+jobs. Hashes of the 6000-step bundle: `EXPERIMENTS.md` E3. Inference: `docs/inference/INFERENCE.md`.
+
+## Helper scripts
+* `ai/scripts/exec_smoke.py` - runs every executor job type end-to-end through `python -m nivra.cli exec`.
+* `ai/scripts/init_from_ckpt.py` - `ai.init_model` `from_checkpoint` from a generator checkpoint (DiLoCo base).
+* `python -m nivra.distributed.simulate --base <version dir> --out <dir> --workers 2 --rounds 3` - real multi-process DiLoCo.
+
+## Distributed-training safety defaults
+Update validation always enforces absolute norm bounds, zero-update rejection, JSON size limits and header-first
+safetensors checks, with no parameters required (`docs/training/DISTRIBUTED.md` section 0 and 1.4). Consequence for
+local experiments: a pseudo-gradient larger than 0.5 x ||base weights|| is rejected (`norm_outlier`).

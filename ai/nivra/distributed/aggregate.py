@@ -12,7 +12,7 @@ import torch
 from safetensors.torch import load_file
 
 from . import version as ver
-from .update import validate_update, l2_norm, DEFAULT_MAX_BYTES
+from .update import validate_update, l2_norm, DEFAULT_MAX_BYTES, DEFAULT_MAX_REL_NORM
 
 
 def combine(deltas: list, method: str = "auto", trim_ratio: float = 0.2) -> tuple:
@@ -56,19 +56,24 @@ def outer_step(base: dict, delta: dict, outer_state: Optional[dict], lr: float =
 def aggregate(base_manifest_path, base_weights_path, updates: list, out_dir, *, outer_state_path=None,
               outer_lr: float = 0.7, momentum: float = 0.9, nesterov: bool = True, aggregation: str = "auto",
               trim_ratio: float = 0.2, max_norm_ratio: float = 5.0, max_bytes: int = DEFAULT_MAX_BYTES,
-              version_id: Optional[str] = None) -> dict:
+              version_id: Optional[str] = None, max_rel_norm: float = DEFAULT_MAX_REL_NORM,
+              clip_factor: float = 2.0) -> dict:
     """updates: list of {"path": update.safetensors, "manifest_path": update.json}.
     Returns a summary dict (new_version_id None and no_op True when nothing was accepted)."""
     base_m = ver.read_manifest(base_manifest_path)
     base = ver.load_weights(base_m, base_weights_path)
-    outer_state = load_file(str(outer_state_path)) if outer_state_path else None
+    outer_state = None
+    if outer_state_path:
+        ver.check_tensor_file(outer_state_path, {k: tuple(v.shape) for k, v in base.items()}, None, max_bytes)
+        outer_state = load_file(str(outer_state_path))
     applied = set(base_m["applied_update_ids"])
     rejected, cand = [], []
     seen_ids = set()
     # first pass: structural validation without the norm test (need all norms for the median)
     for u in updates:
         val, tensors = validate_update(u["path"], u["manifest_path"], base_m, max_norm_ratio=max_norm_ratio,
-                                       max_bytes=max_bytes, base_weights=base, return_tensors=True)
+                                       max_bytes=max_bytes, base_weights=base, max_rel_norm=max_rel_norm,
+                                       return_tensors=True)
         uid = val.update_id
         if uid is not None and (uid in applied or uid in seen_ids):
             rejected.append({"update_id": uid, "reason": "duplicate_update_id", "detail": "already applied or repeated"})
@@ -94,7 +99,19 @@ def aggregate(base_manifest_path, base_weights_path, updates: list, out_dir, *, 
     if not accepted:
         summary.update(new_version_id=None, no_op=True, all_applied_update_ids=sorted(applied), aggregation_method=None)
         return summary
-    delta, used = combine([a[1] for a in accepted], aggregation, trim_ratio)
+    # clip every accepted update to min(own norm, clip_factor x median accepted norm) before averaging
+    import statistics
+    med_acc = float(statistics.median([a[2] for a in accepted]))
+    cap = clip_factor * med_acc
+    clipped, clipped_ids = [], []
+    for uid, t, nrm in accepted:
+        if nrm > cap > 0:
+            f = cap / nrm
+            t = {k: x * f for k, x in t.items()}
+            clipped_ids.append(uid)
+        clipped.append(t)
+    summary["clipped_update_ids"] = clipped_ids
+    delta, used = combine(clipped, aggregation, trim_ratio)
     new_w, buf = outer_step(base, delta, outer_state, outer_lr, momentum, nesterov)
     rnd = base_m["round"] + 1
     all_ids = list(base_m["applied_update_ids"]) + [a[0] for a in accepted]
