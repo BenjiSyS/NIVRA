@@ -97,7 +97,9 @@ whose embedded config differs from the manifest, and an unresolvable or mismatch
 
 Text encoder resolution (a worker receives only the three files, so the encoder is never inferred from a directory):
 * `stub`: rebuilt from the manifest (hashed words, no language knowledge; tests and dry runs only).
-* `nivra`: `<bundle dir>/<text_encoder.path>` when the bundle directory is available, otherwise
+* `nivra`, in this order: the extracted `text_encoder_archive` job input (network workers: the controller ships the
+  bundle's `text_encoder/` as a tar artifact, see `nivra/inference/te_archive.py`; extracted with path/size checks into
+  `<cache>/te_cache/<archive sha256>`), `<bundle dir>/<text_encoder.path>` when the bundle directory is available, otherwise
   `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>`. The checkpoint id and the sha256 of its `model.safetensors` must match
   the manifest.
 * `external`: `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>` only, with its `NIVRA_LICENSE.json` (see

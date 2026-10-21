@@ -18,6 +18,29 @@ import (
 // parallel on every local GPU (one at a time on CPU) -> stitch, the same job
 // types the controller hands to network workers.
 
+// paramNum reads a numeric history parameter. The history holds the Go types
+// the request was built with (int, int64, float64) until the app restarts and
+// the file is reloaded (where everything is float64), so a plain float64
+// assertion silently returned 0 for width, height, fps and seed.
+func paramNum(p map[string]any, k string) float64 {
+	switch v := p[k].(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	}
+	return 0
+}
+
 type progressFunc func(f float64, stage string)
 
 type fnReporter struct{ f progressFunc }
@@ -57,7 +80,7 @@ func runPy(ctx context.Context, rt LocalRuntime, device, work, jobType, id strin
 func (a *App) generateLocalLong(ctx context.Context, it histItem, m localModel, rt LocalRuntime, work string) (string, error) {
 	inputs := map[string]any{"weights": filepath.Join(m.Path, "weights.safetensors"),
 		"manifest": filepath.Join(m.Path, "model_version.json"), "vae_weights": filepath.Join(m.Path, "vae.safetensors")}
-	num := func(k string) float64 { v, _ := it.Params[k].(float64); return v }
+	num := func(k string) float64 { return paramNum(it.Params, k) }
 	fps := int(num("fps"))
 	if fps <= 0 {
 		fps = m.DefaultFPS
@@ -70,6 +93,11 @@ func (a *App) generateLocalLong(ctx context.Context, it histItem, m localModel, 
 		}
 	}
 	seed := int(num("seed"))
+	// Output size: what the user asked for, else the model's native size.
+	width, height := int(num("width")), int(num("height"))
+	if width <= 0 || height <= 0 {
+		width, height = m.DefaultWidth, m.DefaultHeight
+	}
 	segFrames := longvideo.SegmentFrames(m.DefaultSeconds, fps)
 	plan := longvideo.Plan(longvideo.TotalFrames(seconds, fps), segFrames)
 	with := func(extra map[string]any) map[string]any {
@@ -100,7 +128,8 @@ func (a *App) generateLocalLong(ctx context.Context, it histItem, m localModel, 
 				done++
 			}
 		}
-		total := 0.1*draftProg + 0.85*sum/float64(len(plan)) + 0.05*stitchProg
+		wd, wr, ws := longvideo.Weights(width, height, len(devices))
+		total := wd*draftProg + wr*sum/float64(len(plan)) + ws*stitchProg
 		st := stageText
 		if strings.HasPrefix(st, "rendering") {
 			st = fmt.Sprintf("rendering segments: %d of %d done on %d device(s)", done, len(plan), len(devices))
@@ -155,7 +184,7 @@ func (a *App) generateLocalLong(ctx context.Context, it histItem, m localModel, 
 				}
 				arts, err := runPy(sctx, rt, dev, filepath.Join(work, fmt.Sprintf("seg_%03d", i)), "ai.refine_segment",
 					fmt.Sprintf("%s-seg%d", it.ID, i), with(map[string]any{"seed": (seed + i) % 2147483647,
-						"width": int(num("width")), "height": int(num("height")), "index": i, "start": seg[0], "end": seg[1],
+						"width": width, "height": height, "index": i, "start": seg[0], "end": seg[1],
 						"name": fmt.Sprintf("segment_%03d", i)}), in,
 					func(f float64, _ string) { mu.Lock(); segProg[i] = f; mu.Unlock(); report() })
 				if err == nil && arts["segment_video"] == "" {

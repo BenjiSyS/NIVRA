@@ -351,6 +351,11 @@ class Pipeline:
         if int(ds.get("train_clips", 0)) < 1:
             raise PipelineError(f"{ds_dir}: the dataset has no train clips (videos too short / missing captions? "
                                 f"see the 'rejected' counts in dataset.json: {ds.get('rejected')})")
+        if int(ds.get("val_clips", 0)) < 1:
+            self.log("WARNING: the dataset has no validation split (too few videos for --val-fraction "
+                     f"{self.o.val_fraction}). Local training is unaffected, but network training with "
+                     "eval_gate=pi needs held-out validation shards and will not be possible with this dataset; "
+                     "add more videos or raise --val-fraction.")
         return {"files": [str(ds_dir / "dataset.json"), str(ds_dir / "manifest.jsonl")], "dataset_dir": str(ds_dir),
                 "fingerprint": ds["fingerprint"], "clips": ds["clips"], "train_clips": ds["train_clips"],
                 "val_clips": ds["val_clips"], "styles": ds.get("styles")}

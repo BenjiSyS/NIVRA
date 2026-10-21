@@ -128,6 +128,12 @@ func main() {
 
 func defaultConfig(role string) string {
 	if v := os.Getenv("NIVRA_CONFIG"); v != "" {
+		// An explicit config that does not exist must not silently fall back
+		// to defaults (and create data folders in the wrong place).
+		if _, err := os.Stat(v); err != nil {
+			fmt.Fprintf(os.Stderr, "NIVRA_CONFIG points to %s, which does not exist\n", v)
+			os.Exit(2)
+		}
 		return v
 	}
 	return filepath.Join("config", role+".json")

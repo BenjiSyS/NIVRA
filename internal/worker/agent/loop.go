@@ -214,6 +214,14 @@ func (a *Agent) heartbeatLoop(ctx context.Context, cl *client.Client) error {
 				a.logf("info", "heartbeat", "controller pause flag is now %v", resp.Paused)
 			}
 			a.handleInvalid(resp.InvalidAttempts)
+			if len(req.Attempts) > 0 && len(a.outboxAttempts()) > 0 {
+				// Results that could not be delivered during a short controller outage
+				// (fewer than 3 missed heartbeats keeps this session alive, so the
+				// flush at session start never runs). Their leases are kept alive by
+				// the heartbeat, so without a retry here the job would stay "running"
+				// on the controller forever.
+				a.flushOutbox(ctx, 20*time.Second)
+			}
 			if resp.PendingCommands > 0 {
 				a.processCommands(ctx, cl)
 			}

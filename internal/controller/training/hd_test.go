@@ -552,7 +552,7 @@ type hdRunFixture struct {
 	vae     string
 }
 
-func newRunFixture(t *testing.T, workers int, gate string) *hdRunFixture {
+func newRunFixture(t *testing.T, workers int, gate string, mods ...func(*RunConfig)) *hdRunFixture {
 	e := newHDEnv(t)
 	vae := e.version(e.project, map[string]any{"target": "vae", "family": "hd"}, e.art(e.project, "model_weights", randBytes(16)), e.art(e.project, "model_version", []byte(`{}`)), nil)
 	ds, err := e.s.RegisterDataset(e.ctx, core.System, e.project, registerRequest{Name: "lat", Kind: "latents",
@@ -568,6 +568,9 @@ func newRunFixture(t *testing.T, workers int, gate string) *hdRunFixture {
 	cfg := RunConfig{WorkersPerRound: workers, MinUpdates: 1, DataSeed: 42, Rounds: 3,
 		HDFields: HDFields{Family: "hd", HDConfig: "nivra_hd_tiny", DatasetID: ds.ID, InitVersionID: init, EvalGate: gate, ShardsPerJob: 2}}
 	cfg.Inner.InnerSteps, cfg.Inner.WarmupSteps = 10, 2
+	for _, m := range mods {
+		m(&cfg)
+	}
 	run, err := e.s.CreateRun(e.ctx, core.System, e.project, "hd run", cfg, "")
 	if err != nil {
 		t.Fatal(err)
@@ -605,10 +608,11 @@ type jobRow struct {
 	ids     []string
 	trusted bool
 	vram    int
+	gpu     bool
 }
 
 func (f *hdRunFixture) jobs() []jobRow {
-	rows, err := f.e.s.d.DB.Query(f.e.ctx, `SELECT id::text, idempotency_key, params, input_roles, input_artifacts::text[], req_trusted, req_vram_mb
+	rows, err := f.e.s.d.DB.Query(f.e.ctx, `SELECT id::text, idempotency_key, params, input_roles, input_artifacts::text[], req_trusted, req_vram_mb, req_gpu
 		FROM jobs WHERE job_type='ai.hd_train' ORDER BY idempotency_key`)
 	if err != nil {
 		f.e.t.Fatal(err)
@@ -618,7 +622,7 @@ func (f *hdRunFixture) jobs() []jobRow {
 	for rows.Next() {
 		var j jobRow
 		var pb []byte
-		if err := rows.Scan(&j.id, &j.key, &pb, &j.roles, &j.ids, &j.trusted, &j.vram); err != nil {
+		if err := rows.Scan(&j.id, &j.key, &pb, &j.roles, &j.ids, &j.trusted, &j.vram, &j.gpu); err != nil {
 			f.e.t.Fatal(err)
 		}
 		_ = json.Unmarshal(pb, &j.params)
@@ -662,8 +666,8 @@ func TestHDRoundJobsDeterministicAndIdempotent(t *testing.T) {
 			p.BaseVersionID != "v-init" || p.Seed != 0*1000003+hdSlot(0, 0, 2, i) {
 			t.Fatalf("params %+v", p)
 		}
-		if !j.trusted || j.vram != 5500 {
-			t.Fatalf("trusted=%v vram=%d", j.trusted, j.vram)
+		if !j.trusted || j.vram != 5500 || !j.gpu {
+			t.Fatalf("trusted=%v vram=%d gpu=%v", j.trusted, j.vram, j.gpu)
 		}
 	}
 	if js[0].params.UpdateID == js[1].params.UpdateID {
@@ -940,5 +944,75 @@ func TestWorkerGateCandidateFlow(t *testing.T) {
 	run, _ = e.s.runByID(e.ctx, f.run.ID)
 	if st != "rejected" || batch != 1 || run.Round != 1 || *run.ModelVersion != c.VersionID {
 		t.Fatalf("state=%s batch=%d round=%d", st, batch, run.Round)
+	}
+}
+
+// allow_cpu lets a GPU-less worker take train jobs (tiny configs, smoke tests): no GPU requirement, req_vram_mb 0 is
+// legal, and without the flag nothing changes (5500 MB and a GPU).
+func TestHDAllowCPU(t *testing.T) {
+	id := "11111111-1111-4111-8111-111111111111"
+	c := RunConfig{HDFields: HDFields{Family: "hd", HDConfig: "nivra_hd_tiny", DatasetID: id, InitVersionID: id, AllowCPU: true}}
+	c.Defaults()
+	if err := c.Validate(); err != nil || c.ReqVRAMMB != 0 {
+		t.Fatalf("allow_cpu defaults: vram=%d err=%v", c.ReqVRAMMB, err)
+	}
+	c.ReqVRAMMB = -1
+	if c.Validate() == nil {
+		t.Fatal("negative req_vram_mb accepted")
+	}
+	n := RunConfig{HDFields: HDFields{Family: "hd", HDConfig: "nivra_hd_tiny", DatasetID: id, InitVersionID: id}}
+	n.Defaults()
+	if n.ReqVRAMMB != 5500 {
+		t.Fatalf("default vram %d", n.ReqVRAMMB)
+	}
+	n.ReqVRAMMB = 0
+	if n.Validate() == nil {
+		t.Fatal("req_vram_mb 0 without allow_cpu accepted")
+	}
+	f := newRunFixture(t, 2, "off", func(c *RunConfig) { c.AllowCPU, c.ReqVRAMMB = true, 0 })
+	f.step()
+	js := f.jobs()
+	if len(js) != 2 {
+		t.Fatalf("jobs %d", len(js))
+	}
+	for _, j := range js {
+		if j.gpu || j.vram != 0 || !j.trusted {
+			t.Fatalf("cpu job: gpu=%v vram=%d trusted=%v", j.gpu, j.vram, j.trusted)
+		}
+	}
+}
+
+// The encode RAM request is configurable (an 8 GB laptop cannot take the 8192 MB default) and bounded.
+func TestEncodeReqRAM(t *testing.T) {
+	e := newHDEnv(t)
+	raw, err := e.s.RegisterDataset(e.ctx, core.System, e.project, registerRequest{Name: "raw", Kind: "raw", Shards: e.shards(e.project, "dataset_shard", 2, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vae := e.version(e.project, map[string]any{"target": "vae", "family": "hd"}, e.art(e.project, "model_weights", randBytes(16)), e.art(e.project, "model_version", []byte(`{}`)), nil)
+	te, tok := e.art(e.project, "text_encoder", randBytes(16)), e.art(e.project, "tokenizer", randBytes(16))
+	req := encodeRequest{VAEVersionID: vae, TextEncoderArtifact: te.ID, TokenizerArtifact: tok.ID, Stage: Stage{64, 64, 9, 8}, ReqRAMMB: 100}
+	if _, _, err := e.s.StartEncode(e.ctx, core.System, e.project, raw.ID, req); err == nil {
+		t.Fatal("req_ram_mb 100 accepted")
+	}
+	req.ReqRAMMB = 1024
+	if _, _, err := e.s.StartEncode(e.ctx, core.System, e.project, raw.ID, req); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = e.s.d.DB.QueryRow(e.ctx, `SELECT count(*) FROM jobs WHERE job_type='ai.hd_encode' AND req_ram_mb=1024`).Scan(&n)
+	if n != 2 {
+		t.Fatalf("encode jobs with req_ram_mb=1024: %d", n)
+	}
+	e2 := newHDEnv(t)
+	raw2, _ := e2.s.RegisterDataset(e2.ctx, core.System, e2.project, registerRequest{Name: "raw", Kind: "raw", Shards: e2.shards(e2.project, "dataset_shard", 1, 1)})
+	vae2 := e2.version(e2.project, map[string]any{"target": "vae", "family": "hd"}, e2.art(e2.project, "model_weights", randBytes(16)), e2.art(e2.project, "model_version", []byte(`{}`)), nil)
+	te2, tok2 := e2.art(e2.project, "text_encoder", randBytes(16)), e2.art(e2.project, "tokenizer", randBytes(16))
+	if _, _, err := e2.s.StartEncode(e2.ctx, core.System, e2.project, raw2.ID, encodeRequest{VAEVersionID: vae2, TextEncoderArtifact: te2.ID, TokenizerArtifact: tok2.ID, Stage: Stage{64, 64, 9, 8}}); err != nil {
+		t.Fatal(err)
+	}
+	_ = e2.s.d.DB.QueryRow(e2.ctx, `SELECT count(*) FROM jobs WHERE job_type='ai.hd_encode' AND req_ram_mb=8192`).Scan(&n)
+	if n != 1 {
+		t.Fatalf("default encode RAM should stay 8192: %d", n)
 	}
 }

@@ -58,6 +58,7 @@ type HDFields struct {
 	ShardsPerJob   int        `json:"shards_per_job,omitempty"`
 	DeltaDtype     string     `json:"delta_dtype,omitempty"`
 	ReqVRAMMB      int        `json:"req_vram_mb,omitempty"`
+	AllowCPU       bool       `json:"allow_cpu,omitempty"` // GPU-less workers may take train/eval jobs (tiny configs, smoke tests; req_vram_mb may be 0)
 	EvalGate       string     `json:"eval_gate,omitempty"` // pi | worker | off
 	EvalClips      int        `json:"eval_clips,omitempty"`
 	BoundC         float64    `json:"bound_c,omitempty"`
@@ -131,7 +132,7 @@ func (c *RunConfig) hdDefaults() {
 	if c.LeaseSeconds == 0 {
 		c.LeaseSeconds = 900
 	}
-	if c.ReqVRAMMB == 0 {
+	if c.ReqVRAMMB == 0 && !c.AllowCPU {
 		c.ReqVRAMMB = 5500
 		if large {
 			c.ReqVRAMMB = 22000
@@ -181,8 +182,8 @@ func (c RunConfig) validateHD() error {
 		return bad("bound_c (0, 100]")
 	case c.RedundancyFrac != 0:
 		return bad("redundancy_frac > 0 (duplicate-work cosine checks for untrusted devices) is not implemented; use trusted devices")
-	case c.ReqVRAMMB < 1 || c.ReqVRAMMB > 1<<20 || c.ReqRAMMB < 1:
-		return bad("req_vram_mb and req_ram_mb must be positive")
+	case c.ReqVRAMMB < 0 || (c.ReqVRAMMB < 1 && !c.AllowCPU) || c.ReqVRAMMB > 1<<20 || c.ReqRAMMB < 1:
+		return bad("req_vram_mb and req_ram_mb must be positive (req_vram_mb may be 0 only with allow_cpu)")
 	case c.Inner.GradAccum < 1 || c.Inner.GradAccum > 64:
 		return bad("inner.grad_accum 1..64")
 	case c.Inner.WarmupSteps < 0 || c.Inner.WarmupSteps > c.Inner.InnerSteps:
@@ -670,7 +671,7 @@ func (s *Service) ensureHDRoundJobs(ctx context.Context, run *Run) error {
 			pb, _ := json.Marshal(params)
 			mv, rid := *run.ModelVersion, run.ID
 			if _, err := s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: run.ProjectID, JobType: "ai.hd_train", Params: pb, Inputs: inputs,
-				ReqRAMMB: c.ReqRAMMB, ReqVRAMMB: c.ReqVRAMMB, ReqGPU: true, Priority: 10, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds,
+				ReqRAMMB: c.ReqRAMMB, ReqVRAMMB: c.ReqVRAMMB, ReqGPU: !c.AllowCPU, Priority: 10, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds,
 				ReqTrusted: trusted, ModelVersion: &mv, TrainingRunID: &rid,
 				IdempotencyKey: fmt.Sprintf("%sb%d:w%d", roundKeyPrefix(run.ID, run.Round), run.RoundBatch, i)}); err != nil {
 				return err
@@ -1157,7 +1158,7 @@ func (s *Service) ensureEvalJob(ctx context.Context, run *Run, versionID string,
 	params, _ := json.Marshal(map[string]any{"version_id": versionID, "triples_seed": hdTriplesSeed(c), "n": c.EvalClips, "timestep_buckets": 4})
 	mv, rid := *run.ModelVersion, run.ID
 	id, err := s.sched.Create(ctx, nil, scheduler.NewJob{ProjectID: run.ProjectID, JobType: "ai.hd_eval", Params: params, Inputs: inputs,
-		ReqRAMMB: c.ReqRAMMB, ReqVRAMMB: c.ReqVRAMMB, ReqGPU: true, Priority: 12, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds,
+		ReqRAMMB: c.ReqRAMMB, ReqVRAMMB: c.ReqVRAMMB, ReqGPU: !c.AllowCPU, Priority: 12, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds,
 		ReqTrusted: true, ModelVersion: &mv, TrainingRunID: &rid, IdempotencyKey: key})
 	if err != nil {
 		return nil, err

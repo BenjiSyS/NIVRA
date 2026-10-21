@@ -104,3 +104,37 @@ func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+// Regression (found by the real e2e run): the history keeps the request's Go
+// types (int, int64) until the app restarts, and the long local video read
+// width/height/fps/seed with a float64 assertion, so segments were sent with
+// width 0 ("params.width must be >= 32").
+func TestLocalLongVideoParamsSurviveInMemory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "models", "tiny")
+	writeBundle(t, dir, map[string]any{"schema": "nivra.model_version/1", "family": "hd", "default_resolution": []int{96, 64},
+		"default_seconds": 0.5, "default_fps": 30})
+	m, err := inspectBundle(dir)
+	if err != nil || m.DefaultWidth != 96 || m.DefaultHeight != 64 {
+		t.Fatalf("native size: %+v %v", m, err)
+	}
+	a := &App{Dir: t.TempDir(), ModelDirs: []string{filepath.Join(root, "models")}, Runtime: func() LocalRuntime { return LocalRuntime{} }}
+	a.Init()
+	h := (&Server{App: a}).Handler()
+	rec := doLocal(t, h, "POST", "/local/api/app/generate",
+		`{"prompt":"x","model_version":`+jsonString(localID(dir))+`,"width":128,"height":64,"fps":24,"seed":7,"seconds":2}`, nil)
+	if rec.Code != 200 {
+		t.Fatalf("generate: %d %s", rec.Code, rec.Body)
+	}
+	a.mu.Lock()
+	params := a.items[0].Params
+	a.mu.Unlock()
+	for k, want := range map[string]float64{"width": 128, "height": 64, "fps": 24, "seed": 7, "seconds": 2} {
+		if got := paramNum(params, k); got != want {
+			t.Errorf("paramNum(%s) = %v, want %v", k, got, want)
+		}
+	}
+	if paramNum(params, "missing") != 0 {
+		t.Error("missing param must be 0")
+	}
+}

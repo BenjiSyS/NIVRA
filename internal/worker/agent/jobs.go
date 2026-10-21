@@ -247,6 +247,11 @@ func (a *Agent) runTask(ctx context.Context, cl *client.Client, t *activeTask) {
 	t.mu.Lock()
 	reason := t.reason
 	t.mu.Unlock()
+	// Was the task stopped from outside? Must be read BEFORE t.cancel(): that call
+	// (made only to end the progress publisher) cancels this same context, so
+	// reading it afterwards made every failure look like a stop and an invalid
+	// request (e.g. an unknown style) was requeued forever instead of failing.
+	interrupted := ctx.Err() != nil
 	t.cancel()
 	<-pubDone
 
@@ -256,7 +261,7 @@ func (a *Agent) runTask(ctx context.Context, cl *client.Client, t *activeTask) {
 		a.logf("info", "jobs", "attempt %s discarded", job.AttemptID)
 		a.cleanupWork(job.AttemptID, false)
 		return
-	case errors.Is(err, executor.ErrStopped) || (err != nil && ctx.Err() != nil):
+	case errors.Is(err, executor.ErrStopped) || (err != nil && interrupted):
 		a.logf("info", "jobs", "attempt %s stopped; returning it to the queue", job.AttemptID)
 		entry.Fail = &protocol.JobFailRequest{FencingToken: job.FencingToken, Code: "STOPPED", Message: "stopped on request", Retryable: true}
 	case err != nil:

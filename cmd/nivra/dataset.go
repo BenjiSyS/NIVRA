@@ -26,7 +26,7 @@ import (
 const datasetUsage = `Register training data with a Nivra controller.
 
   nivra dataset push DIR [--kind raw|latents] [--name NAME] [--redistribution owner_devices|any]
-                         [--url URL --project NAME]
+                         --url URL [--project NAME]
 
 DIR is a dataset directory written by "nivra.cli data-ingest" (raw clips) or by the
 latents stage of "train-pipeline" (latents); it must contain dataset.json.
@@ -97,6 +97,11 @@ func cmdDataset(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *kind == "latents" {
+		if err := latentsEncoderCheck(man, *vae, *te); err != nil {
+			return err
+		}
+	}
 	r, pid, err := connectRemote(ctx, *url, *user, *project)
 	if err != nil {
 		return err
@@ -159,6 +164,30 @@ type datasetManifest struct {
 	Frames  int            `json:"frames"`
 	FPS     float64        `json:"fps"`
 	Encoder map[string]any `json:"encoder"`
+	// A latents dataset written by train-pipeline carries these at the top level (no "encoder" block).
+	LatentStage   map[string]any `json:"stage"`
+	TextEncoderID string         `json:"text_encoder_id"`
+	VAEVersionID  string         `json:"vae_version_id"`
+}
+
+// latentsEncoderCheck fails before any upload when a latents dataset cannot be registered: the controller needs the
+// model version id of the frozen VAE (it is not in dataset.json: the id exists only after "nivra model import"),
+// the text encoder id and the stage.
+func latentsEncoderCheck(m *datasetManifest, vaeFlag, teFlag string) error {
+	var miss []string
+	if vaeFlag == "" && m.Encoder["vae_version_id"] == nil {
+		miss = append(miss, `--vae-version ID (the model version id that "nivra model import" printed for this run's bundle)`)
+	}
+	if teFlag == "" && m.Encoder["text_encoder_id"] == nil {
+		miss = append(miss, "--text-encoder-id SHA256 (dataset.json has none)")
+	}
+	if m.Encoder["stage"] == nil {
+		miss = append(miss, "a stage {h,w,frames,fps} (dataset.json has none)")
+	}
+	if len(miss) > 0 {
+		return errors.New("a latents dataset needs " + strings.Join(miss, " and "))
+	}
+	return nil
 }
 
 func (m *datasetManifest) stage() map[string]any {
@@ -197,6 +226,15 @@ func readDatasetManifest(dir string) (*datasetManifest, error) {
 	}
 	if st := m.stage(); st != nil && m.Encoder["stage"] == nil {
 		m.Encoder["stage"] = st
+	}
+	if m.Encoder["stage"] == nil && m.LatentStage != nil {
+		m.Encoder["stage"] = m.LatentStage
+	}
+	if m.Encoder["text_encoder_id"] == nil && m.TextEncoderID != "" {
+		m.Encoder["text_encoder_id"] = m.TextEncoderID
+	}
+	if m.Encoder["vae_version_id"] == nil && m.VAEVersionID != "" {
+		m.Encoder["vae_version_id"] = m.VAEVersionID
 	}
 	return m, nil
 }

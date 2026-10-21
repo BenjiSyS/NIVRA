@@ -44,6 +44,9 @@ type localModel struct {
 	// One model clip; longer videos are built from segments.
 	DefaultSeconds float64 `json:"default_seconds"`
 	DefaultFPS     int     `json:"default_fps"`
+	// The model's native output size (default_resolution in its manifest).
+	DefaultWidth  int `json:"default_width"`
+	DefaultHeight int `json:"default_height"`
 }
 
 const localPrefix = "local:"
@@ -72,6 +75,7 @@ func inspectBundle(dir string) (localModel, error) {
 		DefaultStyle string   `json:"default_style"`
 		DefSeconds   float64  `json:"default_seconds"`
 		DefFPS       float64  `json:"default_fps"`
+		DefRes       []int    `json:"default_resolution"`
 	}
 	if err := json.Unmarshal(b, &m); err != nil || !strings.HasPrefix(m.Schema, "nivra.model_version/") {
 		return localModel{}, errors.New("model_version.json is not a Nivra model manifest")
@@ -98,8 +102,13 @@ func inspectBundle(dir string) (localModel, error) {
 	if m.DefFPS <= 0 {
 		m.DefFPS = 30
 	}
+	w, h := 1280, 720
+	if len(m.DefRes) == 2 && m.DefRes[0] >= 32 && m.DefRes[1] >= 32 {
+		w, h = m.DefRes[0], m.DefRes[1]
+	}
 	return localModel{ID: localID(dir), Path: dir, Name: name, Family: fam, Params: int64(m.Params),
-		Styles: m.Styles, DefaultStyle: m.DefaultStyle, DefaultSeconds: m.DefSeconds, DefaultFPS: int(m.DefFPS)}, nil
+		Styles: m.Styles, DefaultStyle: m.DefaultStyle, DefaultSeconds: m.DefSeconds, DefaultFPS: int(m.DefFPS),
+		DefaultWidth: w, DefaultHeight: h}, nil
 }
 
 // localModels returns the loaded bundles plus bundles found in the default
@@ -109,6 +118,11 @@ func (a *App) localModels() []localModel {
 	paths := append(append([]string(nil), a.cfg.LocalModels...), a.discovered...)
 	a.mu.Unlock()
 	for _, root := range a.ModelDirs {
+		// Relative folders (e.g. "models" next to Nivra.exe) must become absolute:
+		// inspectBundle only accepts absolute paths.
+		if abs, err := filepath.Abs(root); err == nil {
+			root = abs
+		}
 		ents, _ := os.ReadDir(root)
 		for _, e := range ents {
 			if e.IsDir() {
@@ -266,7 +280,7 @@ func (a *App) generateLocal(ctx context.Context, it histItem) {
 		return
 	}
 	defer os.RemoveAll(work)
-	if secs, _ := it.Params["seconds"].(float64); m.Family == "hd" && secs > m.DefaultSeconds {
+	if secs := paramNum(it.Params, "seconds"); m.Family == "hd" && secs > m.DefaultSeconds {
 		video, err := a.generateLocalLong(jctx, it, m, rt, work)
 		if jctx.Err() != nil {
 			a.update(it.ID, func(h *histItem) {

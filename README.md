@@ -166,6 +166,16 @@ project code and it trains and generates for everyone too. It only gets jobs tha
 budget, so HD jobs that need a GPU never land on a CPU-only computer. Closing the window or
 **Quit Nivra** stops the app and this computer's worker. Details: [docs/getting-started/APP_UI.md](docs/getting-started/APP_UI.md).
 
+* **Models are found automatically**: model folders in `models` next to Nivra.exe, Downloads, Desktop, Documents,
+  Videos or ComfyUI are detected (Models → Search now) and the best one is picked. Models on this computer run
+  without any controller.
+* **Under the prompt box**: Resolution (144p, 480p, 720p, 1080p, 1440p), FPS and Length typed as `8s`, `2 min` or
+  `1.5 h` (up to 3 hours). You can also type them in the message (`…, 2 min 24fps 1080p`). Sampling steps are
+  automatic. Before sending you see an estimated time; while running, the time left.
+* **Long videos** (longer than the model's 8 s clip) are drawn once at low resolution, then split into segments
+  that every connected GPU renders at the same time (other people's workers too), then joined.
+* **Several GPUs** in one computer: one worker per GPU, so all of them take part.
+
 ### Manual
 
 1. Install Git (optional) and download/clone Nivra.
@@ -256,10 +266,27 @@ Workers can generate verified shards (`ai.dataset_shard`), which the controller 
 
 ### Captioning downloaded videos
 
-`nivra caption --install` once, then `nivra caption D:ideos --limit 100` writes `<name>.txt` (what is visible, with a
+`nivra caption --install` once (the one-file setup already does it), then `nivra caption D:\videos\batch1 --limit 100` writes `<name>.txt` (what is visible, with a
 style tag such as "Anime style.") and, when there is speech or an embedded subtitle track, `<name>.subtitles.txt` next to
 each video. Existing captions are never overwritten without `--overwrite`; run the same command again to continue with the
 next 100. Uses Florence-2 and faster-whisper locally. Details: [docs/training/CAPTIONING.md](docs/training/CAPTIONING.md).
+
+### Training on your own videos
+
+1. Put the videos in a folder you have the rights to use, add a `PROVENANCE.json` (source, licence, consent).
+2. `nivra caption FOLDER --limit 100` until every video has a `.txt` (check and edit captions: they decide
+   what the model learns).
+3. One computer: `python -m nivra.cli train-pipeline --config nivra_base --videos FOLDER --out RUN` (ingest →
+   tokenizer → text encoder → VAE → latents → DiT → bundle; every stage resumes). The finished model is written to
+   the `models` folder, where Nivra.exe finds it by itself.
+4. Many computers: import the bundle (`nivra model import`), `nivra dataset push RUN\latents --kind latents`, then
+   start an HD training run in Studio → Training. Trusted GPU workers train in rounds; the controller checks every
+   update and only promotes versions whose held-out loss does not get worse.
+
+Honest expectations: `nivra_base` (213 M) trains on a 6 GB RTX 2060 at 256p; Medium needs 16–24 GB GPUs. Good
+open-ended video needs very large compute; narrow the subject (one style), start small (images/128p/2 s) and
+grow. Full guide: [docs/training/TRAINING.md](docs/training/TRAINING.md), design:
+[docs/architecture/HD_TRAINING.md](docs/architecture/HD_TRAINING.md).
 
 ## 21. Model Architecture
 

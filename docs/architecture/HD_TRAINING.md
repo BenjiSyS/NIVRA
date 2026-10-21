@@ -103,6 +103,8 @@ BPE → NivraText MLM → VAE → latents → DiT → bundle, each stage resumab
 use the `latent_shard` format. Hand-off to distributed: `nivra model import BUNDLE` → `nivra dataset push --kind
 latents` → RunConfig `init_*`.
 
+Text encoder on the network: `nivra model import` packs a Nivra-trained `text_encoder/` into a deterministic tar artifact (kind `text_encoder_archive`, `model_versions.text_encoder_artifact`, migration 0009); `versionInputs` and long-video generations add it as input role `text_encoder_archive` to `ai.generate`/`ai.draft`/`ai.refine_segment`/`ai.evaluate`, and the worker verifies and extracts it (no `NIVRA_TEXT_ENCODERS_DIR` needed). `external` encoders are never packed. HD training jobs are unchanged: `ai.hd_encode` keeps taking `text_encoder_weights` + `tokenizer`, and DiT training/eval work on precomputed latents/embeddings, so they never need the archive.
+
 ### Controller conventions (fixed by the controller implementation)
 
 These are the exact shapes `internal/controller/training/{hd_orchestrator,hd_validators,datasets}.go` produce and check.

@@ -129,11 +129,29 @@ one machine (a 6 GB GPU is enough for `nivra_base`; a CPU works for tiny tests o
    option (for example `--dit-steps`) re-runs only that stage and the ones after it. `--from-stage` / `--to-stage` run part of the
    chain (for instance `--to-stage latents` overnight, DiT the next day); `--force` re-runs the selected stages.
 5. **Use it.** The bundle is written to `<install>\models\anime-v1` (`model_version.json`, `weights.safetensors`, `vae.safetensors`,
-   `text_encoder\`). `Nivra.exe` scans `<install>\models`, so the model appears in its model list (Rescan if it is already open). Without
+   `text_encoder\`). `Nivra.exe` scans `<install>\models`, so the model appears in its model list (Rescan if it is already open; known issue: the app currently ignores the relative `.\models` folder, so copy the bundle to `<data_dir>\models` or load it by its full path). Without
    `--install-dir` the bundle is `RUN\bundle`; copy it into any folder the app scans, or point `--bundle-out` at one.
 6. **Or train on the network instead.** Use the finished `RUN\latents` (already encoded, `nivra-latents/1` shards) and the bundle as the
-   starting version: `nivra model import RUN\bundle`, `nivra dataset push RUN\latents --kind latents`, then create an HD training run on
-   the controller (`docs/architecture/HD_TRAINING.md`). Workers then train rounds of the same DiT on those latents.
+   starting version. Measured end to end on a laptop with the tiny config:
+
+       nivra model import --project main --bundle RUN\bundle          (prints the model version id; run it while the controller is stopped)
+       nivra dataset push RUN\latents --kind latents --vae-version <that version id> --url http://CONTROLLER:8740 --project main
+
+   `--url` is required and the token comes from `NIVRA_TOKEN`. `--vae-version` is required for latents because `dataset.json` cannot know
+   the id the controller gave the bundle. Mark the workers trusted (Studio, Workers page), then create an HD training run
+   (Studio, Training, or `POST /training/runs` with `family: hd`; `docs/architecture/HD_TRAINING.md`). Notes:
+   * A dataset needs a validation shard for `eval_gate: pi`. With few videos the ingest may put none aside (the split is by video, 5 %
+     by default): `train-pipeline` prints a warning when that happens; pass `--val-fraction 0.2`, add videos, or use `eval_gate: off`.
+   * `train` and `eval` jobs need a GPU worker by default. For a tiny config on CPU-only machines set `allow_cpu: true`, `req_vram_mb: 0`
+     and a small `req_ram_mb` in the run config.
+   * To encode raw shards on the network instead (`nivra dataset push RUN\dataset`, then `POST /datasets/{id}/encode`), upload the
+     bundle's `text_encoder\model.safetensors` (artifact kind `text_encoder`) and `tokenizer.json` (kind `tokenizer`) and pass their ids.
+     Encode jobs ask for 8192 MB of RAM by default; pass `req_ram_mb` to lower it for small configs.
+   * **Generating on other computers needs no encoder setup.** `nivra model import` packs the bundle's `text_encoder/` directory
+     (the Nivra-trained encoder) into a deterministic tar artifact (kind `text_encoder_archive`) and the controller hands it to every
+     worker that generates, drafts or refines with that model; the worker verifies it against the manifest's `text_encoder.sha256`,
+     extracts it safely into its cache and uses it. Only an `external` third-party encoder (licensed weights, never uploaded) still
+     has to be placed in `NIVRA_TEXT_ENCODERS_DIR` on each worker, see `docs/training/TEXT_ENCODERS.md`.
 
 Troubleshooting: "no train clips" after ingest means the videos were shorter than 2 s, lower resolution than 448x256 or lacked a caption
 (the counts are in `RUN\dataset\dataset.json`, key `rejected`). A `StreamStateTooLarge` error while decoding means the VAE tile size is too small for the output size:

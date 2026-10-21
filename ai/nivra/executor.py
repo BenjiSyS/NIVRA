@@ -186,7 +186,7 @@ SCHEMAS = {
         params={"mode": S(req=True, choices=["adherence", "reconstruction", "detector"]), "num_prompts": I(16, min=1, max=200),
                 "seeds_per_prompt": I(1, min=1, max=8), "steps": I(20, min=2, max=100), "cfg_scale": F(3.0, min=0.0, max=20.0),
                 "num_clips": I(64, min=1, max=512), "eval_seed": I(777), "prompts_file": S(None)},
-        inputs={"weights": False, "manifest": False, "vae_weights": False}),
+        inputs={"weights": False, "manifest": False, "vae_weights": False, "text_encoder_archive": False}),
     "ai.generate": dict(
         params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "steps": I(30, min=1, max=200),
                 "cfg_scale": F(3.0, min=0.0, max=20.0), "fps": I(8, min=1, max=60), "upscale": I(4, min=1, max=8),
@@ -197,7 +197,7 @@ SCHEMAS = {
                 "fp16": B(None), "offload": S(None, choices=["none", "blocks"]),
                 # style tag (canonical, alias or "none"); None = the HD manifest's default_style
                 "style": S(None, maxlen=64)},
-        inputs={"weights": True, "manifest": True, "vae_weights": True}),
+        inputs={"weights": True, "manifest": True, "vae_weights": True, "text_encoder_archive": False}),
     # long videos (docs/architecture/LONG_VIDEO.md)
     "ai.draft": dict(
         params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "style": S(None, maxlen=64),
@@ -206,7 +206,7 @@ SCHEMAS = {
                 "segment_frames": I(241, min=9, max=4097), "steps": I(None, min=1, max=200),
                 "cfg_scale": F(None, min=0.0, max=20.0), "name": S("draft", maxlen=64), "fp16": B(None),
                 "offload": S(None, choices=["none", "blocks"])},
-        inputs={"weights": True, "manifest": True, "vae_weights": True}),
+        inputs={"weights": True, "manifest": True, "vae_weights": True, "text_encoder_archive": False}),
     "ai.refine_segment": dict(
         params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "style": S(None, maxlen=64),
                 "sampler": S(None, choices=["euler", "ab2"]), "width": I(req=True, min=32, max=2560),
@@ -214,7 +214,8 @@ SCHEMAS = {
                 "start": I(req=True, min=0), "end": I(req=True, min=0), "strength": F(0.55, exclusive_min=0.0, max=1.0),
                 "steps": I(None, min=1, max=200), "cfg_scale": F(None, min=0.0, max=20.0),
                 "name": S("segment", maxlen=64), "fp16": B(None), "offload": S(None, choices=["none", "blocks"])},
-        inputs={"weights": True, "manifest": True, "vae_weights": True, "draft_video": True}),
+        inputs={"weights": True, "manifest": True, "vae_weights": True, "draft_video": True,
+                "text_encoder_archive": False}),
     "ai.stitch": dict(
         params={"fps": I(30, min=1, max=60), "crossfade_frames": I(4, min=0, max=16), "count": I(req=True, min=1, max=4096),
                 "name": S("video", maxlen=64)},
@@ -495,6 +496,23 @@ def _hd_manifest(ctx: Ctx):
         return None
 
 
+def _text_encoder_dir(ctx: Ctx, m: Optional[dict]):
+    """Directory of the Nivra text encoder shipped with the model (input `text_encoder_archive`), extracted
+    safely into a cache next to the archive and keyed by its sha256; None when no archive was given or the
+    manifest does not use a Nivra-trained encoder."""
+    from .inference.bundle import BundleError
+    from .inference.te_archive import extract_text_encoder_archive
+    arc = ctx.path("text_encoder_archive", required=False)
+    te = (m or {}).get("text_encoder")
+    if arc is None or not isinstance(te, dict) or te.get("kind") != "nivra":
+        return None
+    sha = te.get("sha256")
+    try:
+        return extract_text_encoder_archive(arc, arc.parent / "te_cache", sha if isinstance(sha, str) and sha else None)
+    except BundleError as e:
+        raise InputInvalid(str(e))
+
+
 def h_generate_hd(ctx: Ctx, p: dict, m: dict) -> dict:
     from .inference.bundle import BundleError
     from .inference.hd_bundle import hd_summary, load_hd_bundle_files, save_hd_result
@@ -513,7 +531,8 @@ def h_generate_hd(ctx: Ctx, p: dict, m: dict) -> dict:
     if p["offload"] is not None:
         over["offload"] = p["offload"] == "blocks"
     try:
-        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(), **over)
+        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(),
+                                    text_encoder_dir=_text_encoder_dir(ctx, m), **over)
     except BundleError as e:
         raise InputInvalid(str(e))
     ctx.check_stop()
@@ -563,7 +582,8 @@ def _long_pipe(ctx: Ctx, p: dict, job: str):
     if p["offload"] is not None:
         over["offload"] = p["offload"] == "blocks"
     try:
-        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(), **over)
+        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(),
+                                    text_encoder_dir=_text_encoder_dir(ctx, m), **over)
     except BundleError as e:
         raise InputInvalid(str(e))
     ctx.check_stop()
@@ -693,7 +713,8 @@ def _evaluate_stylized_hd(ctx: Ctx, p: dict) -> dict:
     from .inference.hd_bundle import load_hd_bundle_files
     from .inference.sampler import Stopped
     try:
-        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device())
+        pipe = load_hd_bundle_files(ctx.path("weights"), ctx.path("manifest"), ctx.path("vae_weights"), _device(),
+                                    text_encoder_dir=_text_encoder_dir(ctx, _hd_manifest(ctx)))
     except BundleError as e:
         raise InputInvalid(str(e))
     prompts = sty.load_stylized_prompts(p["prompts_file"])[: p["num_prompts"]]

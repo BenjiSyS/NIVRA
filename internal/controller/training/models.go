@@ -2,6 +2,8 @@ package training
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,9 +19,11 @@ import (
 
 // ImportBundle registers an existing model bundle (weights, manifest and the
 // VAE it was trained with) as a model version usable for generation and as a
-// starting point for training runs. The three files must already be stored
-// as artifacts of the project.
-func (s *Service) ImportBundle(ctx context.Context, actor core.Actor, projectID, name, weightsID, manifestID, vaeID string, activate bool) (string, error) {
+// starting point for training runs. The files must already be stored as
+// artifacts of the project. textEncoderID is optional: the packed text_encoder/
+// directory (kind text_encoder_archive) of a bundle whose manifest says
+// text_encoder.kind == "nivra"; external encoders are never stored.
+func (s *Service) ImportBundle(ctx context.Context, actor core.Actor, projectID, name, weightsID, manifestID, vaeID, textEncoderID string, activate bool) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 80 {
 		return "", fmt.Errorf("%w: name must be 1-80 characters", ErrBadConfig)
@@ -47,6 +51,28 @@ func (s *Service) ImportBundle(ctx context.Context, actor core.Actor, projectID,
 	if vs := str("vae_sha256"); vs != "" && vs != vInfo.SHA256 {
 		return "", fmt.Errorf("%w: the VAE is not the one this model was trained with", ErrBadConfig)
 	}
+	var teArg any // NULL unless a Nivra encoder archive is supplied
+	if textEncoderID != "" {
+		te, _ := man["text_encoder"].(map[string]any)
+		if k, _ := te["kind"].(string); k != "nivra" {
+			return "", fmt.Errorf("%w: only Nivra-trained text encoders are stored with a model (manifest text_encoder.kind is %q); external encoders stay in NIVRA_TEXT_ENCODERS_DIR", ErrBadConfig, k)
+		}
+		tPath, tInfo, err := s.store.Path(ctx, projectID, textEncoderID)
+		if err != nil {
+			return "", fmt.Errorf("%w: text encoder artifact unavailable", ErrBadConfig)
+		}
+		if tInfo.Kind != KindTextEncoderArchive {
+			return "", fmt.Errorf("%w: text encoder artifact must have kind %s", ErrBadConfig, KindTextEncoderArchive)
+		}
+		got, err := inspectTextEncoderArchive(tPath)
+		if err != nil {
+			return "", err
+		}
+		if want, _ := te["sha256"].(string); want != "" && want != got {
+			return "", fmt.Errorf("%w: the text encoder archive does not match the manifest's text_encoder.sha256", ErrBadConfig)
+		}
+		teArg = textEncoderID
+	}
 	arch := str("config_name")
 	if !validName(arch) {
 		arch = "imported"
@@ -64,11 +90,12 @@ func (s *Service) ImportBundle(ctx context.Context, actor core.Actor, projectID,
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO model_versions (id, project_id, architecture_id, version_number, weights_artifact,
-				manifest_artifact, vae_artifact, manifest, display_name)
-			VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8)`, id, projectID, arch, weightsID, manifestID, vaeID, raw, name); err != nil {
+				manifest_artifact, vae_artifact, manifest, display_name, text_encoder_artifact)
+			VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9)`, id, projectID, arch, weightsID, manifestID, vaeID, raw, name, teArg); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE artifacts SET protected=true WHERE id IN ($1,$2,$3)`, weightsID, manifestID, vaeID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE artifacts SET protected=true WHERE id IN ($1,$2,$3)
+			OR ($4::uuid IS NOT NULL AND id = $4::uuid)`, weightsID, manifestID, vaeID, teArg); err != nil {
 			return err
 		}
 		if activate {
@@ -95,7 +122,57 @@ func (s *Service) ImportBundleDir(ctx context.Context, actor core.Actor, project
 		}
 		ids[kind] = info.ID
 	}
-	return s.ImportBundle(ctx, actor, projectID, name, ids["model_weights"], ids["model_version"], ids["vae_weights"], activate)
+	teID, err := s.importTextEncoder(ctx, projectID, dir)
+	if err != nil {
+		return "", err
+	}
+	return s.ImportBundle(ctx, actor, projectID, name, ids["model_weights"], ids["model_version"], ids["vae_weights"], teID, activate)
+}
+
+// importTextEncoder packs <dir>/text_encoder into a text_encoder_archive
+// artifact when the bundle's manifest names a Nivra-trained encoder. It
+// returns "" when there is nothing to store: no text_encoder/ directory, or a
+// stub or external encoder (external encoders are licensed third-party
+// weights and are never packed or uploaded).
+func (s *Service) importTextEncoder(ctx context.Context, projectID, dir string) (string, error) {
+	src := filepath.Join(dir, TextEncoderDir)
+	if _, err := os.Lstat(src); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "model_version.json"))
+	if err != nil {
+		return "", err
+	}
+	var m struct {
+		TE struct {
+			Kind string `json:"kind"`
+		} `json:"text_encoder"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "", fmt.Errorf("%w: manifest unreadable: %v", ErrBadConfig, err)
+	}
+	if m.TE.Kind != "nivra" {
+		return "", nil
+	}
+	tmp, err := os.CreateTemp("", "nivra-te-*.tar")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	err = PackTextEncoderDir(src, tmp)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", err
+	}
+	info, err := s.store.Import(ctx, projectID, KindTextEncoderArchive, tmp.Name(), "")
+	if err != nil {
+		return "", fmt.Errorf("import text encoder: %w", err)
+	}
+	return info.ID, nil
 }
 
 // Activate makes a model version the project's default for generation.
@@ -119,13 +196,14 @@ func (s *Service) registerModelRoutes(r *api.Router) {
 			WeightsArtifact  string `json:"weights_artifact"`
 			ManifestArtifact string `json:"manifest_artifact"`
 			VAEArtifact      string `json:"vae_artifact"`
+			TextEncoder      string `json:"text_encoder_artifact"`
 			Activate         bool   `json:"activate"`
 		}
 		if err := api.DecodeJSON(w, req, 8192, &body); err != nil {
 			api.WriteErr(w, 400, protocol.ErrBadRequest, "malformed request")
 			return
 		}
-		id, err := s.ImportBundle(req.Context(), a.Actor, a.ProjectID, body.Name, body.WeightsArtifact, body.ManifestArtifact, body.VAEArtifact, body.Activate)
+		id, err := s.ImportBundle(req.Context(), a.Actor, a.ProjectID, body.Name, body.WeightsArtifact, body.ManifestArtifact, body.VAEArtifact, body.TextEncoder, body.Activate)
 		if err != nil {
 			s.writeErr(w, req, r, err)
 			return

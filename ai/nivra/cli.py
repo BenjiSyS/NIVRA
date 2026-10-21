@@ -10,8 +10,13 @@ import json
 import sys
 from pathlib import Path
 
-WORKER_JOB_TYPES = ["ai.dataset_shard", "ai.local_train", "ai.evaluate", "ai.generate"]
-CONTROLLER_JOB_TYPES = ["ai.init_model", "ai.validate_update", "ai.aggregate"]
+# Job types a worker advertises to the controller (the claim query only hands out
+# types a device lists). Every handler in executor.HANDLERS that is not controller
+# side must be here, or the controller creates jobs that no worker ever claims.
+WORKER_JOB_TYPES = ["ai.dataset_shard", "ai.local_train", "ai.evaluate", "ai.generate",
+                    "ai.draft", "ai.refine_segment", "ai.stitch",
+                    "ai.hd_encode", "ai.hd_train", "ai.hd_eval"]
+CONTROLLER_JOB_TYPES = ["ai.init_model", "ai.validate_update", "ai.aggregate", "ai.hd_aggregate"]
 
 
 def _cmd_train_vae(a):

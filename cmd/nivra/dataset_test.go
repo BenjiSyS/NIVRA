@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +81,30 @@ func TestReadDatasetManifest(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "dataset.json"), []byte(`{"shards":[{"file":"../x","split":"train","clips":1}]}`), 0o600)
 	if _, err := readDatasetManifest(dir); err == nil {
 		t.Fatal("path traversal in shard file accepted")
+	}
+}
+
+// A latents dataset written by train-pipeline has stage / text_encoder_id at the top level (no "encoder" block): the
+// push must find them there, and demand the VAE model version id (only known after "nivra model import") up front.
+func TestLatentsManifestFromPipeline(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "dataset.json"), []byte(`{"fingerprint":"abc","format":"nivra-latents-dataset/1",
+		"vae_version":"deadbeef","text_encoder_id":"cafe","stage":{"h":64,"w":64,"frames":17,"fps":8},
+		"shards":[{"file":"lat-train-00000.safetensors","split":"train","clips":9,"sha256":"y"}]}`), 0o600)
+	m, err := readDatasetManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Encoder["text_encoder_id"] != "cafe" || m.Encoder["stage"] == nil {
+		t.Fatalf("encoder not read from the top level: %+v", m.Encoder)
+	}
+	if m.Encoder["vae_version_id"] != nil {
+		t.Fatal("the VAE content hash must not be mistaken for a model version id")
+	}
+	if err := latentsEncoderCheck(m, "", ""); err == nil || !strings.Contains(err.Error(), "--vae-version") {
+		t.Fatalf("missing VAE version id not reported: %v", err)
+	}
+	if err := latentsEncoderCheck(m, "11111111-1111-4111-8111-111111111111", ""); err != nil {
+		t.Fatal(err)
 	}
 }

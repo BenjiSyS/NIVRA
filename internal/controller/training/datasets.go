@@ -309,7 +309,12 @@ type encodeRequest struct {
 	TokenizerArtifact   string  `json:"tokenizer_artifact"`
 	Stage               Stage   `json:"stage"`
 	AuditFrac           float64 `json:"audit_frac"` // 0 = default 5%; negative = none
+	// ReqRAMMB is the RAM an encode job asks of its worker (default 8192, the size for full-size configs). Small
+	// configs need far less; a laptop with 8 GB total can only take encode jobs when this is lowered.
+	ReqRAMMB int `json:"req_ram_mb"`
 }
+
+const defaultEncodeRAMMB = 8192
 
 // auditSelected deterministically picks the shards that are re-encoded for audit.
 func auditSelected(target string, idx int, frac float64) bool {
@@ -334,6 +339,12 @@ func (s *Service) StartEncode(ctx context.Context, actor core.Actor, projectID, 
 	st := req.Stage
 	if st.H < 8 || st.W < 8 || st.Frames < 1 || st.FPS < 1 || st.H > 4320 || st.W > 7680 || st.Frames > 2000 || st.FPS > 120 {
 		return nil, false, badReq("stage {h,w,frames,fps} out of range")
+	}
+	if req.ReqRAMMB == 0 {
+		req.ReqRAMMB = defaultEncodeRAMMB
+	}
+	if req.ReqRAMMB < 256 || req.ReqRAMMB > 1<<20 {
+		return nil, false, badReq("req_ram_mb must be 256..1048576")
 	}
 	vaeW, vaeM, err := s.resolveVAE(ctx, projectID, req.VAEVersionID)
 	if err != nil {
@@ -401,7 +412,7 @@ func (s *Service) StartEncode(ctx context.Context, actor core.Actor, projectID, 
 				id, err := s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: projectID, JobType: "ai.hd_encode", Params: pb,
 					Inputs: []protocol.ArtifactRef{{ID: sh.ArtifactID, Role: "raw_shard"}, {ID: vaeW, Role: "vae_weights"}, {ID: vaeM, Role: "vae_manifest"},
 						{ID: te.ID, Role: "text_encoder_weights"}, {ID: tok.ID, Role: "tokenizer"}},
-					ReqRAMMB: 8192, Priority: 15, MaxAttempts: 3, LeaseSeconds: 1800, ReqTrusted: true, IdempotencyKey: key, CreatedBy: by2s(by)})
+					ReqRAMMB: req.ReqRAMMB, Priority: 15, MaxAttempts: 3, LeaseSeconds: 1800, ReqTrusted: true, IdempotencyKey: key, CreatedBy: by2s(by)})
 				if err != nil {
 					return err
 				}

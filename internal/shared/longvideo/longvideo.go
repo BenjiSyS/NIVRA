@@ -35,3 +35,23 @@ func Plan(frames, segFrames int) [][2]int {
 	}
 	return out
 }
+
+// Weights split a long video's overall progress between its stages by
+// expected cost: the draft renders every frame at 256x144, the refine stage
+// every frame at the target size spread over `parallel` devices, the stitch
+// is cheap. (Fixed weights made the time-left estimate wildly pessimistic
+// during the draft.)
+func Weights(width, height, parallel int) (draft, refine, stitch float64) {
+	if parallel < 1 {
+		parallel = 1
+	}
+	dp := float64(256 * 144)
+	tp := float64(width*height) / float64(parallel)
+	if tp <= 0 {
+		tp = 1280 * 720
+	}
+	stitch = 0.03
+	draft = (1 - stitch) * dp / (dp + tp)
+	refine = 1 - stitch - draft
+	return
+}

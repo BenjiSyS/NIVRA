@@ -252,8 +252,9 @@ The frame count is 1 + 8k covering `seconds * fps`. Progress events: `text`, `sa
 (one per latent chunk), `write`; the stop file / `limits.max_seconds` are polled every sampling step and decode chunk.
 Summary: `{frames, fps, width, height, seconds, seconds_text, seconds_sampling, seconds_decode, peak_rss_mb,
 cuda_max_allocated_mb (CUDA only), model_version_id, text_encoder, sampler, steps, family: "hd"}`. Artifacts are
-the same (`video`, `video_metadata`). The text encoder is resolved on the worker (inputs are only the three files):
-`stub` from the manifest, `nivra`/`external` from `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>`; a missing or
+the same (`video`, `video_metadata`). The text encoder is resolved on the worker: `stub` from the manifest, `nivra` from the
+optional input `text_encoder_archive` (also accepted by `ai.draft`, `ai.refine_segment`, `ai.evaluate`; the controller adds it
+when the model version has one), `external` from `$NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>`; a missing or
 mismatching encoder is `INPUT_INVALID` (exit 5), as is a weights/VAE sha256 mismatch.
 
 ## 2. Reference sequence for a distributed round

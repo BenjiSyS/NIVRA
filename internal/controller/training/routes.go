@@ -360,16 +360,21 @@ func (s *Service) versionInputs(ctx context.Context, projectID, versionID string
 			return nil, "", fmt.Errorf("%w: no active model version; train a model first", ErrBadConfig)
 		}
 	}
-	var wts, man, vae *string
-	err := s.d.DB.QueryRow(ctx, `SELECT v.weights_artifact::text, v.manifest_artifact::text, COALESCE(v.vae_artifact, r.vae_artifact)::text
-		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id WHERE v.id=$1 AND v.project_id=$2`, versionID, projectID).Scan(&wts, &man, &vae)
+	var wts, man, vae, te *string
+	err := s.d.DB.QueryRow(ctx, `SELECT v.weights_artifact::text, v.manifest_artifact::text, COALESCE(v.vae_artifact, r.vae_artifact)::text,
+			v.text_encoder_artifact::text
+		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id WHERE v.id=$1 AND v.project_id=$2`, versionID, projectID).Scan(&wts, &man, &vae, &te)
 	if errors.Is(err, pgx.ErrNoRows) || wts == nil || man == nil || vae == nil {
 		return nil, "", fmt.Errorf("%w: model version not found or incomplete", ErrBadConfig)
 	}
 	if err != nil {
 		return nil, "", err
 	}
-	return []protocol.ArtifactRef{{ID: *wts, Role: "weights"}, {ID: *man, Role: "manifest"}, {ID: *vae, Role: "vae_weights"}}, versionID, nil
+	refs := []protocol.ArtifactRef{{ID: *wts, Role: "weights"}, {ID: *man, Role: "manifest"}, {ID: *vae, Role: "vae_weights"}}
+	if te != nil { // Nivra-trained encoder shipped with the model; always the last ref
+		refs = append(refs, protocol.ArtifactRef{ID: *te, Role: "text_encoder_archive"})
+	}
+	return refs, versionID, nil
 }
 
 // hdFrameRAMMB is the extra host RAM for decoding frames of w x h.
@@ -518,7 +523,7 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 			style, _ := params["style"].(string)
 			gp := genParams{Prompt: body.Prompt, Seed: body.Seed, Style: style, Sampler: sampler, Steps: body.Steps, CFGScale: body.CFGScale,
 				Width: body.Width, Height: body.Height, FPS: fps, Seconds: body.Seconds, SegFrame: segmentFrames(segSeconds, fps),
-				Frames: int(math.Round(body.Seconds*float64(fps))) + 1, Inputs: []string{inputs[0].ID, inputs[1].ID, inputs[2].ID},
+				Frames: int(math.Round(body.Seconds*float64(fps))) + 1, Inputs: artifactIDs(inputs),
 				RAMMB: req2.RAMMB, VRAMMB: req2.VRAMMB}
 			if gp.Width == 0 || gp.Height == 0 {
 				gp.Width, gp.Height = 1280, 720

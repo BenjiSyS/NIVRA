@@ -345,3 +345,13 @@ def test_garbage_inputs_exit_5(hd, tmp_path):
     rc, ev, out, p = run(tmp_path, "ai.refine_segment", {"prompt": "x", "width": 96, "height": 64, "start": 5, "end": 20, "steps": 2},
                          {**models(hd), "draft_video": str(seg)}, "g3")
     assert rc == 5 and "frames" in ev[-1]["message"]
+
+
+def test_workers_advertise_every_job_type_the_executor_handles():
+    """Regression: ai.draft / ai.refine_segment / ai.stitch were missing from WORKER_JOB_TYPES, so no worker ever
+    claimed the first job of a long video and it sat 'ready' forever (found by the real two-worker e2e run)."""
+    from nivra import cli, executor
+    worker, controller = set(cli.WORKER_JOB_TYPES), set(cli.CONTROLLER_JOB_TYPES)
+    assert not worker & controller
+    assert worker | controller == set(executor.HANDLERS)
+    assert {"ai.draft", "ai.refine_segment", "ai.stitch"} <= worker

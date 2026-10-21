@@ -38,7 +38,7 @@ type genParams struct {
 	Seconds  float64  `json:"seconds"`
 	SegFrame int      `json:"segment_frames"`
 	Frames   int      `json:"frames"`
-	Inputs   []string `json:"inputs"` // weights, manifest, vae artifact ids
+	Inputs   []string `json:"inputs"` // weights, manifest, vae, [text encoder archive] artifact ids
 	RAMMB    int      `json:"ram_mb"`
 	VRAMMB   int      `json:"vram_mb"`
 }
@@ -50,7 +50,19 @@ func segmentPlan(frames, segFrames int) [][2]int { return longvideo.Plan(frames,
 
 func (p genParams) inputs(extra ...protocol.ArtifactRef) []protocol.ArtifactRef {
 	refs := []protocol.ArtifactRef{{ID: p.Inputs[0], Role: "weights"}, {ID: p.Inputs[1], Role: "manifest"}, {ID: p.Inputs[2], Role: "vae_weights"}}
+	if len(p.Inputs) > 3 && p.Inputs[3] != "" { // generations stored before 0009 have exactly three
+		refs = append(refs, protocol.ArtifactRef{ID: p.Inputs[3], Role: "text_encoder_archive"})
+	}
 	return append(refs, extra...)
+}
+
+// artifactIDs lists the ids of versionInputs refs in order.
+func artifactIDs(refs []protocol.ArtifactRef) []string {
+	ids := make([]string, len(refs))
+	for i, r := range refs {
+		ids[i] = r.ID
+	}
+	return ids
 }
 
 func (p genParams) common() map[string]any {
@@ -322,8 +334,9 @@ func (s *Service) generationView(ctx context.Context, projectID, genID string) (
 	var segments int
 	var artifact *string
 	var created time.Time
-	if err := s.d.DB.QueryRow(ctx, `SELECT status, stage, segments, artifact_id::text, failure_reason, created_at
-		FROM generations WHERE id=$1 AND project_id=$2`, genID, projectID).Scan(&status, &stage, &segments, &artifact, &failure, &created); err != nil {
+	var rawParams []byte
+	if err := s.d.DB.QueryRow(ctx, `SELECT status, stage, segments, artifact_id::text, failure_reason, created_at, params
+		FROM generations WHERE id=$1 AND project_id=$2`, genID, projectID).Scan(&status, &stage, &segments, &artifact, &failure, &created, &rawParams); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errGenNotFound
 		}
@@ -360,7 +373,10 @@ func (s *Service) generationView(ctx context.Context, projectID, genID string) (
 			workers[k.device] = true
 		}
 	}
-	progress := 0.1*draft + 0.85*segSum/float64(segments) + 0.05*stitch
+	var gp genParams
+	_ = json.Unmarshal(rawParams, &gp)
+	wd, wr, ws := longvideo.Weights(gp.Width, gp.Height, max(1, len(running)))
+	progress := wd*draft + wr*segSum/float64(segments) + ws*stitch
 	if status == "completed" {
 		progress = 1
 	}

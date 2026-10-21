@@ -9,7 +9,8 @@ A bundle is a directory (the Go controller stores/passes the three files individ
 
 Text encoder resolution (the worker may only receive the three files above):
     stub      deterministic hashed-word encoder rebuilt from the manifest (tests / dry runs only);
-    nivra     <bundle dir>/<text_encoder.path> if that exists, else $NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>;
+    nivra     an explicit directory (text_encoder_dir: the extracted `text_encoder_archive` network workers
+              receive) > <bundle dir>/<text_encoder.path> > $NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name>;
               the checkpoint id and the sha256 of its model.safetensors must match the manifest;
     external  $NIVRA_TEXT_ENCODERS_DIR/<text_encoder.name> (or the bundle path when one is recorded); must carry a
               NIVRA_LICENSE.json whose id/hash match. Nothing is ever downloaded.
@@ -187,8 +188,11 @@ def describe_text_encoder(spec: str, cfg: dict, out_dir: Path) -> tuple:
     raise BundleError(f"bad text encoder spec {spec!r}; use stub | nivra:<dir> | external:<dir>")
 
 
-def resolve_text_encoder(te: dict, bundle_dir: Optional[Path] = None, text_encoders_dir=None) -> TextEncoder:
-    """Rebuild the text encoder a manifest refers to (see module docstring). Raises BundleError."""
+def resolve_text_encoder(te: dict, bundle_dir: Optional[Path] = None, text_encoders_dir=None,
+                         text_encoder_dir=None) -> TextEncoder:
+    """Rebuild the text encoder a manifest refers to (see module docstring). Raises BundleError.
+    `text_encoder_dir` (an extracted encoder archive) wins over the bundle dir, which wins over the env dir;
+    it only applies to Nivra-trained encoders (external ones are never shipped)."""
     if not isinstance(te, dict) or not isinstance(te.get("id"), str) or te.get("kind") not in ("stub", "nivra", "external"):
         raise BundleError("manifest has no valid text_encoder entry")
     kind = te["kind"]
@@ -197,6 +201,8 @@ def resolve_text_encoder(te: dict, bundle_dir: Optional[Path] = None, text_encod
     else:
         root = text_encoders_dir or os.environ.get(ENV_TEXT_DIR)
         cands = []
+        if text_encoder_dir is not None and kind == "nivra":
+            cands.append(Path(text_encoder_dir))
         rel = te.get("path")
         if rel and bundle_dir is not None:
             base = Path(bundle_dir).resolve()
@@ -306,7 +312,7 @@ def _check_file(path, shapes: Optional[dict], what: str) -> None:
 
 def load_hd_bundle_files(weights, manifest, vae_weights, device: str = "cpu", *, bundle_dir=None,
                          text_encoders_dir=None, text_encoder: Optional[TextEncoder] = None,
-                         **overrides) -> HDPipeline:
+                         text_encoder_dir=None, **overrides) -> HDPipeline:
     """Verify sha256 of the DiT and VAE against the manifest (refusing mismatches) and build an HDPipeline.
     overrides are HDPipeline inference options (fp16, int8, offload, attn_chunk, vae_tile, ...)."""
     try:
@@ -338,7 +344,7 @@ def load_hd_bundle_files(weights, manifest, vae_weights, device: str = "cpu", *,
     except Exception as e:  # noqa: BLE001
         raise BundleError(f"invalid HD config/VAE metadata: {e}") from e
     bdir = Path(bundle_dir) if bundle_dir is not None else Path(manifest).resolve().parent
-    enc = text_encoder if text_encoder is not None else resolve_text_encoder(m.get("text_encoder"), bdir, text_encoders_dir)
+    enc = text_encoder if text_encoder is not None else resolve_text_encoder(m.get("text_encoder"), bdir, text_encoders_dir, text_encoder_dir)
     cuda = str(device).startswith("cuda")
     try:
         dit_sd = load_file(str(weights))
