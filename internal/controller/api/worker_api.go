@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"nivra/internal/controller/artifacts"
@@ -365,6 +366,22 @@ func (s *Server) serveArtifact(w http.ResponseWriter, r *http.Request, projectID
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set("X-Nivra-SHA256", info.SHA256)
 	w.Header().Set("ETag", `"`+info.SHA256+`"`)
-	w.Header().Set("Content-Disposition", `attachment; filename="`+info.Kind+"-"+info.SHA256[:12]+`"`)
+	disp := "attachment"
+	if strings.HasPrefix(info.ContentType, "video/") || strings.HasPrefix(info.ContentType, "image/") {
+		disp = "inline" // playable in Studio; nosniff + a fixed media type prevent content confusion
+	}
+	w.Header().Set("Content-Disposition", disp+`; filename="`+info.Kind+"-"+info.SHA256[:12]+extFor(info.ContentType)+`"`)
 	http.ServeContent(w, r, "", info.CreatedAt, f)
+}
+
+func extFor(ct string) string {
+	switch ct {
+	case "video/mp4":
+		return ".mp4"
+	case "application/json":
+		return ".json"
+	case "image/png":
+		return ".png"
+	}
+	return ""
 }

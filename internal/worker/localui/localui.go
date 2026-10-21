@@ -87,7 +87,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /local/api/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, s.A.Status()) })
 	mux.HandleFunc("GET /local/api/logs", func(w http.ResponseWriter, r *http.Request) {
 		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-		writeJSON(w, 200, map[string]any{"logs": s.A.Logs(after, 500)})
+		logs := s.A.Logs(after, 500)
+		if logs == nil {
+			logs = []agent.LogLine{}
+		}
+		writeJSON(w, 200, map[string]any{"logs": logs})
 	})
 	mux.HandleFunc("POST /local/api/connect", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {

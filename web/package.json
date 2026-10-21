@@ -1,0 +1,23 @@
+{
+  "name": "nivra-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Nivra Studio (controller dashboard) and Nivra Worker website",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build && node scripts/postbuild.mjs"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.5"
+  }
+}

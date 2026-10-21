@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -93,5 +94,6 @@ func (r *Registry) Names() []string {
 	for n := range r.types {
 		out = append(out, n)
 	}
+	sort.Strings(out)
 	return out
 }

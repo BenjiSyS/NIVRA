@@ -120,7 +120,7 @@ Job statuses: `ready → leased → running → uploading → validating → com
 
 ### Training, models, checkpoints, generation
 * `GET /projects/{pid}/training/runs` → `{runs:[Run]}`; `POST` (operator) `{name, vae_artifact, config: RunConfig}`
-* `GET /projects/{pid}/training/runs/{rid}`; `POST .../pause|resume|stop|checkpoint`; `POST .../load {checkpoint_id}` (run must be paused)
+* `GET /projects/{pid}/training/runs/{rid}`; `POST .../pause|resume|stop|checkpoint`; `POST .../load {checkpoint_id}` (run must be paused, stopped or completed)
 * `GET /projects/{pid}/training/runs/{rid}/metrics` → `{series:{name:[{round,step,ts,value}]}}` (names: `heldout_loss_before`, `heldout_loss_after`, `delta_l2`, `accepted_updates`, `rejected_updates`, `update_loss_first_mean`, `update_loss_last_mean`, `round_seconds`, `active_workers`, `outer_lr`)
 * `GET /projects/{pid}/training/runs/{rid}/updates` → accepted/applied/invalid/stale updates with worker and metadata
 * `GET /projects/{pid}/checkpoints?run=`, `GET /projects/{pid}/models`

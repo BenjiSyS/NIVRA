@@ -157,9 +157,7 @@ func Enroll(ctx context.Context, controllerURL string, allowInsecure bool, code 
 	id := &identity.Identity{ControllerURL: base.String(), ControllerKey: begin.ControllerKey, ProjectID: done.ProjectID,
 		ProjectName: done.ProjectName, DeviceID: done.DeviceID, DeviceName: done.DeviceName, ContributorName: dev.ContributorName,
 		PrivateSeed: priv.Seed(), EnrolledAt: time.Now().UTC()}
-	sum := sha256.Sum256(begin.ControllerKey)
-	fp := hex.EncodeToString(sum[:16])
-	return &EnrollResult{Identity: id, ControllerFingerprint: fp}, nil
+	return &EnrollResult{Identity: id, ControllerFingerprint: secure.Fingerprint(begin.ControllerKey)}, nil
 }
 
 // OpenSession obtains a fresh bearer token, verifying the controller's identity.

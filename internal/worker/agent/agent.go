@@ -16,6 +16,7 @@ import (
 
 	"nivra/internal/shared/config"
 	"nivra/internal/shared/protocol"
+	"nivra/internal/shared/secure"
 	"nivra/internal/shared/versioning"
 	"nivra/internal/worker/client"
 	"nivra/internal/worker/executor"
@@ -202,7 +203,7 @@ func (a *Agent) Status() Status {
 	if a.id != nil {
 		st.ControllerURL, st.ProjectID, st.ProjectName = a.id.ControllerURL, a.id.ProjectID, a.id.ProjectName
 		st.DeviceID, st.DeviceName = a.id.DeviceID, a.id.DeviceName
-		st.ControllerKey = fingerprint(a.id.ControllerKey)
+		st.ControllerKey = secure.Fingerprint(a.id.ControllerKey)
 	}
 	if !a.lastBeat.IsZero() {
 		t := a.lastBeat
@@ -219,13 +220,6 @@ func (a *Agent) Status() Status {
 		st.Executors = append(st.Executors, t)
 	}
 	return st
-}
-
-func fingerprint(key []byte) string {
-	if len(key) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%x", key[:8])
 }
 
 // Logs returns recent local log lines after seq.

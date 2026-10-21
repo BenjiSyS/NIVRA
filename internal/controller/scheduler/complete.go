@@ -191,7 +191,7 @@ func (s *Scheduler) finalize(ctx context.Context, jt *JobType, in ValidationInpu
 			if _, err := tx.Exec(ctx, `UPDATE job_attempts SET state='accepted' WHERE id=$1`, in.AttemptID); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE jobs SET status='completed', completed_at=now(), updated_at=now() WHERE id=$1`, in.JobID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE jobs SET status='completed', failure_reason='', completed_at=now(), updated_at=now() WHERE id=$1`, in.JobID); err != nil {
 				return err
 			}
 			var category string

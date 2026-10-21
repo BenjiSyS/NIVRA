@@ -29,7 +29,7 @@ import (
 )
 
 type stats struct {
-	mu   sync.Mutex
+	mu     sync.Mutex
 	lat    map[string][]time.Duration
 	errs   map[string]int
 	causes map[string]int

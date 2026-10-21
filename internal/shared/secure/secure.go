@@ -34,5 +34,19 @@ func SHA256Hex(b []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
+// Fingerprint formats SHA-256(pub) as 8 groups of 4 hex digits; controller
+// and worker both display identity keys this way so they can be compared.
+func Fingerprint(pub []byte) string {
+	h := SHA256Hex(pub)[:32]
+	out := ""
+	for i := 0; i < len(h); i += 4 {
+		if i > 0 {
+			out += ":"
+		}
+		out += h[i : i+4]
+	}
+	return out
+}
+
 // Equal compares two byte slices in constant time.
 func Equal(a, b []byte) bool { return subtle.ConstantTimeCompare(a, b) == 1 }

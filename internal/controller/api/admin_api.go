@@ -175,11 +175,12 @@ func (s *Server) dbHealth(ctx context.Context) map[string]any {
 	if err := s.d.DB.Ping(ctx); err != nil {
 		return map[string]any{"status": "down", "error": "database unreachable"}
 	}
+	latency := float64(time.Since(start).Microseconds()) / 1000
 	var size int64
 	var version string
 	_ = s.d.DB.QueryRow(ctx, `SELECT pg_database_size(current_database()), current_setting('server_version')`).Scan(&size, &version)
 	st := s.d.DB.Stat()
-	return map[string]any{"status": "ok", "latency_ms": float64(time.Since(start).Microseconds()) / 1000, "size_bytes": size,
+	return map[string]any{"status": "ok", "latency_ms": latency, "size_bytes": size,
 		"version": version, "pool_total": st.TotalConns(), "pool_idle": st.IdleConns(), "pool_max": st.MaxConns()}
 }
 
