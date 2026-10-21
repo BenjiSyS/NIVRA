@@ -18,7 +18,14 @@ import (
 	"nivra/internal/shared/protocol"
 )
 
-const sessionCookie = "nivra_session"
+// sessionCookieName uses the __Host- prefix when cookies are Secure, which
+// forbids Domain and requires Path=/, so subdomains cannot set or overwrite it.
+func (s *Server) sessionCookieName() string {
+	if s.d.Cfg.CookieSecure {
+		return "__Host-nivra_session"
+	}
+	return "nivra_session"
+}
 
 // ---- worker authentication ----
 
@@ -113,14 +120,14 @@ type AdminCtx struct {
 // requests must carry the CSRF header and, if present, a same-origin Origin.
 func (s *Server) admin(role string, projectScoped bool, h func(http.ResponseWriter, *http.Request, *AdminCtx)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(sessionCookie)
+		c, err := r.Cookie(s.sessionCookieName())
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "sign in required")
 			return
 		}
 		sess, err := s.Auth.Authenticate(r.Context(), c.Value)
 		if err != nil {
-			http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+			http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.d.Cfg.CookieSecure})
 			writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "session expired")
 			return
 		}
@@ -161,6 +168,6 @@ func (s *Server) admin(role string, projectScoped bool, h func(http.ResponseWrit
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", Expires: expires,
+	http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: token, Path: "/", Expires: expires,
 		HttpOnly: true, Secure: s.d.Cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
 }

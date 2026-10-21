@@ -46,8 +46,31 @@ var shaRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Owner identifies who uploads an artifact.
 type Owner struct {
-	DeviceID string // set for workers
-	UserID   string // set for administrators
+	DeviceID  string // set for workers
+	UserID    string // set for administrators
+	AttemptID string // workers: the active attempt the upload belongs to (verified by the caller)
+}
+
+// Per-device upload budgets (a worker may only upload for its active attempt).
+const (
+	maxInFlightPerDevice   = 4
+	maxArtifactsPerAttempt = 16
+)
+
+// ErrTooMany means a per-device or per-attempt upload budget is exhausted.
+var ErrTooMany = errors.New("too many uploads for this device or attempt")
+
+// ContentTypeFor maps an artifact kind to a fixed, safe media type. Client
+// supplied types are never trusted (artifacts are served to administrators).
+func ContentTypeFor(kind string) string {
+	switch kind {
+	case "video":
+		return "video/mp4"
+	case "update", "model_version", "dataset_manifest", "evaluation_report", "video_metadata", "result_json":
+		return "application/json"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // Info describes an artifact.
@@ -132,33 +155,44 @@ func (s *Store) Begin(ctx context.Context, projectID string, owner Owner, kind, 
 	if size > s.d.Cfg.MaxUploadBytes {
 		return Info{}, ErrTooLarge
 	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	if len(contentType) > 100 {
-		return Info{}, ErrBadRequest
-	}
-	var dev, usr any
+	_ = contentType // ignored: the media type is derived from the kind
+	contentType = ContentTypeFor(kind)
+	var dev, usr, att any
 	if owner.DeviceID != "" {
-		dev = owner.DeviceID
+		if owner.AttemptID == "" {
+			return Info{}, ErrForbidden
+		}
+		dev, att = owner.DeviceID, owner.AttemptID
+		var inflight, perAttempt int
+		if err := s.d.DB.QueryRow(ctx, `SELECT
+				(SELECT count(*) FROM artifacts WHERE uploaded_by_device=$1 AND state='uploading'),
+				(SELECT count(*) FROM artifacts WHERE attempt_id=$2)`, owner.DeviceID, owner.AttemptID).Scan(&inflight, &perAttempt); err != nil {
+			return Info{}, err
+		}
+		if inflight >= maxInFlightPerDevice || perAttempt >= maxArtifactsPerAttempt {
+			return Info{}, ErrTooMany
+		}
 	}
 	if owner.UserID != "" {
 		usr = owner.UserID
 	}
+	// Deduplicate only within the same project and uploader, so a worker
+	// cannot probe for, or claim, content stored by others.
 	var existing string
-	err := s.d.DB.QueryRow(ctx, `SELECT storage_path FROM artifacts WHERE sha256=$1 AND size_bytes=$2 AND state='complete' LIMIT 1`, sum, size).Scan(&existing)
+	err := s.d.DB.QueryRow(ctx, `SELECT storage_path FROM artifacts WHERE sha256=$1 AND size_bytes=$2 AND state='complete'
+		AND project_id=$3 AND uploaded_by_device IS NOT DISTINCT FROM $4::uuid LIMIT 1`, sum, size, projectID, dev).Scan(&existing)
 	if err == nil {
 		if _, statErr := os.Stat(filepath.Join(s.root, existing)); statErr == nil {
 			return scanInfo(s.d.DB.QueryRow(ctx, `INSERT INTO artifacts (project_id, kind, sha256, size_bytes, received_bytes, content_type, state,
-					storage_path, uploaded_by_device, uploaded_by_user, completed_at)
-				VALUES ($1,$2,$3,$4,$4,$5,'complete',$6,$7,$8, now()) RETURNING `+infoCols, projectID, kind, sum, size, contentType, existing, dev, usr))
+					storage_path, uploaded_by_device, uploaded_by_user, attempt_id, completed_at)
+				VALUES ($1,$2,$3,$4,$4,$5,'complete',$6,$7,$8,$9, now()) RETURNING `+infoCols, projectID, kind, sum, size, contentType, existing, dev, usr, att))
 		}
 	}
 	if free, ferr := sysinfo.DiskFree(s.root); ferr == nil && free < uint64(size)+diskReserve {
 		return Info{}, ErrNoSpace
 	}
-	info, err := scanInfo(s.d.DB.QueryRow(ctx, `INSERT INTO artifacts (project_id, kind, sha256, size_bytes, content_type, state, uploaded_by_device, uploaded_by_user)
-		VALUES ($1,$2,$3,$4,$5,'uploading',$6,$7) RETURNING `+infoCols, projectID, kind, sum, size, contentType, dev, usr))
+	info, err := scanInfo(s.d.DB.QueryRow(ctx, `INSERT INTO artifacts (project_id, kind, sha256, size_bytes, content_type, state, uploaded_by_device, uploaded_by_user, attempt_id)
+		VALUES ($1,$2,$3,$4,$5,'uploading',$6,$7,$8) RETURNING `+infoCols, projectID, kind, sum, size, contentType, dev, usr, att))
 	if err != nil {
 		return info, err
 	}
@@ -216,6 +250,9 @@ func (s *Store) WriteChunk(ctx context.Context, projectID, id string, owner Owne
 	}
 	if info.Received+int64(len(buf)) > info.Size {
 		return info, ErrTooLarge
+	}
+	if free, ferr := sysinfo.DiskFree(s.root); ferr == nil && free < uint64(len(buf))+diskReserve {
+		return info, ErrNoSpace
 	}
 	f, err := os.OpenFile(s.partPath(id), os.O_WRONLY|os.O_CREATE, 0o640)
 	if err != nil {
@@ -342,9 +379,8 @@ func (s *Store) Import(ctx context.Context, projectID, kind, path, contentType s
 			return Info{}, err
 		}
 	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
+	_ = contentType
+	contentType = ContentTypeFor(kind)
 	return scanInfo(s.d.DB.QueryRow(ctx, `INSERT INTO artifacts (project_id, kind, sha256, size_bytes, received_bytes, content_type, state, storage_path, completed_at)
 		VALUES ($1,$2,$3,$4,$4,$5,'complete',$6, now()) RETURNING `+infoCols, projectID, kind, sum, size, contentType, rel))
 }
@@ -398,7 +434,41 @@ func (s *Store) PurgeStaleUploads(ctx context.Context) error {
 	for _, id := range ids {
 		_ = os.Remove(s.partPath(id))
 	}
-	return nil
+	_, err = s.PurgeOrphans(ctx, 24*time.Hour)
+	return err
+}
+
+// PurgeOrphans marks worker artifacts older than age that nothing references
+// (results, training updates, model versions, checkpoints, runs) as deleted,
+// and removes a stored file only when no complete row still uses it.
+func (s *Store) PurgeOrphans(ctx context.Context, age time.Duration) (int, error) {
+	rows, err := s.d.DB.Query(ctx, `UPDATE artifacts a SET state='deleted'
+		WHERE a.state='complete' AND a.uploaded_by_device IS NOT NULL AND NOT a.protected
+		  AND a.created_at < now() - make_interval(secs => $1)
+		  AND NOT EXISTS (SELECT 1 FROM job_results r WHERE r.artifact_id = a.id
+		        OR jsonb_path_exists(r.artifacts, '$.* ? (@ == $id)', jsonb_build_object('id', a.id::text)))
+		  AND NOT EXISTS (SELECT 1 FROM training_updates u WHERE u.update_artifact = a.id)
+		  AND NOT EXISTS (SELECT 1 FROM model_versions v WHERE a.id IN (v.weights_artifact, v.manifest_artifact, v.state_artifact))
+		  AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.artifact_id = a.id)
+		  AND NOT EXISTS (SELECT 1 FROM training_runs t WHERE t.vae_artifact = a.id)
+		RETURNING a.storage_path`, age.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	paths, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		var used bool
+		if err := s.d.DB.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE storage_path=$1 AND state='complete')`, p).Scan(&used); err == nil && !used {
+			_ = os.Remove(filepath.Join(s.root, p))
+		}
+	}
+	return len(paths), nil
 }
 
 // Stats summarises storage use.

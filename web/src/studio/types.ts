@@ -67,6 +67,7 @@ export interface Worker {
   reported_state: string
   paused: boolean
   public_profile: boolean
+  trusted: boolean
   last_seen_at: string | null
   created_at: string
   clock_skew_ms: number

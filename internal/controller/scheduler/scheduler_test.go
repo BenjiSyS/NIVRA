@@ -27,6 +27,16 @@ type env struct {
 	code    string
 }
 
+func testutilDeps(t *testing.T) *core.Deps { return testutil.Deps(t) }
+
+func projectsCreate(t *testing.T, d *core.Deps) (string, string, error) {
+	p, ci, err := projects.New(d).Create(context.Background(), core.System, "T2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.ID, ci.Code, nil
+}
+
 func setup(t *testing.T) *env {
 	t.Helper()
 	d := testutil.Deps(t)
@@ -300,4 +310,54 @@ func TestStopRequeuesAndCancel(t *testing.T) {
 		t.Fatalf("result after cancel: want ErrStale, got %v", err)
 	}
 	time.Sleep(10 * time.Millisecond)
+}
+
+func TestTrustedJobsOnlyGoToTrustedDevices(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	dev := e.enroll(t, "untrusted")
+	params, _ := json.Marshal(builtin.SleepParams{Seconds: 1})
+	if _, err := e.s.Create(ctx, nil, scheduler.NewJob{ProjectID: e.project, JobType: builtin.TypeSleep, Params: params, ReqTrusted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := e.s.Lease(ctx, e.project, dev); a != nil {
+		t.Fatal("untrusted device leased a trusted-only job")
+	}
+	e.d.DB.Exec(ctx, `UPDATE devices SET trusted=true WHERE id=$1`, dev)
+	if a, err := e.s.Lease(ctx, e.project, dev); err != nil || a == nil {
+		t.Fatalf("trusted device could not lease: %v", err)
+	}
+}
+
+func TestValidatorFailuresAreBounded(t *testing.T) {
+	d := testutilDeps(t)
+	reg := scheduler.NewRegistry()
+	calls := 0
+	reg.Register(&scheduler.JobType{Name: "test.flaky", Category: "test", Async: true,
+		ValidateParams: func(json.RawMessage) error { return nil },
+		Validate: func(context.Context, scheduler.ValidationInput) (scheduler.Verdict, error) {
+			calls++
+			return scheduler.Verdict{}, errors.New("validator infrastructure down")
+		}})
+	e := &env{d: d, s: scheduler.New(d, reg)}
+	p, ci, _ := projectsCreate(t, d)
+	e.project, e.code = p, ci
+	dev := e.enroll(t, "w")
+	e.d.DB.Exec(context.Background(), `UPDATE worker_capabilities SET executors = executors || '{test.flaky}' WHERE device_id=$1`, dev)
+	ctx := context.Background()
+	jobID, err := e.s.Create(ctx, nil, scheduler.NewJob{ProjectID: e.project, JobType: "test.flaky", MaxAttempts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := e.s.Lease(ctx, e.project, dev)
+	if r, err := e.s.Complete(ctx, dev, a.AttemptID, protocol.JobCompleteRequest{FencingToken: a.FencingToken}); err != nil || r.Status != protocol.ResultValidating {
+		t.Fatalf("%+v %v", r, err)
+	}
+	for i := 0; i < 5; i++ {
+		e.s.ValidatePendingOnce(ctx)
+	}
+	j, _ := e.s.GetJob(ctx, e.project, jobID)
+	if j.Status != scheduler.JobFailed || calls != 3 {
+		t.Fatalf("want job failed after 3 validator errors, got %s after %d calls", j.Status, calls)
+	}
 }

@@ -26,6 +26,27 @@ func newLimiter(perSecond float64, burst int) *limiter {
 // perMinute builds a limiter allowing n events per minute with burst n.
 func perMinute(n int) *limiter { return newLimiter(float64(n)/60, n) }
 
+// blocked reports whether key has no token left, without consuming one.
+func (l *limiter) blocked(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return false
+	}
+	t := b.tokens + time.Since(b.last).Seconds()*l.rate
+	return t < 1
+}
+
+// take consumes up to n tokens and returns how many were granted.
+func (l *limiter) take(key string, n int) int {
+	got := 0
+	for got < n && l.allow(key) {
+		got++
+	}
+	return got
+}
+
 // allow consumes one token for key.
 func (l *limiter) allow(key string) bool {
 	l.mu.Lock()

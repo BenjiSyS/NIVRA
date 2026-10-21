@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"nivra/internal/controller/artifacts"
@@ -16,7 +15,7 @@ import (
 
 func (s *Server) handleEnrollBegin(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.enrollIP.allow(ip) || !s.enrollGlobal.allow("global") {
+	if !s.enrollIP.allow(rateKey(ip)) || !s.enrollGlobal.allow("global") {
 		w.Header().Set("Retry-After", "60")
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many enrollment attempts; wait a minute")
 		return
@@ -42,7 +41,7 @@ func (s *Server) handleEnrollBegin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEnrollComplete(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.completeIP.allow(ip) {
+	if !s.completeIP.allow(rateKey(ip)) {
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many enrollment attempts")
 		return
 	}
@@ -56,6 +55,8 @@ func (s *Server) handleEnrollComplete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, protocol.ErrValidation, err.Error())
 	case errors.Is(err, enrollment.ErrInvalidCode):
 		writeErr(w, http.StatusForbidden, protocol.ErrInvalidCode, "project code was rotated or revoked during enrollment")
+	case errors.Is(err, enrollment.ErrDeviceLimit):
+		writeErr(w, http.StatusForbidden, protocol.ErrForbidden, err.Error())
 	case errors.Is(err, enrollment.ErrDeviceRevoked):
 		writeErr(w, http.StatusForbidden, protocol.ErrRevoked, err.Error())
 	case err != nil:
@@ -68,7 +69,7 @@ func (s *Server) handleEnrollComplete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWorkerSession(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
-	if !s.sessionIP.allow(ip) {
+	if !s.sessionIP.allow(rateKey(ip)) {
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many session requests")
 		return
 	}
@@ -76,12 +77,17 @@ func (s *Server) handleWorkerSession(w http.ResponseWriter, r *http.Request) {
 	if readEnvelope(w, r, nil, protocol.MsgSession, &req) != nil {
 		return
 	}
-	if !s.sessionDevice.allow(req.DeviceID) {
+	// The per-device budget is only charged for verified requests, so knowing
+	// a device id is not enough to lock that device out.
+	if s.sessionDevice.blocked(req.DeviceID) {
 		w.Header().Set("Retry-After", "10")
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many session requests for this device")
 		return
 	}
 	resp, err := s.Enroll.OpenSession(r.Context(), req, ip)
+	if err == nil {
+		s.sessionDevice.allow(req.DeviceID)
+	}
 	switch {
 	case errors.Is(err, enrollment.ErrDeviceRevoked):
 		writeErr(w, http.StatusForbidden, protocol.ErrRevoked, "this device has been revoked")
@@ -99,6 +105,11 @@ func (s *Server) handleWorkerSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, id *WorkerCtx) {
+	if !s.heartbeatDev.allow(id.DeviceID) {
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "heartbeats are sent too often")
+		return
+	}
 	var req protocol.HeartbeatRequest
 	if readEnvelope(w, r, id, protocol.MsgHeartbeat, &req) != nil {
 		return
@@ -267,8 +278,11 @@ func (s *Server) handleWorkerLogs(w http.ResponseWriter, r *http.Request, id *Wo
 	if readEnvelope(w, r, id, protocol.MsgLogBatch, &req) != nil {
 		return
 	}
+	n := s.logLines.take(id.DeviceID, len(req.Lines))
+	dropped := len(req.Lines) - n
+	req.Lines = req.Lines[len(req.Lines)-n:]
 	s.Telemetry.WorkerLogs(id.ProjectID, id.DeviceID, req)
-	writeJSON(w, http.StatusOK, map[string]int{"accepted": len(req.Lines)})
+	writeJSON(w, http.StatusOK, map[string]int{"accepted": n, "dropped": dropped})
 }
 
 // ---- artifacts (worker side) ----
@@ -292,6 +306,9 @@ func (s *Server) artifactErr(w http.ResponseWriter, r *http.Request, err error, 
 		writeErr(w, http.StatusForbidden, protocol.ErrForbidden, err.Error())
 	case errors.Is(err, artifacts.ErrTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, protocol.ErrTooLarge, err.Error())
+	case errors.Is(err, artifacts.ErrTooMany):
+		w.Header().Set("Retry-After", "10")
+		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, err.Error())
 	case errors.Is(err, artifacts.ErrNoSpace):
 		writeErr(w, http.StatusInsufficientStorage, protocol.ErrUnavailable, err.Error())
 	case errors.Is(err, artifacts.ErrChecksum):
@@ -308,7 +325,16 @@ func (s *Server) handleUploadBegin(w http.ResponseWriter, r *http.Request, id *W
 	if readEnvelope(w, r, id, protocol.MsgUploadBegin, &req) != nil {
 		return
 	}
-	info, err := s.Artifacts.Begin(r.Context(), id.ProjectID, artifacts.Owner{DeviceID: id.DeviceID}, req.Kind, req.SHA256, req.ContentType, req.Size)
+	if len(req.AttemptID) != 36 {
+		writeErr(w, http.StatusForbidden, protocol.ErrForbidden, "uploads must belong to an active job attempt")
+		return
+	}
+	if err := s.Sched.CheckActive(r.Context(), id.DeviceID, req.AttemptID, req.FencingToken); err != nil {
+		s.schedErr(w, r, err)
+		return
+	}
+	info, err := s.Artifacts.Begin(r.Context(), id.ProjectID, artifacts.Owner{DeviceID: id.DeviceID, AttemptID: req.AttemptID},
+		req.Kind, req.SHA256, req.ContentType, req.Size)
 	if err != nil {
 		s.artifactErr(w, r, err, info)
 		return
@@ -366,9 +392,12 @@ func (s *Server) serveArtifact(w http.ResponseWriter, r *http.Request, projectID
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set("X-Nivra-SHA256", info.SHA256)
 	w.Header().Set("ETag", `"`+info.SHA256+`"`)
+	// Artifacts may come from untrusted workers: never let them execute in
+	// the Studio origin. Only exact, server-assigned media types are inline.
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; media-src 'self'")
 	disp := "attachment"
-	if strings.HasPrefix(info.ContentType, "video/") || strings.HasPrefix(info.ContentType, "image/") {
-		disp = "inline" // playable in Studio; nosniff + a fixed media type prevent content confusion
+	if info.ContentType == "video/mp4" || info.ContentType == "image/png" {
+		disp = "inline"
 	}
 	w.Header().Set("Content-Disposition", disp+`; filename="`+info.Kind+"-"+info.SHA256[:12]+extFor(info.ContentType)+`"`)
 	http.ServeContent(w, r, "", info.CreatedAt, f)

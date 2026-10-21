@@ -14,6 +14,9 @@ import (
 	"nivra/internal/shared/secure"
 )
 
+// maxValidationAttempts caps validator infrastructure failures per result.
+const maxValidationAttempts = 3
+
 // MaxResultBytes bounds the inline JSON result; large outputs use artifacts.
 const MaxResultBytes = 32 << 10
 
@@ -264,6 +267,9 @@ func (s *Scheduler) RunValidationLoop(ctx context.Context) {
 	}
 }
 
+// ValidatePendingOnce runs one pass of the validation loop (tests, maintenance).
+func (s *Scheduler) ValidatePendingOnce(ctx context.Context) { s.validatePending(ctx) }
+
 func (s *Scheduler) validatePending(ctx context.Context) {
 	rows, err := s.d.DB.Query(ctx, `SELECT r.id, r.attempt_id, r.job_id, j.project_id, a.device_id, j.job_type, j.params, r.payload,
 			r.artifact_id::text, r.artifacts, j.model_version::text, j.training_run_id::text,
@@ -301,8 +307,16 @@ func (s *Scheduler) validatePending(ctx context.Context) {
 		}
 		v, err := s.runValidator(ctx, jt, in)
 		if err != nil {
-			s.d.Log.Warn("validator error; will retry", "job", in.JobID, "type", in.JobType, "err", err)
-			continue
+			// Bounded retries: a result that keeps breaking the validator is
+			// rejected instead of being retried forever.
+			var n int
+			_ = s.d.DB.QueryRow(ctx, `UPDATE job_results SET validation_attempts = validation_attempts + 1 WHERE id=$1
+				RETURNING validation_attempts`, in.ResultID).Scan(&n)
+			s.d.Log.Warn("validator error", "job", in.JobID, "type", in.JobType, "attempt", n, "err", err)
+			if n < maxValidationAttempts {
+				continue
+			}
+			v = Verdict{Reason: fmt.Sprintf("validation failed %d times: %v", n, err), Retry: true}
 		}
 		if err := s.finalize(ctx, jt, in, v); err != nil {
 			s.d.Log.Warn("finalize failed", "job", in.JobID, "err", err)

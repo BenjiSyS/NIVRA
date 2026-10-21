@@ -29,6 +29,7 @@ var (
 	ErrClockSkew        = errors.New("client clock differs from controller by more than 5 minutes")
 	ErrReplay           = errors.New("request nonce already used")
 	ErrBadInput         = errors.New("invalid enrollment request")
+	ErrDeviceLimit      = errors.New("this project has reached its device limit")
 )
 
 const (
@@ -143,6 +144,15 @@ func (s *Service) Complete(ctx context.Context, req protocol.EnrollCompleteReque
 		var dev protocol.DeviceInfo
 		if err := json.Unmarshal(info, &dev); err != nil {
 			return err
+		}
+		var count int
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM devices WHERE project_id=$1 AND status='active'),
+				EXISTS (SELECT 1 FROM devices WHERE project_id=$1 AND public_key=$2)`, projectID, pub).Scan(&count, &exists); err != nil {
+			return err
+		}
+		if !exists && count >= s.d.Cfg.MaxDevicesPerProject {
+			return ErrDeviceLimit
 		}
 		err = tx.QueryRow(ctx, `INSERT INTO devices (project_id, public_key, name, contributor_name, os, arch, agent_version, enrolled_code_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

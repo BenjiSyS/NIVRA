@@ -228,7 +228,7 @@ func (a *Agent) runTask(ctx context.Context, cl *client.Client, t *activeTask) {
 		art := out.Artifacts[i]
 		t.set("uploading", fmt.Sprintf("uploading %s (%d/%d)", art.Kind, i+1, len(out.Artifacts)), -1)
 		var id string
-		id, err = cl.Upload(ctx, art.Path, art.Kind, art.ContentType, func(sent, total int64) {
+		id, err = cl.Upload(ctx, job.AttemptID, job.FencingToken, art.Path, art.Kind, art.ContentType, func(sent, total int64) {
 			t.mu.Lock()
 			t.upload = fmt.Sprintf("%s: %d/%d bytes", art.Kind, sent, total)
 			t.mu.Unlock()

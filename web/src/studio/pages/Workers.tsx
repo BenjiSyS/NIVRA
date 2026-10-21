@@ -161,6 +161,21 @@ function WorkerDrawer(props: { id: string; onClose: () => void }) {
     if (r !== undefined) void store.loadWorkers()
   }
 
+  const toggleTrust = async () => {
+    if (!worker) return
+    const next = !worker.trusted
+    if (next) {
+      const ok = await confirmDialog({
+        title: `Trust ${worker.name} for training?`,
+        body: 'Trusted devices receive distributed model-training jobs, whose updates change the shared model. Only trust devices you control or know.',
+        confirmLabel: 'Trust device',
+      })
+      if (!ok) return
+    }
+    const r = await run(() => api.post(`${pbase(pid)}/workers/${props.id}/trust`, { trusted: next }), next ? 'Device trusted' : 'Trust removed')
+    if (r !== undefined) void store.loadWorkers()
+  }
+
   const op = can('operator')
   const revoked = worker?.state === 'revoked'
   const pts = metrics.data?.points ?? []
@@ -197,6 +212,7 @@ function WorkerDrawer(props: { id: string; onClose: () => void }) {
               )}
               <button className="btn" disabled={!op || busy || revoked || !worker.current_task} title={worker.current_task ? '' : 'No task is running'} onClick={() => void stopTask()}>Stop task</button>
               <button className="btn" disabled={!op || busy || revoked} onClick={() => void disconnect()}>Disconnect</button>
+              <button className="btn" disabled={!can('admin') || busy || revoked} title={can('admin') ? 'Allow or disallow model-training jobs' : 'Administrators only'} onClick={() => void toggleTrust()}>{worker.trusted ? 'Untrust' : 'Trust for training'}</button>
               <button className="btn danger" disabled={!can('admin') || busy || revoked} title={can('admin') ? '' : 'Administrators only'} onClick={() => void revoke()}>Revoke</button>
               <a className="btn" href={`#/logs?device=${encodeURIComponent(worker.id)}`}>View logs</a>
             </div>
@@ -268,6 +284,7 @@ function WorkerDrawer(props: { id: string; onClose: () => void }) {
                   ['Accepted jobs', String(worker.accepted_jobs)],
                   ['Credit', fmtNum(worker.credit)],
                   ['Public profile', worker.public_profile ? 'yes' : 'no'],
+                  ['Trusted for training', worker.trusted ? 'yes' : 'no'],
                 ]}
               />
             </div>

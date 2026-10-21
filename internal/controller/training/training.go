@@ -57,8 +57,14 @@ type RunConfig struct {
 	// InitWeightsArtifact / InitManifestArtifact optionally seed version 0
 	// from an existing model bundle (e.g. a single-node trained checkpoint)
 	// instead of random initialisation. Both must be set together.
-	InitWeightsArtifact  string `json:"init_weights_artifact,omitempty"`
-	InitManifestArtifact string `json:"init_manifest_artifact,omitempty"`
+	InitWeightsArtifact string `json:"init_weights_artifact,omitempty"`
+	// AllowUntrusted lets any device train; by default only devices an
+	// administrator marked trusted receive model-update jobs.
+	AllowUntrusted bool `json:"allow_untrusted,omitempty"`
+	// MaxHeldoutIncrease rejects an aggregated version whose controller-side
+	// held-out loss rises by more than this fraction (requires eval_heldout).
+	MaxHeldoutIncrease   float64 `json:"max_heldout_increase,omitempty"`
+	InitManifestArtifact string  `json:"init_manifest_artifact,omitempty"`
 }
 
 // Defaults fills unset fields with conservative values sized for CPU workers.
@@ -107,6 +113,9 @@ func (c *RunConfig) Defaults() {
 	}
 	if c.LeaseSeconds == 0 {
 		c.LeaseSeconds = 300
+	}
+	if c.MaxHeldoutIncrease == 0 {
+		c.MaxHeldoutIncrease = 0.10
 	}
 }
 

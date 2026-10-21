@@ -50,7 +50,13 @@ type Controller struct {
 	WorkerRequestsPerSecond int    `json:"worker_requests_per_second"`
 	CloudflaredMetricsURL   string `json:"cloudflared_metrics_url"`
 	CheckpointRetain        int    `json:"checkpoint_retain"`
-	DBMaxConns              int    `json:"db_max_conns"`
+	// APIHosts / StudioHosts separate public hostnames: admin routes and the
+	// Studio website are not served on API hosts, worker routes not on Studio
+	// hosts. Empty lists disable the separation (local use).
+	APIHosts             []string `json:"api_hosts,omitempty"`
+	StudioHosts          []string `json:"studio_hosts,omitempty"`
+	MaxDevicesPerProject int      `json:"max_devices_per_project"`
+	DBMaxConns           int      `json:"db_max_conns"`
 }
 
 // Worker is the worker agent configuration.
@@ -87,6 +93,7 @@ func DefaultController() Controller {
 		WorkerRequestsPerSecond: 20,
 		CloudflaredMetricsURL:   "",
 		CheckpointRetain:        5,
+		MaxDevicesPerProject:    1000,
 		DBMaxConns:              16,
 	}
 }
@@ -174,6 +181,19 @@ func (c Controller) Validate() error {
 	}
 	if c.DBMaxConns < 2 {
 		errs = append(errs, errors.New("db_max_conns must be >= 2"))
+	}
+	if strings.HasPrefix(c.PublicURL, "https://") {
+		// Served through an HTTPS proxy (Cloudflare Tunnel): cookies must be
+		// Secure and rate limits must see real client addresses.
+		if !c.CookieSecure {
+			errs = append(errs, errors.New("public_url is https: set \"cookie_secure\": true in the controller config"))
+		}
+		if !c.TrustProxyHeaders {
+			errs = append(errs, errors.New("public_url is https: set \"trust_proxy_headers\": true in the controller config"))
+		}
+	}
+	if c.MaxDevicesPerProject < 1 {
+		errs = append(errs, errors.New("max_devices_per_project must be >= 1"))
 	}
 	return errors.Join(errs...)
 }

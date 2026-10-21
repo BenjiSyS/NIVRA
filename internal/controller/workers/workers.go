@@ -170,6 +170,7 @@ type View struct {
 	ReportedState   string                    `json:"reported_state"`
 	Paused          bool                      `json:"paused"`
 	PublicProfile   bool                      `json:"public_profile"`
+	Trusted         bool                      `json:"trusted"`
 	LastSeenAt      *time.Time                `json:"last_seen_at"`
 	CreatedAt       time.Time                 `json:"created_at"`
 	ClockSkewMS     int                       `json:"clock_skew_ms"`
@@ -197,7 +198,7 @@ type Task struct {
 }
 
 const viewSelect = `SELECT d.id, d.name, d.contributor_name, d.os, d.arch, d.agent_version, d.status, d.reported_state, d.paused,
-	d.public_profile, d.last_seen_at, d.created_at,
+	d.public_profile, d.trusted, d.last_seen_at, d.created_at,
 	COALESCE((SELECT clock_skew_ms FROM worker_sessions s WHERE s.device_id=d.id ORDER BY authenticated_at DESC LIMIT 1), 0),
 	COALESCE(c.cpu, '{}'), COALESCE(c.gpus, '[]'), COALESCE(c.ram_mb, 0), COALESCE(c.vram_mb, 0),
 	COALESCE(c.ram_budget_mb, 0), COALESCE(c.vram_budget_mb, 0), COALESCE(c.executors, '{}'),
@@ -216,7 +217,7 @@ func (s *Service) scan(r pgx.Row) (View, error) {
 	var tJob, tAtt, tType, tState, tStage *string
 	var tProg *float64
 	err := r.Scan(&v.ID, &v.Name, &v.ContributorName, &v.OS, &v.Arch, &v.AgentVersion, &status, &v.ReportedState, &v.Paused,
-		&v.PublicProfile, &v.LastSeenAt, &v.CreatedAt, &v.ClockSkewMS, &cpu, &gpus, &v.RAMMB, &v.VRAMMB, &v.RAMBudgetMB,
+		&v.PublicProfile, &v.Trusted, &v.LastSeenAt, &v.CreatedAt, &v.ClockSkewMS, &cpu, &gpus, &v.RAMMB, &v.VRAMMB, &v.RAMBudgetMB,
 		&v.VRAMBudgetMB, &v.Executors, &tJob, &tAtt, &tType, &tState, &tProg, &tStage, &v.AcceptedJobs, &v.Credit)
 	if err != nil {
 		return v, err
@@ -303,6 +304,25 @@ func (s *Service) Rename(ctx context.Context, actor core.Actor, projectID, devic
 func (s *Service) SetPublicProfile(ctx context.Context, projectID, deviceID string, public bool) error {
 	_, err := s.d.DB.Exec(ctx, `UPDATE devices SET public_profile=$3 WHERE id=$2 AND project_id=$1`, projectID, deviceID, public)
 	return err
+}
+
+// SetTrusted marks a device as allowed (or not) to run jobs that require
+// trust, such as distributed model updates.
+func (s *Service) SetTrusted(ctx context.Context, actor core.Actor, projectID, deviceID string, trusted bool) error {
+	tag, err := s.d.DB.Exec(ctx, `UPDATE devices SET trusted=$3, updated_at=now() WHERE id=$2 AND project_id=$1 AND status='active'`,
+		projectID, deviceID, trusted)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	s.d.Audit(ctx, nil, actor, "worker.trust", "device:"+deviceID, "success", map[string]any{"trusted": trusted})
+	if trusted {
+		s.d.Events.NotifyJobs(projectID)
+	}
+	s.publish(ctx, projectID, deviceID)
+	return nil
 }
 
 // Revoke permanently disables a device: sessions end, active attempts are

@@ -312,7 +312,7 @@ func (s *Service) ensureRoundJobs(ctx context.Context, run *Run) error {
 			_, err := s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: run.ProjectID, JobType: "ai.local_train", Params: pb,
 				Inputs: []protocol.ArtifactRef{{ID: base.Weights, Role: "base_weights"}, {ID: base.Manifest, Role: "base_manifest"},
 					{ID: *run.VAEArtifact, Role: "vae_weights"}},
-				ReqRAMMB: c.ReqRAMMB, Priority: 10, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds,
+				ReqRAMMB: c.ReqRAMMB, Priority: 10, MaxAttempts: 3, LeaseSeconds: c.LeaseSeconds, ReqTrusted: !c.AllowUntrusted,
 				IdempotencyKey: fmt.Sprintf("%sb%d:w%d", roundKeyPrefix(run.ID, run.Round), run.RoundBatch, i),
 				ModelVersion:   &mv, TrainingRunID: &rid})
 			if err != nil {
@@ -450,6 +450,23 @@ func (s *Service) aggregate(ctx context.Context, run *Run, ups []acceptedUpdate)
 			return err
 		})
 		s.d.Log.Warn("aggregation rejected every update; retrying round", "run_id", run.ID, "round", run.Round)
+		return nil
+	}
+	// Independent gate: refuse a version whose held-out loss (computed here,
+	// on the controller) gets clearly worse; the round is retried instead.
+	if sum.HeldoutBefore != nil && sum.HeldoutAfter != nil && run.Config.MaxHeldoutIncrease > 0 &&
+		*sum.HeldoutAfter > *sum.HeldoutBefore*(1+run.Config.MaxHeldoutIncrease) {
+		why := fmt.Sprintf("aggregated version rejected: held-out loss %.4f -> %.4f", *sum.HeldoutBefore, *sum.HeldoutAfter)
+		_ = core.WithTx(ctx, s.d.DB, func(tx pgx.Tx) error {
+			for _, u := range ups {
+				if err := s.recordUpdate(ctx, tx, run, base, u, "invalid", why, nil); err != nil {
+					return err
+				}
+			}
+			_, err := tx.Exec(ctx, `UPDATE training_runs SET round_batch=round_batch+1, pending_version=NULL, status_detail=$2 WHERE id=$1`, run.ID, why)
+			return err
+		})
+		s.d.Log.Warn(why, "run_id", run.ID, "round", run.Round)
 		return nil
 	}
 	w, ok1 := artifactByKind(res, "model_weights")

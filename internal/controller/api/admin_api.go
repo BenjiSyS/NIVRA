@@ -39,13 +39,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if !s.loginIP.allow(ip) || !s.loginUser.allow(strings.ToLower(req.Username)) {
+	user := strings.ToLower(req.Username)
+	// Per-IP limit counts every attempt; the per-account limit counts only
+	// failures, so a flood from elsewhere cannot lock out a correct login
+	// for long and successful sign-ins are never throttled by it.
+	if !s.loginIP.allow(rateKey(ip)) || s.loginUser.blocked(user) {
 		w.Header().Set("Retry-After", "60")
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many sign-in attempts; wait a minute")
 		return
 	}
 	token, sess, err := s.Auth.Login(r.Context(), req.Username, req.Password, ip, r.UserAgent())
 	if errors.Is(err, auth.ErrInvalidCredentials) {
+		s.loginUser.allow(user)
 		writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "invalid username or password")
 		return
 	}
@@ -59,7 +64,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
 	_ = s.Auth.Logout(r.Context(), a.Session.ID)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.d.Cfg.CookieSecure})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "signed out"})
 }
 
@@ -357,6 +362,26 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, a *AdminCt
 	writeJSON(w, http.StatusOK, map[string]string{"status": "renamed"})
 }
 
+func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	var req struct {
+		Trusted bool `json:"trusted"`
+	}
+	if err := decodeJSON(w, r, 1024, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, protocol.ErrBadRequest, "malformed request")
+		return
+	}
+	err := s.Workers.SetTrusted(r.Context(), a.Actor, a.ProjectID, r.PathValue("wid"), req.Trusted)
+	if errors.Is(err, workers.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, protocol.ErrNotFound, "worker not found or revoked")
+		return
+	}
+	if err != nil {
+		s.internalErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"trusted": req.Trusted})
+}
+
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
 	err := s.Workers.Revoke(r.Context(), a.Actor, a.ProjectID, r.PathValue("wid"))
 	if errors.Is(err, workers.ErrNotFound) {
@@ -555,7 +580,7 @@ func (s *Server) handleContributions(w http.ResponseWriter, r *http.Request, a *
 }
 
 func (s *Server) handlePublicLeaderboard(w http.ResponseWriter, r *http.Request) {
-	if !s.enrollIP.allow("lb:" + s.clientIP(r)) {
+	if !s.enrollIP.allow("lb:" + rateKey(s.clientIP(r))) {
 		writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many requests")
 		return
 	}

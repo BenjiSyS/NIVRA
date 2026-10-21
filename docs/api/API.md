@@ -62,7 +62,7 @@ Every worker `POST` body is an envelope; the server checks `protocol_version`, `
 | `GET /worker/commands` | – | → `{commands:[{id, type, payload, state, created_at, expires_at}]}` (marks queued → delivered) |
 | `POST /worker/commands/{id}/ack` | `command.ack` | `{state: acknowledged|executing|completed|failed, result?}` |
 | `POST /worker/logs` | `log.batch` | `{lines:[{time_ms, level, service, message}]}` (≤500) |
-| `POST /artifacts/uploads` | `upload.begin` | `{kind, size, sha256, content_type}` → `{upload_id, offset, size, chunk_size, state, artifact_id?}` (identical content is deduplicated: `state: complete` immediately) |
+| `POST /artifacts/uploads` | `upload.begin` | `{kind, size, sha256, attempt_id, fencing_token}` — only for the device's current attempt; at most 4 uploads in flight per device and 16 artifacts per attempt; the media type is assigned by the server from `kind` → `{upload_id, offset, size, chunk_size, state, artifact_id?}` (identical content is deduplicated: `state: complete` immediately) |
 | `PUT /artifacts/uploads/{id}?offset=N` | raw bytes ≤8 MiB | → status; `409 offset_mismatch` carries the authoritative offset |
 | `GET /artifacts/uploads/{id}` | – | → current offset (resume) |
 | `POST /artifacts/uploads/{id}/complete` | `{}` | verifies size + sha256 → `{state: complete, artifact_id}` |
@@ -103,6 +103,7 @@ Status codes that matter to workers: `401 unauthorized` (open a new session), `4
 * `POST /projects/{pid}/workers/{wid}/commands` (operator) `{type: pause|resume|stop_task|disconnect|refresh_capabilities}` → `202 CommandView`. `pause`/`resume` also flip the authoritative scheduler flag immediately.
 * `GET /projects/{pid}/workers/{wid}/commands`, `GET /projects/{pid}/commands` → `{commands:[{id, device_id, type, state, payload, result, created_at, delivered_at, acknowledged_at, finished_at, expires_at}]}`. The UI shows "requested" (queued/delivered/acknowledged/executing) distinctly from "confirmed" (completed).
 * `POST /projects/{pid}/workers/{wid}/rename` (operator) `{name}`
+* `POST /projects/{pid}/workers/{wid}/trust` (admin) `{trusted}` — only trusted devices receive distributed model-training jobs (unless a run sets `allow_untrusted`)
 * `POST /projects/{pid}/workers/{wid}/revoke` (admin)
 
 ### Jobs / queue
@@ -130,7 +131,7 @@ Job statuses: `ready → leased → running → uploading → validating → com
 * `POST /projects/{pid}/evaluate` `{mode: adherence|reconstruction, num_prompts?, steps?, model_version?}`
 * `POST /projects/{pid}/datasets/shards` `{seed, start, count, jobs, frames?, size?}`
 
-`RunConfig`: `{architecture: "nivra_tiny", seed, rounds, workers_per_round, min_updates, round_timeout_sec, shard_size, data_seed, outer_lr, momentum, eval_heldout, inner:{inner_steps, batch_size, lr, weight_decay, grad_clip, eval_clips}, req_ram_mb, lease_seconds}`. Run statuses: `created, initializing, running, paused, stopping, stopped, completed, failed`.
+`RunConfig`: `{allow_untrusted (default false), max_heldout_increase (default 0.10), init_weights_artifact?, init_manifest_artifact?, architecture: "nivra_tiny", seed, rounds, workers_per_round, min_updates, round_timeout_sec, shard_size, data_seed, outer_lr, momentum, eval_heldout, inner:{inner_steps, batch_size, lr, weight_decay, grad_clip, eval_clips}, req_ram_mb, lease_seconds}`. Run statuses: `created, initializing, running, paused, stopping, stopped, completed, failed`.
 
 ---
 

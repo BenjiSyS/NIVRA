@@ -392,7 +392,10 @@ type UploadBeginRequest struct {
 	Size        int64  `json:"size"`
 	SHA256      string `json:"sha256"`
 	ContentType string `json:"content_type,omitempty"`
-	AttemptID   string `json:"attempt_id,omitempty"`
+	// AttemptID and FencingToken bind the upload to the device's active
+	// attempt; uploads outside a lease are refused.
+	AttemptID    string `json:"attempt_id"`
+	FencingToken int64  `json:"fencing_token"`
 }
 
 // UploadStatus describes an in-progress upload.

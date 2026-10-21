@@ -12,19 +12,33 @@ import (
 )
 
 // readJSONArtifact loads a small JSON artifact.
+// maxManifestBytes bounds JSON artifacts read by the controller (and passed
+// to Python), so a padded manifest cannot exhaust the Pi's memory.
+const maxManifestBytes = 1 << 20
+
+// errJSONTooLarge marks an oversized JSON artifact (a worker fault, not an
+// infrastructure error, so the result is rejected instead of retried).
+var errJSONTooLarge = errors.New("JSON artifact exceeds the size limit")
+
 func (s *Service) readJSONArtifact(ctx context.Context, projectID, id string, v any) (string, error) {
-	p, _, err := s.store.Path(ctx, projectID, id)
+	p, info, err := s.store.Path(ctx, projectID, id)
 	if err != nil {
 		return "", err
+	}
+	if info.Size > maxManifestBytes {
+		return p, errJSONTooLarge
 	}
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, 4<<20))
+	b, err := io.ReadAll(io.LimitReader(f, maxManifestBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(b) > maxManifestBytes {
+		return p, errJSONTooLarge
 	}
 	return p, json.Unmarshal(b, v)
 }
@@ -63,24 +77,33 @@ func (s *Service) validateLocalTrain(ctx context.Context, in scheduler.Validatio
 		return scheduler.Verdict{Reason: "missing update or update_weights artifact", Retry: true}, nil
 	}
 	var params struct {
-		UpdateID string `json:"update_id"`
+		UpdateID   string `json:"update_id"`
+		InnerSteps int    `json:"inner_steps"`
+		BatchSize  int    `json:"batch_size"`
 	}
 	_ = json.Unmarshal(in.Params, &params)
 	var man updateManifest
 	manPath, err := s.readJSONArtifact(ctx, in.ProjectID, upd, &man)
 	if err != nil {
-		return scheduler.Verdict{Reason: "unreadable update manifest: " + err.Error(), Retry: true}, nil
+		return scheduler.Verdict{Reason: "unreadable or oversized update manifest: " + err.Error()}, nil
 	}
 	if man.UpdateID != params.UpdateID || man.Schema != "nivra.update/1" {
 		return scheduler.Verdict{Reason: "update manifest does not match the assigned update_id", Retry: true}, nil
 	}
-	wPath, _, err := s.store.Path(ctx, in.ProjectID, wts)
+	wPath, wInfo, err := s.store.Path(ctx, in.ProjectID, wts)
 	if err != nil {
 		return scheduler.Verdict{}, err
 	}
 	base, err := s.version(ctx, *run.ModelVersion)
 	if err != nil {
 		return scheduler.Verdict{}, err
+	}
+	// An honest update has the same tensors as the base weights; reject
+	// anything far from that size before Python loads it.
+	if _, bInfo, err := s.store.Path(ctx, in.ProjectID, base.Weights); err == nil {
+		if d := wInfo.Size - bInfo.Size; d > 1<<20 || d < -(1<<20) {
+			return scheduler.Verdict{Reason: fmt.Sprintf("update_weights size %d is inconsistent with the base weights (%d)", wInfo.Size, bInfo.Size)}, nil
+		}
 	}
 	if man.BaseVersionID != base.VersionID {
 		return scheduler.Verdict{Reason: "stale_base_version"}, nil
@@ -118,8 +141,11 @@ func (s *Service) validateLocalTrain(ctx context.Context, in scheduler.Validatio
 	if !sum.Valid {
 		return scheduler.Verdict{Reason: fmt.Sprintf("update rejected by validation: %v", sum.Reasons), Detail: detail, Retry: true}, nil
 	}
-	return scheduler.Verdict{Accept: true, Units: float64(man.Samples), UnitKind: "training_samples",
-		Credit: float64(man.Samples) / 100, Detail: detail}, nil
+	// Credit derives from the server-issued job parameters, never from
+	// numbers in the worker-written manifest.
+	samples := float64(params.InnerSteps * params.BatchSize)
+	return scheduler.Verdict{Accept: true, Units: samples, UnitKind: "training_samples",
+		Credit: samples / 100, Detail: detail}, nil
 }
 
 // peerNorms returns the L2 norms of other valid updates in the same round.
@@ -183,9 +209,18 @@ func (s *Service) validateDatasetShard(ctx context.Context, in scheduler.Validat
 	if mine.ContentSHA256 != sum.ContentSHA256 {
 		return scheduler.Verdict{Reason: "content hash differs from controller recomputation", Retry: true}, nil
 	}
-	// Also verify the uploaded artifact is what the summary claims: the shard
-	// file hash is stored in the manifest; here we rely on the summary hash
-	// matching the controller recomputation.
+	// The uploaded shard file itself must equal the controller's recomputation.
+	ref, ok := artifactByKind(res, "dataset_shard")
+	if !ok || ref.SHA256 == "" {
+		return scheduler.Verdict{}, errors.New("controller recomputation produced no dataset_shard artifact hash")
+	}
+	upInfo, err := s.store.Get(ctx, in.ProjectID, in.Artifacts["dataset_shard"])
+	if err != nil {
+		return scheduler.Verdict{Reason: "dataset_shard artifact missing", Retry: true}, nil
+	}
+	if upInfo.SHA256 != ref.SHA256 {
+		return scheduler.Verdict{Reason: "uploaded shard file differs from controller recomputation", Retry: true}, nil
+	}
 	return scheduler.Verdict{Accept: true, Units: float64(p.Count), UnitKind: "clips", Credit: float64(p.Count) / 100,
 		Detail: map[string]any{"verified": true, "content_sha256": mine.ContentSHA256}}, nil
 }
@@ -198,7 +233,7 @@ func (s *Service) validateEvaluate(ctx context.Context, in scheduler.ValidationI
 	}
 	var rep map[string]any
 	if _, err := s.readJSONArtifact(ctx, in.ProjectID, in.Artifacts["evaluation_report"], &rep); err != nil {
-		return scheduler.Verdict{Reason: "unreadable evaluation report", Retry: true}, nil
+		return scheduler.Verdict{Reason: "unreadable or oversized evaluation report"}, nil
 	}
 	return scheduler.Verdict{Accept: true, Units: 1, UnitKind: "evaluations", Credit: 0,
 		Detail: map[string]any{"verified": false}}, nil

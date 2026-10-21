@@ -45,14 +45,16 @@ func (s *Scheduler) Registry() *Registry { return s.reg }
 
 // NewJob describes a job to enqueue.
 type NewJob struct {
-	ProjectID      string
-	JobType        string
-	Params         json.RawMessage
-	Inputs         []protocol.ArtifactRef // only ID and Role are used
-	ReqRAMMB       int
-	ReqVRAMMB      int
-	ReqGPU         bool
-	ReqOS          string
+	ProjectID string
+	JobType   string
+	Params    json.RawMessage
+	Inputs    []protocol.ArtifactRef // only ID and Role are used
+	ReqRAMMB  int
+	ReqVRAMMB int
+	ReqGPU    bool
+	ReqOS     string
+	// ReqTrusted restricts the job to devices an administrator marked trusted.
+	ReqTrusted     bool
 	Priority       int
 	MaxAttempts    int
 	LeaseSeconds   int
@@ -104,12 +106,12 @@ func (s *Scheduler) Create(ctx context.Context, q core.Querier, j NewJob) (strin
 	var id string
 	err := q.QueryRow(ctx, `INSERT INTO jobs (project_id, job_type, category, model_version, training_run_id, params,
 			input_artifacts, input_roles, req_ram_mb, req_vram_mb, req_gpu, req_os, priority, status, max_attempts,
-			lease_seconds, deadline_at, idempotency_key, created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'ready',$14,$15,$16,$17,$18)
+			lease_seconds, deadline_at, idempotency_key, created_by, req_trusted)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'ready',$14,$15,$16,$17,$18,$19)
 		ON CONFLICT (project_id, idempotency_key) DO UPDATE SET updated_at = jobs.updated_at
 		RETURNING id`,
 		j.ProjectID, j.JobType, t.Category, j.ModelVersion, j.TrainingRunID, j.Params, ids, roles,
-		j.ReqRAMMB, j.ReqVRAMMB, j.ReqGPU, reqOS, j.Priority, j.MaxAttempts, j.LeaseSeconds, j.Deadline, idem, j.CreatedBy).Scan(&id)
+		j.ReqRAMMB, j.ReqVRAMMB, j.ReqGPU, reqOS, j.Priority, j.MaxAttempts, j.LeaseSeconds, j.Deadline, idem, j.CreatedBy, j.ReqTrusted).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("create job: %w", err)
 	}
@@ -124,9 +126,10 @@ func (s *Scheduler) Lease(ctx context.Context, projectID, deviceID string) (*pro
 	err := core.WithTx(ctx, s.d.DB, func(tx pgx.Tx) error {
 		var paused bool
 		var status, devOS string
+		var trusted bool
 		// Locking the device row serialises concurrent lease calls per device.
-		if err := tx.QueryRow(ctx, `SELECT paused, status, os FROM devices WHERE id=$1 AND project_id=$2 FOR UPDATE`,
-			deviceID, projectID).Scan(&paused, &status, &devOS); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT paused, status, os, trusted FROM devices WHERE id=$1 AND project_id=$2 FOR UPDATE`,
+			deviceID, projectID).Scan(&paused, &status, &devOS, &trusted); err != nil {
 			return err
 		}
 		if paused || status != "active" {
@@ -158,8 +161,9 @@ func (s *Scheduler) Lease(ctx context.Context, projectID, deviceID string) (*pro
 			  AND (j.req_os IS NULL OR j.req_os = $5)
 			  AND (j.deadline_at IS NULL OR j.deadline_at > now())
 			  AND NOT EXISTS (SELECT 1 FROM job_attempts x WHERE x.job_id=j.id AND x.device_id=$6 AND x.state='rejected')
+			  AND (NOT j.req_trusted OR $7)
 			ORDER BY j.priority DESC, j.created_at
-			LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, projectID, executors, ram, vram, devOS, deviceID).Scan(&jobID)
+			LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, projectID, executors, ram, vram, devOS, deviceID, trusted).Scan(&jobID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -399,6 +403,24 @@ func (s *Scheduler) Retry(ctx context.Context, actor core.Actor, projectID, jobI
 	s.d.Events.NotifyJobs(projectID)
 	s.publishJob(ctx, projectID, jobID)
 	return nil
+}
+
+// CheckActive verifies that attemptID is the device's current, unexpired
+// attempt with the given fencing token.
+func (s *Scheduler) CheckActive(ctx context.Context, deviceID, attemptID string, fencing int64) error {
+	var dev, state string
+	var tok int64
+	var current *string
+	err := s.d.DB.QueryRow(ctx, `SELECT a.device_id, a.state, a.fencing_token, j.current_attempt_id::text
+		FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE a.id=$1`, attemptID).Scan(&dev, &state, &tok, &current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	r := &attemptRow{attemptID: attemptID, deviceID: dev, state: state, fencing: tok, current: current}
+	return r.checkCurrent(deviceID, fencing)
 }
 
 // ActiveAttempts returns the device's attempts that still hold a lease.

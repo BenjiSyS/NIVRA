@@ -401,7 +401,7 @@ func (c *Client) throttle(start time.Time, sent int64) {
 }
 
 // Upload sends a file as a resumable artifact upload and returns its id.
-func (c *Client) Upload(ctx context.Context, path, kind, contentType string, progress func(sent, total int64)) (string, error) {
+func (c *Client) Upload(ctx context.Context, attemptID string, fencing int64, path, kind, contentType string, progress func(sent, total int64)) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -415,7 +415,7 @@ func (c *Client) Upload(ctx context.Context, path, kind, contentType string, pro
 	sum := hex.EncodeToString(h.Sum(nil))
 	var st protocol.UploadStatus
 	if _, err := c.Send(ctx, "/api/v1/artifacts/uploads", protocol.MsgUploadBegin,
-		protocol.UploadBeginRequest{Kind: kind, Size: size, SHA256: sum, ContentType: contentType}, &st); err != nil {
+		protocol.UploadBeginRequest{Kind: kind, Size: size, SHA256: sum, ContentType: contentType, AttemptID: attemptID, FencingToken: fencing}, &st); err != nil {
 		return "", err
 	}
 	if st.State == "complete" {

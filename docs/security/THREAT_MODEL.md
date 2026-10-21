@@ -44,3 +44,24 @@ Scope: controller on a home Raspberry Pi exposed through Cloudflare Tunnel, admi
 * Workers' reported losses/metrics are unverified.
 * The worker website is unauthenticated on loopback: any local user/process on that computer can control the worker.
 * No automatic security updates of the binary yet (updates are manual; unsigned remote scripts are never executed).
+
+## Security review 2026-10-21 (read-only review, fixes implemented the same day)
+
+| # | Finding | Fix | Test |
+|---|---------|-----|------|
+| F1 | Uploads unrelated to any job could fill the Pi's disk | Uploads require the device's current attempt + fencing token; ≤4 in flight per device, ≤16 artifacts per attempt; free-space re-check per chunk; unreferenced worker artifacts purged after 24 h (files removed only when no row still uses them) | `TestUploadBudgetsAndIsolation`, `TestOrphanPurge` |
+| F2 | Padded manifests could make controller-side Python run out of memory, retried forever | JSON artifacts > 1 MiB rejected in Go before Python; update weights must match the base size ±1 MiB; validator infrastructure failures are retried at most 3 times, then rejected | `TestValidatorFailuresAreBounded` (Python-side size checks: see EXPERIMENTS/DISTRIBUTED docs) |
+| F3 | Huge finite updates could destroy the model when fewer than 3 updates are present | Absolute and per-tensor norm bounds relative to the base weights, zero-update rejection and per-update clipping in `ai.validate_update`/`ai.aggregate`; independent controller gate rejects a version whose held-out loss rises > 10 % | Python tests; orchestrator gate |
+| F4 | Credit derived from worker-written `samples` | Credit computed from server-issued `inner_steps × batch_size` | code review |
+| F5 | Insecure cookie/proxy defaults behind HTTPS | Controller refuses to start with an `https` `public_url` unless `cookie_secure` and `trust_proxy_headers` are set; `__Host-` cookie prefix | `TestHTTPSPublicURLRequiresSecureSettings`, `TestSecureCookieUsesHostPrefix` |
+| F6 | Admin API reachable on the worker hostname; per-account login lockout by strangers | `api_hosts`/`studio_hosts` separation; per-account limiter counts failures only | `TestHostSplit` |
+| F7 | Worker-chosen content types could run script in the Studio origin | Server assigns media types from `kind`; only `video/mp4`/`image/png` inline; `Content-Security-Policy: sandbox` on artifacts | artifact test (content type ignored) |
+| F8 | Log/heartbeat floods | Per-device limits: 20 log lines/s (burst 500), ~2 heartbeats per interval | code review |
+| F9 | Unlimited devices could outvote aggregation | Per-project device cap (default 1000); model-training jobs only for admin-trusted devices by default | `TestTrustedJobsOnlyGoToTrustedDevices` |
+| F10 | Uploaded shard file never compared | Shard file SHA-256 compared with the controller's recomputation | validator |
+| F11 | Cross-project dedupe | Dedupe limited to the same project and uploader | `TestUploadBudgetsAndIsolation` |
+| F12 | Spoofable `X-Forwarded-For`; IPv6 rotation | Only `CF-Connecting-IP` from loopback; IPv6 rate keys by /64 | `TestClientIPIgnoresForwardedFor`, `TestRateKeyGroupsIPv6Prefixes` |
+| F13 | Device lockout by unauthenticated session floods | Per-device session budget charged only after signature verification | code review |
+
+Status: the blocking findings for public exposure (F1–F5) are fixed in Go; the Python bounds for F2/F3 are
+implemented in `ai/` (see the AI package tests). Re-review before enabling the public hostnames.

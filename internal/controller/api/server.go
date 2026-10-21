@@ -59,6 +59,8 @@ type Server struct {
 	loginUser     *limiter
 	workerRate    *limiter
 	adminRate     *limiter
+	heartbeatDev  *limiter // at most ~2 heartbeats per interval per device
+	logLines      *limiter // worker log lines per device
 
 	httpSrv *http.Server
 }
@@ -91,6 +93,8 @@ func New(c Config) *Server {
 		loginUser:     perMinute(cfg.LoginAttemptsPerMinute),
 		workerRate:    newLimiter(float64(cfg.WorkerRequestsPerSecond), cfg.WorkerRequestsPerSecond*2),
 		adminRate:     newLimiter(50, 100),
+		heartbeatDev:  newLimiter(2/float64(cfg.HeartbeatIntervalSec), 4),
+		logLines:      newLimiter(20, 500),
 	}
 }
 
@@ -117,7 +121,7 @@ func (s *Server) Handler() http.Handler {
 	for _, e := range s.exts {
 		e.Register(&Router{s: s, mux: mux})
 	}
-	return s.recoverer(s.securityHeaders(mux))
+	return s.recoverer(s.securityHeaders(s.hostSplit(mux)))
 }
 
 // ListenAndServe serves until ctx is cancelled, then shuts down gracefully.
@@ -208,18 +212,65 @@ func (s *Server) clientIP(r *http.Request) string {
 	}
 	if s.d.Cfg.TrustProxyHeaders {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			// Only Cloudflare's header (set at the edge, overwriting any client
+			// value) is trusted; X-Forwarded-For is spoofable by local processes.
 			if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); net.ParseIP(cf) != nil {
 				return cf
-			}
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				first, _, _ := strings.Cut(xff, ",")
-				if ip := strings.TrimSpace(first); net.ParseIP(ip) != nil {
-					return ip
-				}
 			}
 		}
 	}
 	return host
+}
+
+// rateKey groups IPv6 clients by /64 (one subscriber's prefix) so rotating
+// addresses cannot evade per-IP limits; IPv4 addresses are used as-is.
+func rateKey(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil || p.To4() != nil {
+		return ip
+	}
+	return p.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// hostSplit enforces API/Studio hostname separation when configured.
+func (s *Server) hostSplit(next http.Handler) http.Handler {
+	norm := func(hs []string) map[string]bool {
+		m := map[string]bool{}
+		for _, h := range hs {
+			m[strings.ToLower(strings.TrimSpace(h))] = true
+		}
+		return m
+	}
+	apiHosts, studioHosts := norm(s.d.Cfg.APIHosts), norm(s.d.Cfg.StudioHosts)
+	if len(apiHosts) == 0 && len(studioHosts) == 0 {
+		return next
+	}
+	workerPrefixes := []string{"/api/v1/worker/", "/api/v1/enrollment/", "/api/v1/artifacts/"}
+	isWorkerRoute := func(p string) bool {
+		for _, w := range workerPrefixes {
+			if strings.HasPrefix(p, w) {
+				return true
+			}
+		}
+		return false
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := strings.ToLower(r.Host)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		p := r.URL.Path
+		public := p == "/api/v1/health" || strings.HasPrefix(p, "/api/v1/public/")
+		switch {
+		case apiHosts[host] && !public && !isWorkerRoute(p):
+			writeErr(w, http.StatusNotFound, protocol.ErrNotFound, "not found")
+			return
+		case studioHosts[host] && isWorkerRoute(p):
+			writeErr(w, http.StatusNotFound, protocol.ErrNotFound, "not found")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
@@ -301,6 +352,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	p("POST", "/workers/{wid}/commands", auth.RoleOperator, s.handleSendCommand)
 	p("POST", "/workers/{wid}/rename", auth.RoleOperator, s.handleRename)
 	p("POST", "/workers/{wid}/revoke", auth.RoleAdmin, s.handleRevoke)
+	p("POST", "/workers/{wid}/trust", auth.RoleAdmin, s.handleTrust)
 	p("GET", "/commands", auth.RoleViewer, s.handleAllCommands)
 	p("GET", "/jobs", auth.RoleViewer, s.handleJobs)
 	p("POST", "/jobs", auth.RoleOperator, s.handleCreateJob)
