@@ -1,0 +1,18 @@
+# OPT-IN Linux worker unit (user service). See nivra-controller.service for install steps.
+[Unit]
+Description=Nivra worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Nivra
+ExecStart=%h/Nivra/bin/nivra worker run --config %h/Nivra/config/worker.json
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=90
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

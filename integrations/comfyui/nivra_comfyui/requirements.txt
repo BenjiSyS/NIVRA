@@ -1,0 +1,5 @@
+# ComfyUI already provides torch. The Nivra model package itself must be
+# importable: either `pip install -e <nivra-repo>/ai` into ComfyUI's Python,
+# or set NIVRA_AI_DIR=<nivra-repo>/ai before starting ComfyUI.
+numpy>=1.26
+safetensors>=0.4

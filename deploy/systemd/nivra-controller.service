@@ -1,0 +1,27 @@
+# OPT-IN: Nivra does not install this automatically.
+# Install (as the benji user, after reviewing paths):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/nivra-controller.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now nivra-controller
+#   sudo loginctl enable-linger benji      # keep user services running without a login session
+# Remove: systemctl --user disable --now nivra-controller
+[Unit]
+Description=Nivra controller (API + Nivra Studio)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/Nivra
+ExecStartPre=-/usr/bin/docker start nivra-pg
+ExecStart=%h/Desktop/Nivra/bin/nivra controller run --config %h/Desktop/Nivra/config/controller.json
+Restart=on-failure
+RestartSec=10
+# Graceful shutdown: running training rounds stay durable in PostgreSQL.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
