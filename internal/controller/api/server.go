@@ -124,7 +124,12 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string, ready func(net
 	if err != nil {
 		return fmt.Errorf("listen %s: %w (is another controller already running?)", addr, err)
 	}
+	// Long polls and SSE streams derive from baseCtx; cancelling it at
+	// shutdown lets them return immediately instead of stalling Shutdown.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
 	s.httpSrv = &http.Server{
+		BaseContext:       func(net.Listener) context.Context { return baseCtx },
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       5 * time.Minute, // artifact chunks
@@ -141,6 +146,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string, ready func(net
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
+		cancelBase()
 		sctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return s.httpSrv.Shutdown(sctx)
