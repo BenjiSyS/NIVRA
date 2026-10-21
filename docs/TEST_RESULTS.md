@@ -75,3 +75,11 @@ Trained bundle `runs/release/nivra-small-6000` imported through the admin API (s
 
 Quality note: the trained baseline produces the requested colours but blurry shapes and weak motion
 (see `docs/research/EXPERIMENTS.md` for the measured prompt-adherence scores).
+
+## AI package
+
+`.venv\Scripts\python.exe -m pytest ai/tests -q` → **72 passed** (Windows, torch 2.14.1+cpu). Controller-side
+paths (`ai.init_model`, `ai.validate_update`, `ai.aggregate`, `ai.dataset_shard` verification) were exercised on
+the Pi with torch 2.6.0/aarch64 through distributed runs 001/002 and cross-platform shard verification
+(4/4 shards byte-identical between Windows x86 and Pi aarch64). Benchmarks and training measurements:
+`docs/research/EXPERIMENTS.md`.
