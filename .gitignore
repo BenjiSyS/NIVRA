@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Node / web
+node_modules/
+web/dist/
+internal/webui/dist/*
+!internal/webui/dist/.keep
+
+# Go / build output
+/bin/
+/dist/
+*.exe
+*.test
+coverage.out
+
+# Runtime data, secrets and local config (never commit)
+/data/
+/runs/
+/NivraData/
+.env
+*.key
+*.pem
+secrets/
+worker-identity.json
+controller-secrets.json
+
+# Model weights and generated media belong in artifact storage, not git
+*.safetensors
+*.pt
+*.ckpt
+*.mp4
+*.npz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

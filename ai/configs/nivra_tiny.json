@@ -1,0 +1,9 @@
+{
+  "name": "nivra_tiny",
+  "arch_version": "nivra-small/1",
+  "data": {"frames": 8, "size": 32},
+  "vae": {"latent_channels": 4, "c1": 8, "c2": 16, "n_res": 1},
+  "model": {"patch": 2, "dim": 32, "depth": 1, "heads": 2, "mlp_ratio": 2, "text_layers": 1, "text_heads": 2},
+  "train_vae": {"batch_size": 4, "lr": 0.002, "warmup": 2, "weight_decay": 0.0, "grad_clip": 1.0, "ema_decay": 0.0, "train_clips": 32},
+  "train_gen": {"batch_size": 4, "lr": 0.001, "warmup": 2, "weight_decay": 0.0, "grad_clip": 1.0, "ema_decay": 0.99, "train_clips": 32, "caption_dropout": 0.1}
+}

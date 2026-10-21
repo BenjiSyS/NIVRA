@@ -1,0 +1,19 @@
+[project]
+name = "nivra"
+version = "0.1.0"
+description = "Nivra Small: original text-to-video research package (CPU-first, from-scratch)"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy", "safetensors"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["nivra*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

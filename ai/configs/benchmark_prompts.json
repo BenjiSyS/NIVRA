@@ -1,0 +1,150 @@
+{
+ "version": "nivra-bench/1",
+ "note": "Prompts use only the closed vocabulary. 'stationary' and the 'invented' metric cover negative constraints (no extra objects).",
+ "prompts": [
+  {
+   "id": "p01",
+   "category": "single",
+   "lang": "en",
+   "prompt": "a red circle moves from left to right"
+  },
+  {
+   "id": "p02",
+   "category": "single",
+   "lang": "sv",
+   "prompt": "en röd cirkel rör sig från vänster till höger"
+  },
+  {
+   "id": "p03",
+   "category": "color",
+   "lang": "en",
+   "prompt": "a green square moves up"
+  },
+  {
+   "id": "p04",
+   "category": "color",
+   "lang": "sv",
+   "prompt": "en gul triangel rör sig nedåt"
+  },
+  {
+   "id": "p05",
+   "category": "color",
+   "lang": "en",
+   "prompt": "a purple triangle moves from right to left"
+  },
+  {
+   "id": "p06",
+   "category": "color",
+   "lang": "sv",
+   "prompt": "en vit kvadrat rör sig uppåt"
+  },
+  {
+   "id": "p07",
+   "category": "direction",
+   "lang": "en",
+   "prompt": "a blue circle moves down"
+  },
+  {
+   "id": "p08",
+   "category": "direction",
+   "lang": "sv",
+   "prompt": "en blå cirkel rör sig från höger till vänster"
+  },
+  {
+   "id": "p09",
+   "category": "direction",
+   "lang": "en",
+   "prompt": "a yellow square moves from right to left"
+  },
+  {
+   "id": "p10",
+   "category": "direction",
+   "lang": "sv",
+   "prompt": "en grön kvadrat rör sig från vänster till höger"
+  },
+  {
+   "id": "p11",
+   "category": "count",
+   "lang": "en",
+   "prompt": "two blue squares move from left to right"
+  },
+  {
+   "id": "p12",
+   "category": "count",
+   "lang": "sv",
+   "prompt": "två blå kvadrater rör sig från vänster till höger"
+  },
+  {
+   "id": "p13",
+   "category": "count",
+   "lang": "en",
+   "prompt": "three white circles stay still"
+  },
+  {
+   "id": "p14",
+   "category": "count",
+   "lang": "sv",
+   "prompt": "två gula trianglar rör sig uppåt"
+  },
+  {
+   "id": "p15",
+   "category": "multi",
+   "lang": "en",
+   "prompt": "a red circle moves from left to right and a green square moves from right to left"
+  },
+  {
+   "id": "p16",
+   "category": "multi",
+   "lang": "sv",
+   "prompt": "en blå triangel rör sig uppåt och en gul cirkel rör sig nedåt"
+  },
+  {
+   "id": "p17",
+   "category": "multi",
+   "lang": "en",
+   "prompt": "a purple square moves up, a white triangle moves down and a red circle stays still"
+  },
+  {
+   "id": "p18",
+   "category": "multi",
+   "lang": "sv",
+   "prompt": "en grön cirkel står still, en lila kvadrat rör sig uppåt och en röd triangel rör sig nedåt"
+  },
+  {
+   "id": "p19",
+   "category": "stationary",
+   "lang": "en",
+   "prompt": "a green circle stays still"
+  },
+  {
+   "id": "p20",
+   "category": "stationary",
+   "lang": "sv",
+   "prompt": "en blå kvadrat står still"
+  },
+  {
+   "id": "p21",
+   "category": "stationary",
+   "lang": "en",
+   "prompt": "a yellow triangle stays still"
+  },
+  {
+   "id": "p22",
+   "category": "stationary",
+   "lang": "sv",
+   "prompt": "en vit cirkel står still"
+  },
+  {
+   "id": "p23",
+   "category": "generic_noun",
+   "lang": "sv",
+   "prompt": "ett rött föremål rör sig från vänster till höger"
+  },
+  {
+   "id": "p24",
+   "category": "generic_noun",
+   "lang": "en",
+   "prompt": "two green objects move down"
+  }
+ ]
+}
