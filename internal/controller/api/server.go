@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"nivra/internal/controller/artifacts"
 	"nivra/internal/controller/auth"
@@ -176,15 +178,25 @@ func (s *Server) internalErr(w http.ResponseWriter, r *http.Request, err error) 
 }
 
 // decodeJSON strictly decodes a bounded JSON body.
+// errInvalidUTF8 rejects bodies that encoding/json would otherwise
+// silently "repair" with U+FFFD (e.g. a client sending cp1252 text).
+var errInvalidUTF8 = errors.New("request body is not valid UTF-8")
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, max int64, v any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, max)
-	dec := json.NewDecoder(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, max))
+	if err != nil {
+		return err
+	}
+	if !utf8.Valid(body) {
+		return errInvalidUTF8
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if _, err := io.Copy(io.Discard, io.LimitReader(r.Body, 1)); err != nil {
-		return err
+	if dec.More() {
+		return errors.New("unexpected data after JSON value")
 	}
 	return nil
 }
