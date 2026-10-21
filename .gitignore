@@ -26,6 +26,8 @@ coverage.out
 *.key
 *.pem
 secrets/
+# ...but the Go package that manages them is source code.
+!internal/controller/secrets/
 worker-identity.json
 controller-secrets.json
 
