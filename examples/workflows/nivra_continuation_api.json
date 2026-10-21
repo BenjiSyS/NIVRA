@@ -1,0 +1,6 @@
+{
+  "1": {"class_type": "NivraModelLoader", "inputs": {"bundle": "nivra-small", "device": "auto"}},
+  "2": {"class_type": "NivraTextToVideo", "inputs": {"model": ["1", 0], "prompt": "en gul triangel rör sig nedåt", "seed": 3, "steps": 30, "cfg_scale": 3.0, "decode_tile": 0}},
+  "4": {"class_type": "NivraVideoContinuation", "inputs": {"model": ["1", 0], "state": ["2", 1], "known_latent_frames": 2, "prompt": ""}},
+  "5": {"class_type": "NivraExportMP4", "inputs": {"frames": ["4", 0], "fps": 8, "upscale": 4, "filename_prefix": "nivra_continued"}}
+}
