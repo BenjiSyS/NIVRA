@@ -266,3 +266,96 @@ func truncate(s string, n int) string {
 	}
 	return s
 }
+
+// TokenPrefix marks Nivra personal API tokens.
+const TokenPrefix = "nivra_pat_"
+
+// APIToken describes a personal API token (never includes the secret).
+type APIToken struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	ExpiresAt  *time.Time `json:"expires_at"`
+	RevokedAt  *time.Time `json:"revoked_at"`
+}
+
+// CreateToken issues a personal API token for userID. The secret is returned
+// once; only its SHA-256 hash is stored.
+func (s *Service) CreateToken(ctx context.Context, userID, name string, ttl time.Duration) (string, APIToken, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 {
+		return "", APIToken{}, errors.New("token name must be 1-64 characters")
+	}
+	secret := TokenPrefix + secure.RandomToken()
+	var exp *time.Time
+	if ttl > 0 {
+		t := time.Now().Add(ttl).UTC()
+		exp = &t
+	}
+	var t APIToken
+	err := s.d.DB.QueryRow(ctx, `INSERT INTO api_tokens (user_id, name, token_hash, expires_at) VALUES ($1,$2,$3,$4)
+		RETURNING id, name, created_at, last_used_at, expires_at, revoked_at`, userID, name, secure.HashToken(secret), exp).
+		Scan(&t.ID, &t.Name, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt, &t.RevokedAt)
+	if err != nil {
+		return "", APIToken{}, err
+	}
+	s.d.Audit(ctx, nil, core.Actor{Type: "user", ID: userID}, "token.create", "token:"+t.ID, "success", map[string]any{"name": name})
+	return secret, t, nil
+}
+
+// ListTokens returns a user's tokens.
+func (s *Service) ListTokens(ctx context.Context, userID string) ([]APIToken, error) {
+	rows, err := s.d.DB.Query(ctx, `SELECT id, name, created_at, last_used_at, expires_at, revoked_at FROM api_tokens
+		WHERE user_id=$1 ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (APIToken, error) {
+		var t APIToken
+		err := r.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt, &t.RevokedAt)
+		return t, err
+	})
+}
+
+// RevokeToken revokes one of the user's tokens.
+func (s *Service) RevokeToken(ctx context.Context, userID, tokenID string) error {
+	tag, err := s.d.DB.Exec(ctx, `UPDATE api_tokens SET revoked_at=now() WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL`, tokenID, userID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSessionInvalid
+	}
+	return nil
+}
+
+// AuthenticateToken resolves a personal API token to a session-like value.
+// Token requests carry no cookies, so they need no CSRF token.
+func (s *Service) AuthenticateToken(ctx context.Context, secret string) (*Session, error) {
+	if !strings.HasPrefix(secret, TokenPrefix) || len(secret) > 128 {
+		return nil, ErrSessionInvalid
+	}
+	sess := &Session{}
+	var tokenID string
+	err := s.d.DB.QueryRow(ctx, `UPDATE api_tokens t SET last_used_at=now() FROM users u
+		WHERE t.token_hash=$1 AND t.user_id=u.id AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now()) AND u.status='active'
+		RETURNING t.id, u.id, u.username, u.display_name, u.role, u.status, u.created_at`, secure.HashToken(secret)).
+		Scan(&tokenID, &sess.User.ID, &sess.User.Username, &sess.User.DisplayName, &sess.User.Role, &sess.User.Status, &sess.User.CreatedAt)
+	if err != nil {
+		return nil, ErrSessionInvalid
+	}
+	sess.ID = "token:" + tokenID
+	sess.ExpiresAt = time.Now().Add(time.Hour)
+	return sess, nil
+}
+
+// TokenForUsername issues a token by account name (controller-host CLI).
+func (s *Service) TokenForUsername(ctx context.Context, username, name string, ttl time.Duration) (string, error) {
+	var id string
+	if err := s.d.DB.QueryRow(ctx, `SELECT id FROM users WHERE username=$1 AND status='active'`, strings.ToLower(username)).Scan(&id); err != nil {
+		return "", fmt.Errorf("user %q not found", username)
+	}
+	secret, _, err := s.CreateToken(ctx, id, name, ttl)
+	return secret, err
+}

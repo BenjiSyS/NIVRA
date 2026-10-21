@@ -46,6 +46,7 @@ export const api = {
   get: <T>(path: string, signal?: AbortSignal) => call<T>('GET', path, { signal }),
   post: <T>(path: string, body?: unknown, o: Opts = {}) => call<T>('POST', path, { ...o, body: body ?? {} }),
   upload: <T>(path: string, file: Blob, contentType: string) => call<T>('POST', path, { raw: file, contentType }),
+  del: <T>(path: string) => call<T>('DELETE', path, {}),
 }
 
 export const pbase = (pid: string) => `/projects/${encodeURIComponent(pid)}`

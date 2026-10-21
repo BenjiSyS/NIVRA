@@ -1,10 +1,63 @@
 import { useState } from 'react'
 import { fmtAgo, fmtBytes, fmtDateTime, fmtDuration } from '../../shared/format'
-import { CopyButton, ErrorNote, applyDensity, Pill, Spinner, loadPref, savePref, useAsync, useNow } from '../../shared/ui'
+import { CopyButton, ErrorNote, applyDensity, Pill, Spinner, confirmDialog, loadPref, savePref, useAction, useAsync, useNow } from '../../shared/ui'
 import { api } from '../api'
 import { Facts, Json } from '../components'
 import { useSession } from '../session'
 import type { AuditEvent, SystemInfo, User } from '../types'
+
+interface ApiToken { id: string; name: string; created_at: string; last_used_at: string | null; expires_at: string | null; revoked_at: string | null }
+
+/** Personal API tokens for ComfyUI's "Nivra Remote" node and scripts. */
+function ApiTokens() {
+  const now = useNow(10000)
+  const list = useAsync(async () => (await api.get<{ tokens: ApiToken[] }>('/tokens')).tokens, [])
+  const [name, setName] = useState('comfyui')
+  const [days, setDays] = useState(365)
+  const [fresh, setFresh] = useState<string | null>(null)
+  const { busy, run } = useAction()
+  const create = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const r = await run(() => api.post<{ token: string }>('/tokens', { name: name.trim(), days }), 'Token created')
+    if (r) { setFresh(r.token); list.reload() }
+  }
+  const revoke = async (t: ApiToken) => {
+    if (!(await confirmDialog({ title: `Revoke token "${t.name}"?`, body: 'Programs using it stop working immediately.', confirmLabel: 'Revoke', danger: true }))) return
+    const r = await run(() => api.del(`/tokens/${encodeURIComponent(t.id)}`), 'Token revoked')
+    if (r !== undefined) list.reload()
+  }
+  return (
+    <div className="card stack">
+      <h2>API tokens</h2>
+      <p className="dim">Use a token for ComfyUI's <strong>Nivra Remote Text-to-Video</strong> node or the <code>nivra generate</code> command. Set it as the <code>NIVRA_TOKEN</code> environment variable or save it in <code>ComfyUI/user/nivra_token.txt</code>. Never paste it into a workflow you share. Tokens have your role ({'generation needs operator or admin'}).</p>
+      <form className="row" onSubmit={(e) => void create(e)}>
+        <label className="field"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} maxLength={64} /></label>
+        <label className="field"><span>Valid days (0 = no expiry)</span><input type="number" min={0} max={3650} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
+        <button className="btn primary" disabled={busy || !name.trim()}>Create token</button>
+      </form>
+      {fresh && (
+        <div className="note">
+          <strong>Copy this token now — it will not be shown again.</strong>
+          <div className="row"><code className="mono" style={{ wordBreak: 'break-all' }}>{fresh}</code><CopyButton text={fresh} /></div>
+        </div>
+      )}
+      {list.error ? <ErrorNote error={list.error} /> : !list.data ? <Spinner /> : list.data.length === 0 ? <p className="dim">No tokens yet.</p> : (
+        <table className="tbl">
+          <thead><tr><th>Name</th><th>Created</th><th>Last used</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+          <tbody>{list.data.map((t) => (
+            <tr key={t.id}>
+              <td>{t.name}</td><td className="dim">{fmtAgo(t.created_at, now)}</td>
+              <td className="dim">{t.last_used_at ? fmtAgo(t.last_used_at, now) : 'never'}</td>
+              <td className="dim">{t.expires_at ? fmtDateTime(t.expires_at) : 'never'}</td>
+              <td><Pill state={t.revoked_at ? 'revoked' : 'active'}>{t.revoked_at ? 'revoked' : 'active'}</Pill></td>
+              <td>{!t.revoked_at && <button className="btn sm danger" disabled={busy} onClick={() => void revoke(t)}>Revoke</button>}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      )}
+    </div>
+  )
+}
 
 export default function Settings() {
   const { user, project, can } = useSession()
@@ -16,6 +69,7 @@ export default function Settings() {
   return (
     <div className="stack">
       <div className="page-head"><h1>Settings</h1></div>
+      <ApiTokens />
       <div className="grid cols-2">
         <div className="card">
           <h2 style={{ marginBottom: 8 }}>System</h2>

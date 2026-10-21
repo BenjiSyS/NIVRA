@@ -103,9 +103,10 @@ func generateLocal(ctx context.Context, bundle, python, prompt string, seed, ste
 }
 
 type remote struct {
-	base string
-	hc   *http.Client
-	csrf string
+	base  string
+	hc    *http.Client
+	csrf  string
+	token string
 }
 
 func (r *remote) do(ctx context.Context, method, path string, body, out any) error {
@@ -121,6 +122,9 @@ func (r *remote) do(ctx context.Context, method, path string, body, out any) err
 	req.Header.Set("Content-Type", "application/json")
 	if r.csrf != "" {
 		req.Header.Set("X-Nivra-CSRF", r.csrf)
+	}
+	if r.token != "" {
+		req.Header.Set("Authorization", "Bearer "+r.token)
 	}
 	resp, err := r.hc.Do(req)
 	if err != nil {
@@ -146,28 +150,31 @@ func generateRemote(ctx context.Context, url, user, project, model, prompt strin
 	if err != nil {
 		return err
 	}
-	if user == "" {
-		return errors.New("--user is required for remote generation")
-	}
-	pw := os.Getenv("NIVRA_PASSWORD")
-	if pw == "" {
-		fmt.Fprintf(os.Stderr, "Password for %s: ", user)
-		b, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Fprintln(os.Stderr)
-		if err != nil {
-			return fmt.Errorf("cannot read password (set NIVRA_PASSWORD): %w", err)
-		}
-		pw = string(b)
-	}
 	jar, _ := cookiejar.New(nil)
-	r := &remote{base: strings.TrimRight(u.String(), "/") + "/api/v1", hc: &http.Client{Jar: jar, Timeout: 2 * time.Minute}}
-	var login struct {
-		CSRF string `json:"csrf_token"`
+	r := &remote{base: strings.TrimRight(u.String(), "/") + "/api/v1", hc: &http.Client{Jar: jar, Timeout: 2 * time.Minute},
+		token: strings.TrimSpace(os.Getenv("NIVRA_TOKEN"))}
+	if r.token == "" {
+		if user == "" {
+			return errors.New("set NIVRA_TOKEN (personal API token) or pass --user for password sign-in")
+		}
+		pw := os.Getenv("NIVRA_PASSWORD")
+		if pw == "" {
+			fmt.Fprintf(os.Stderr, "Password for %s: ", user)
+			b, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Fprintln(os.Stderr)
+			if err != nil {
+				return fmt.Errorf("cannot read password (set NIVRA_PASSWORD or NIVRA_TOKEN): %w", err)
+			}
+			pw = string(b)
+		}
+		var login struct {
+			CSRF string `json:"csrf_token"`
+		}
+		if err := r.do(ctx, "POST", "/auth/login", map[string]string{"username": user, "password": pw}, &login); err != nil {
+			return err
+		}
+		r.csrf = login.CSRF
 	}
-	if err := r.do(ctx, "POST", "/auth/login", map[string]string{"username": user, "password": pw}, &login); err != nil {
-		return err
-	}
-	r.csrf = login.CSRF
 	var ps struct {
 		Projects []struct{ ID, Name string } `json:"projects"`
 	}
@@ -243,6 +250,9 @@ func (r *remote) download(ctx context.Context, path, out string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", r.base+path, nil)
 	if err != nil {
 		return err
+	}
+	if r.token != "" {
+		req.Header.Set("Authorization", "Bearer "+r.token)
 	}
 	resp, err := r.hc.Do(req)
 	if err != nil {

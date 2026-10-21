@@ -72,6 +72,47 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
 	writeJSON(w, http.StatusOK, map[string]any{"user": a.Session.User, "csrf_token": a.Session.CSRF, "expires_at": a.Session.ExpiresAt})
 }
 
+func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	ts, err := s.Auth.ListTokens(r.Context(), a.Session.User.ID)
+	if err != nil {
+		s.internalErr(w, r, err)
+		return
+	}
+	if ts == nil {
+		ts = []auth.APIToken{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": ts})
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	var req struct {
+		Name string `json:"name"`
+		Days int    `json:"days"`
+	}
+	if err := decodeJSON(w, r, 1024, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, protocol.ErrBadRequest, "malformed request")
+		return
+	}
+	if req.Days < 0 || req.Days > 3650 {
+		writeErr(w, http.StatusBadRequest, protocol.ErrValidation, "days must be 0..3650 (0 = no expiry)")
+		return
+	}
+	secret, t, err := s.Auth.CreateToken(r.Context(), a.Session.User.ID, req.Name, time.Duration(req.Days)*24*time.Hour)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, protocol.ErrValidation, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"token": secret, "info": t, "note": "copy the token now; it is not shown again"})
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	if err := s.Auth.RevokeToken(r.Context(), a.Session.User.ID, r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusNotFound, protocol.ErrNotFound, "token not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
 	us, err := s.Auth.ListUsers(r.Context())
 	if err != nil {

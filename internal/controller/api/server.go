@@ -335,6 +335,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/projects", s.admin(auth.RoleAdmin, false, s.handleCreateProject))
 	mux.Handle("GET /api/v1/system", s.admin(auth.RoleViewer, false, s.handleSystem))
 	mux.Handle("GET /api/v1/users", s.admin(auth.RoleAdmin, false, s.handleUsers))
+	mux.Handle("GET /api/v1/tokens", s.admin(auth.RoleViewer, false, s.handleTokens))
+	mux.Handle("POST /api/v1/tokens", s.admin(auth.RoleViewer, false, s.handleCreateToken))
+	mux.Handle("DELETE /api/v1/tokens/{id}", s.admin(auth.RoleViewer, false, s.handleRevokeToken))
 	mux.Handle("GET /api/v1/audit", s.admin(auth.RoleAdmin, false, s.handleAudit))
 
 	p := func(method, pattern, role string, h func(http.ResponseWriter, *http.Request, *AdminCtx)) {

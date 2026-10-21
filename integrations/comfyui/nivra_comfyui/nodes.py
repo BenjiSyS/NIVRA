@@ -213,7 +213,10 @@ class NivraExportMP4:
         return {"ui": {"text": [str(path)]}, "result": (str(path),)}
 
 
+from .remote import NivraRemoteTextToVideo  # noqa: E402
+
 NODE_CLASS_MAPPINGS = {
+    "NivraRemoteTextToVideo": NivraRemoteTextToVideo,
     "NivraModelLoader": NivraModelLoader,
     "NivraTextToVideo": NivraTextToVideo,
     "NivraImageToVideo": NivraImageToVideo,
@@ -222,6 +225,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "NivraRemoteTextToVideo": "Nivra Remote Text-to-Video (network)",
     "NivraModelLoader": "Nivra Model Loader",
     "NivraTextToVideo": "Nivra Text-to-Video",
     "NivraImageToVideo": "Nivra Image-to-Video",

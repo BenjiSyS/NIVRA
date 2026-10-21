@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 
@@ -46,6 +47,7 @@ Usage:
   nivra controller init      [--config FILE]      Create data dirs, secrets and database schema
   nivra admin create         --username NAME [--role admin|operator|viewer] [--password-stdin]
   nivra admin passwd         --username NAME [--password-stdin]
+  nivra admin token          --username NAME                Personal API token (ComfyUI, scripts)
   nivra project create       --name NAME          Create a project and print its enrollment code
   nivra project list                              List projects and codes
   nivra project rotate-code  --name NAME          Revoke the code and issue a new one
@@ -237,24 +239,38 @@ func cmdAdmin(ctx context.Context, args []string) error {
 	}
 	defer closeFn()
 	svc := auth.New(d)
-	pw, err := readPassword(*pwStdin)
-	if err != nil {
-		return err
-	}
 	switch verb {
 	case "create":
+		pw, err := readPassword(*pwStdin)
+		if err != nil {
+			return err
+		}
 		u, err := svc.CreateUser(ctx, *user, *display, pw, *role)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("created %s account %q\n", u.Role, u.Username)
+	case "token":
+		days := 365
+		if v := os.Getenv("NIVRA_TOKEN_DAYS"); v != "" {
+			fmt.Sscanf(v, "%d", &days)
+		}
+		secret, err := svc.TokenForUsername(ctx, *user, "cli-"+time.Now().Format("20060102-150405"), time.Duration(days)*24*time.Hour)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("API token for %s (valid %d days, shown once; keep it secret):\n%s\n", *user, days, secret)
 	case "passwd":
+		pw, err := readPassword(*pwStdin)
+		if err != nil {
+			return err
+		}
 		if err := svc.SetPassword(ctx, *user, pw); err != nil {
 			return err
 		}
 		fmt.Println("password updated; existing sessions were signed out")
 	default:
-		return errors.New("usage: nivra admin create|passwd --username NAME")
+		return errors.New("usage: nivra admin create|passwd|token --username NAME")
 	}
 	return nil
 }

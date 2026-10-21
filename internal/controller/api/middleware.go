@@ -120,22 +120,35 @@ type AdminCtx struct {
 // requests must carry the CSRF header and, if present, a same-origin Origin.
 func (s *Server) admin(role string, projectScoped bool, h func(http.ResponseWriter, *http.Request, *AdminCtx)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(s.sessionCookieName())
-		if err != nil {
-			writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "sign in required")
-			return
-		}
-		sess, err := s.Auth.Authenticate(r.Context(), c.Value)
-		if err != nil {
-			http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.d.Cfg.CookieSecure})
-			writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "session expired")
-			return
+		var sess *auth.Session
+		bearer := false
+		if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && strings.HasPrefix(tok, auth.TokenPrefix) {
+			// Personal API token (ComfyUI, scripts). No cookie is involved, so
+			// requests cannot be forged cross-site and need no CSRF header.
+			t, err := s.Auth.AuthenticateToken(r.Context(), strings.TrimSpace(tok))
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "API token invalid, expired or revoked")
+				return
+			}
+			sess, bearer = t, true
+		} else {
+			c, err := r.Cookie(s.sessionCookieName())
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "sign in required")
+				return
+			}
+			sess, err = s.Auth.Authenticate(r.Context(), c.Value)
+			if err != nil {
+				http.SetCookie(w, &http.Cookie{Name: s.sessionCookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.d.Cfg.CookieSecure})
+				writeErr(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "session expired")
+				return
+			}
 		}
 		if !s.adminRate.allow(sess.ID) {
 			writeErr(w, http.StatusTooManyRequests, protocol.ErrRateLimited, "too many requests")
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if !bearer && r.Method != http.MethodGet && r.Method != http.MethodHead {
 			got := r.Header.Get("X-Nivra-CSRF")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(sess.CSRF)) != 1 {
 				writeErr(w, http.StatusForbidden, protocol.ErrForbidden, "missing or invalid CSRF token")
