@@ -52,8 +52,35 @@ session opening shared the per-IP enrollment rate limit (10/min), so workers beh
 (here the tunnel; in reality NAT) could not open sessions. Fixed with a per-device session limit
 (12/min) and a separate NAT-friendly per-IP limit; the test above is after the fix.
 
-### 100 simulated workers (stretch)
-See section below once recorded.
+### 100 simulated workers (stretch), 5 minutes — PASS with 6 transient errors
+
+Same setup, 10 000 jobs queued, 5 dashboard readers, controller `0b166f7`.
+
+| operation | ok | errors | p50 | p95 | p99 | max |
+|-----------|---:|---:|---:|---:|---:|---:|
+| heartbeat | 1969 | 6 | 88.0 ms | 574.4 ms | 1.28 s | 2.56 s |
+| jobs.next (leased) | 9775 | 0 | 220.6 ms | 400.4 ms | 860.6 ms | 5.65 s |
+| jobs.ack | 9775 | 0 | 210.0 ms | 375.1 ms | 683.4 ms | 1.46 s |
+| jobs.complete | 9775 | 0 | 305.0 ms | 508.2 ms | 861.8 ms | 1.63 s |
+| jobs.complete duplicate | 507 | 0 | 197.8 ms | 349.1 ms | 552.2 ms | 1.45 s |
+| session (re)open | 31 | 0 | 62.8 ms | 283.5 ms | 299.0 ms | 0.33 s |
+| dashboard /workers | 566 | 0 | 95.9 ms | 576.8 ms | 845.3 ms | 2.28 s |
+| dashboard /jobs | 566 | 0 | 185.4 ms | 713.0 ms | 925.7 ms | 2.65 s |
+| dashboard /overview | 566 | 0 | 87.3 ms | 924.2 ms | 1.02 s | 1.78 s |
+
+* Throughput ≈ **32.6 verified jobs/s**; controller RSS 37 MB.
+* Invariants after the run: accepted = contributions = completed = 17 010; 0 double-accepted jobs;
+  0 leaked leases.
+* Errors: 5 × HTTP 401 and 1 timeout on heartbeats (0.3 %). Root cause: the simulated forced
+  reconnects raced with concurrent requests that shared one client; each concurrent 401 opened a new
+  session, which revoked the previous one. The same race could hit a real worker (heartbeat, job poll
+  and uploads run concurrently). Fixed afterwards with single-flight session refresh in
+  `internal/worker/client` plus a regression test (`TestConcurrent401sRefreshSessionOnce`, fails
+  before the fix, passes after). The 100-worker run has not been repeated after the fix.
+
+Conclusion: the Pi sustains 50 and 100 concurrently connected workers with bounded memory, no lost
+or double-counted results and sub-second p95 latencies on all control operations; worker lists in
+the dashboard refresh well within the 1–2 s target at p95 (0.58 s at 100 workers).
 
 ## Caveats
 * Simulated workers prove the control plane, not distributed GPU training.

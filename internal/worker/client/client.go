@@ -37,6 +37,7 @@ type Client struct {
 	id   *identity.Identity
 
 	mu        sync.Mutex
+	refreshMu sync.Mutex // serialises session (re)opening: each new session revokes the previous one
 	token     string
 	expires   time.Time
 	heartbeat int
@@ -162,6 +163,12 @@ func Enroll(ctx context.Context, controllerURL string, allowInsecure bool, code 
 
 // OpenSession obtains a fresh bearer token, verifying the controller's identity.
 func (c *Client) OpenSession(ctx context.Context) (*protocol.SessionResponse, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	return c.openSession(ctx)
+}
+
+func (c *Client) openSession(ctx context.Context) (*protocol.SessionResponse, error) {
 	nonce := secure.RandomBytes(24)
 	ts := time.Now().UnixMilli()
 	var resp protocol.SessionResponse
@@ -182,13 +189,29 @@ func (c *Client) OpenSession(ctx context.Context) (*protocol.SessionResponse, er
 
 // ensureSession refreshes the token when missing or close to expiry.
 func (c *Client) ensureSession(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	tok, exp := c.token, c.expires
-	c.mu.Unlock()
-	if tok != "" && time.Until(exp) > 2*time.Minute {
+	return c.refresh(ctx, "")
+}
+
+// refresh returns a usable token. If stale is non-empty the caller saw it
+// rejected (401); a new session is opened only if no other goroutine has
+// already replaced that token, so concurrent 401s cause one refresh, not a
+// cascade of sessions revoking each other.
+func (c *Client) refresh(ctx context.Context, stale string) (string, error) {
+	valid := func() (string, bool) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		ok := c.token != "" && c.token != stale && time.Until(c.expires) > 2*time.Minute
+		return c.token, ok
+	}
+	if tok, ok := valid(); ok {
 		return tok, nil
 	}
-	if _, err := c.OpenSession(ctx); err != nil {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if tok, ok := valid(); ok {
+		return tok, nil
+	}
+	if _, err := c.openSession(ctx); err != nil {
 		return "", err
 	}
 	c.mu.Lock()
@@ -236,7 +259,9 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
-			c.InvalidateSession()
+			if _, err := c.refresh(ctx, tok); err != nil {
+				return 0, err
+			}
 			continue
 		}
 		code := resp.StatusCode
@@ -522,7 +547,7 @@ func (c *Client) downloadOnce(ctx context.Context, ref protocol.ArtifactRef, par
 			}
 		}
 	case http.StatusUnauthorized:
-		c.InvalidateSession()
+		_, _ = c.refresh(ctx, tok)
 		return &protocol.APIError{Status: 401, Code: protocol.ErrUnauthorized, Message: "session expired"}
 	default:
 		return decodeError(resp)
