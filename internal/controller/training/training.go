@@ -36,6 +36,10 @@ type InnerConfig struct {
 	WeightDecay float64 `json:"weight_decay"`
 	GradClip    float64 `json:"grad_clip"`
 	EvalClips   int     `json:"eval_clips"`
+	// HD runs only (docs/architecture/HD_TRAINING.md).
+	WarmupSteps int     `json:"warmup_steps,omitempty"`
+	GradAccum   int     `json:"grad_accum,omitempty"`
+	CFGDropout  float64 `json:"cfg_dropout,omitempty"`
 }
 
 // RunConfig configures a distributed run.
@@ -65,10 +69,16 @@ type RunConfig struct {
 	// held-out loss rises by more than this fraction (requires eval_heldout).
 	MaxHeldoutIncrease   float64 `json:"max_heldout_increase,omitempty"`
 	InitManifestArtifact string  `json:"init_manifest_artifact,omitempty"`
+
+	// HD runs (family "hd"); every field is omitted for small-model runs.
+	HDFields
 }
 
 // Defaults fills unset fields with conservative values sized for CPU workers.
 func (c *RunConfig) Defaults() {
+	if c.Family == FamilyHD {
+		c.hdDefaults() // sets the HD-specific values before the generic fill below
+	}
 	if c.Architecture == "" {
 		c.Architecture = "nivra_tiny"
 	}
@@ -121,6 +131,13 @@ func (c *RunConfig) Defaults() {
 
 // Validate bounds the configuration.
 func (c RunConfig) Validate() error {
+	if c.Family == FamilyHD {
+		if err := c.validateHD(); err != nil {
+			return err
+		}
+	} else if c.Family != "" && c.Family != FamilySmall {
+		return fmt.Errorf("%w: family must be small or hd", ErrBadConfig)
+	}
 	switch {
 	case !validName(c.Architecture):
 		return fmt.Errorf("%w: architecture must be a config name", ErrBadConfig)
@@ -179,6 +196,12 @@ func RegisterJobTypes(reg *scheduler.Registry, svc *Service) {
 		ValidateParams: objectParams, Validate: svcOr(svc, (*Service).validateEvaluate)})
 	reg.Register(&scheduler.JobType{Name: "ai.generate", Category: "generation", Async: true,
 		ValidateParams: objectParams, Validate: svcOr(svc, (*Service).validateGenerate)})
+	registerHDJobTypes(reg, svc)
+	// Long videos: draft -> parallel refine segments -> stitch (generations.go).
+	for _, t := range []struct{ name, kind string }{{"ai.draft", "draft_video"}, {"ai.refine_segment", "segment_video"}, {"ai.stitch", "video"}} {
+		reg.Register(&scheduler.JobType{Name: t.name, Category: "generation", Async: true, ValidateParams: objectParams,
+			Validate: svcOr(svc, mp4Validator(t.kind)), OnFinalized: svcKick(svc)})
+	}
 }
 
 func objectParams(raw json.RawMessage) error {
@@ -322,6 +345,9 @@ func (s *Service) CreateRun(ctx context.Context, actor core.Actor, projectID, na
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if cfg.Family == FamilyHD {
+		return s.createHDRun(ctx, actor, projectID, name, cfg)
 	}
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 80 {

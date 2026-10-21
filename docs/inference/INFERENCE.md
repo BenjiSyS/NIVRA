@@ -121,6 +121,49 @@ has optional `width`/`height`/`seconds`/`fps`/`sampler`, 0 / "model default" = b
 models; Video Continuation works, keeping the previous segment's padded frame size; Image-to-Video is small-only) use
 the same loader. Continuation of an HD video via the library: `HDPipeline.continue_video`.
 
+## Long videos (`ai.draft`, `ai.refine_segment`, `ai.stitch`)
+
+Contract and controller side: `docs/architecture/LONG_VIDEO.md`. Code: `nivra/inference/longvideo.py` (logic),
+`HDPipeline.refine` and `sample_flow(init=, strength=, anchors=)` in `nivra/inference/hd.py`, the streaming
+`Mp4Writer` / `RawReader` in `video_io.py`, handlers in `nivra/executor.py`. HD bundles only (others exit 5).
+
+* **`ai.draft`**: params `prompt, seed, style?, sampler?, seconds, fps, draft_width=256, draft_height=144`,
+  `segment_frames` (1 + 8k, default 241), optional `steps, cfg_scale, name (draft), fp16, offload`. Plan:
+  `F = floor(seconds*fps + 0.5) + 1` (half away from zero, like Go), segment *i* = `[i(S-1), min((i+1)(S-1), F-1)]`
+  (`longvideo.segment_plan`, same test vectors as Go's `segmentPlan`). The first segment is `generate`d, every later
+  one `continue_video`d (2 known latent frames), frames are streamed into the MP4 as they are produced (memory is
+  one segment, not the video) and the last segment is trimmed to F. Artifacts `draft_video` (`<name>.mp4`, F frames at
+  draft size) and `draft_plan` (`<name>_plan.json`: `frames, fps, segment_frames, segments[{index,start,end}]`).
+  Progress: stage `draft`, fraction over segments, `step`/`total` = segments done / N. The stop file and
+  `limits.max_seconds` are polled between sampling steps; a stopped job leaves no partial MP4.
+* **`ai.refine_segment`**: inputs `weights, manifest, vae_weights, draft_video`; params `prompt, seed, style?,
+  sampler?, width, height, fps, index, start, end, strength=0.55`, optional `steps, cfg_scale, name (segment),
+  fp16, offload`. Draft frames `start..end` are read through ffmpeg (accurate seek, bicubic upscale to
+  width x height), edge-padded to the VAE multiple and repeated up to 1 + 8k, encoded with the HC-VAE (frame chunks
+  are converted to float lazily, so a 1440p segment is never a float tensor), noised to `strength` and sampled over
+  the remaining part of the schedule (the first scheduled t <= strength: with `steps=30` and a shifted schedule
+  roughly half of them run). The first and last latent frames are replaced by the draft latents (noised along the
+  flow path) at every step and restored exactly at the end, so neighbouring segments meet at the draft frame they
+  share. Decoded chunks go straight into the writer (CRF 12), padding is trimmed: the output has exactly
+  `end - start + 1` frames at width x height. Artifact `segment_video`. `width`/`height` must be even (yuv420p),
+  up to 2560 x 1440. Bad range / unreadable draft / range beyond the draft: exit 5.
+* **`ai.stitch`**: inputs `segment_000 .. segment_{count-1}` (no model files), params `fps, count,
+  crossfade_frames=4 (0 disables), name (video)`. Segments are read one frame at a time through ffmpeg pipes and
+  encoded on the fly (CRF 14); memory is O(crossfade window). Every segment but the first drops its first frame
+  (the shared boundary), so the total is `sum(n_i) - (N-1)` = F. Seam: the boundary frame B plus `c//2` frames
+  before and `c - c//2 - 1` after it (c frames) are blends of both segments with weight `(j+1)/(c+1)` on the next
+  segment; a segment has no frames before its start or after its end, so there its boundary frame is held (a
+  short still ghost of 1-2 frames, not motion interpolation). `c` shrinks automatically next to very short
+  segments. Segments of different sizes or an unreadable file: exit 5; a missing `segment_NNN` or extras: exit 2.
+
+Measured on this CPU (tiny HD config, random weights, 2 threads; plumbing numbers only, not quality or GPU claims):
+2560 x 1440, 9 frames, 2 sampling steps: peak RSS 5.6 GB (`generate`, untiled VAE) and 5.6 GB (`refine`, 4 steps,
+about 95 s: 47 s encode, 46 s decode). With `vae_tile=16` the peak stays at about 5.5 GB and the time triples: the
+decoder's receptive radius is 7 latent cells, so a 16-cell tile still reads a 30-cell window of the 45 x 80 grid.
+`vae_tile=8` crashed the interpreter (segfault) in `HCVAE.decode_stream` at this size (not investigated; `hc_vae.py`
+is outside this feature). Tiling only pays off on much larger latent grids than the tiny config has.
+Not claimed: any visual quality, temporal coherence over minutes, or GPU behaviour (untested).
+
 ## Hardware profiles
 
 Measured on this machine (the only hardware used): Intel i5-8250U, 4 cores / 8 threads, 8 GB RAM, no GPU,

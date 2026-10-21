@@ -17,6 +17,7 @@ def inspect_dataset(root, samples: int = 5) -> dict:
         "dir": str(root), "fingerprint": ds["fingerprint"], "clips": len(rows),
         "per_bucket": dict(Counter(r["bucket"] for r in rows)), "per_split": dict(Counter(r["split"] for r in rows)),
         "per_lang": dict(Counter(r["lang"] for r in rows)),
+        "per_style": dict(sorted(Counter(r.get("style", "unspecified") for r in rows).items())),
         "per_license": dict(Counter(r["provenance"]["license"] for r in rows)),
         "shards": len(ds.get("shards", [])), "bytes": sum(s["bytes"] for s in ds.get("shards", [])),
         "rejected": ds.get("rejected", {}),

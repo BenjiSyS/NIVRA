@@ -30,7 +30,8 @@ func startGroup(cmd *exec.Cmd) (*procGroup, error) {
 		windows.CloseHandle(job)
 		return nil, err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
+	// CREATE_NO_WINDOW: no console window pops up when Nivra.exe (no console) runs Python.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | 0x08000000, HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		windows.CloseHandle(job)
 		return nil, err

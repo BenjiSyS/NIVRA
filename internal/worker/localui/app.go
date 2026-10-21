@@ -31,6 +31,12 @@ type App struct {
 	Log               *slog.Logger
 	// Quit, when set, is called by POST /local/api/app/quit (closes Nivra.exe).
 	Quit func()
+	// Runtime, when set, lets the app run model bundles on this computer.
+	Runtime func() LocalRuntime
+	// ModelDirs are scanned for model bundle folders (each subfolder one model).
+	ModelDirs []string
+	// ScanRoots are searched a few levels deep, in the background, for models.
+	ScanRoots []string
 
 	mu        sync.Mutex
 	cfg       appConfig
@@ -41,12 +47,19 @@ type App struct {
 	lastErr   string
 	hc        *http.Client
 	wake      chan struct{}
+	// local generation queue
+	localWake   chan struct{}
+	localCancel map[string]context.CancelFunc
+	discovered  []string
+	rescanNow   chan struct{}
 }
 
 type appConfig struct {
 	ControllerURL string `json:"controller_url"`
 	Token         string `json:"token"`
 	Project       string `json:"project"`
+	// LocalModels are model bundle folders loaded with "Load model".
+	LocalModels []string `json:"local_models,omitempty"`
 }
 
 type appUser struct {
@@ -60,19 +73,52 @@ type appProject struct {
 }
 
 type histItem struct {
-	ID           string         `json:"id"`
-	ProjectID    string         `json:"project_id"`
-	Prompt       string         `json:"prompt"`
-	Params       map[string]any `json:"params"`
-	CreatedAt    time.Time      `json:"created_at"`
-	FinishedAt   *time.Time     `json:"finished_at,omitempty"`
-	Status       string         `json:"status"`
-	Progress     float64        `json:"progress"`
-	Stage        string         `json:"stage"`
-	Worker       string         `json:"worker"`
-	Error        string         `json:"error"`
-	Video        bool           `json:"video"`
+	ID         string         `json:"id"`
+	ProjectID  string         `json:"project_id"`
+	Prompt     string         `json:"prompt"`
+	Params     map[string]any `json:"params"`
+	CreatedAt  time.Time      `json:"created_at"`
+	FinishedAt *time.Time     `json:"finished_at,omitempty"`
+	Status     string         `json:"status"`
+	Progress   float64        `json:"progress"`
+	Stage      string         `json:"stage"`
+	Worker     string         `json:"worker"`
+	Error      string         `json:"error"`
+	Video      bool           `json:"video"`
+	// Local generations run on this computer from a loaded model folder.
+	Local bool `json:"local,omitempty"`
+	// GenerationID is set for long videos built from segments on the network.
+	GenerationID string     `json:"generation_id,omitempty"`
+	ModelID      string     `json:"model_id,omitempty"`
+	StartedAt    *time.Time `json:"started_at,omitempty"`
 	pollFailures int
+	samples      []progSample
+}
+
+// progSample is one (time, progress) observation for the time-left estimate.
+type progSample struct {
+	t time.Time
+	p float64
+}
+
+// eta estimates the seconds left from the recent progress rate; -1 = unknown.
+func (h *histItem) eta(now time.Time) int {
+	if !unfinished(h.Status) || h.Status == "queued" || len(h.samples) < 2 {
+		return -1
+	}
+	first, last := h.samples[0], h.samples[len(h.samples)-1]
+	dp := last.p - first.p
+	dt := last.t.Sub(first.t).Seconds()
+	if dp < 0.005 || dt < 1 || last.p >= 1 {
+		return -1
+	}
+	left := (1 - last.p) * dt / dp
+	// Time since the last update already counts towards what is left.
+	left -= now.Sub(last.t).Seconds()
+	if left < 1 {
+		left = 1
+	}
+	return int(left + 0.5)
 }
 
 var jobIDRe = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
@@ -91,6 +137,15 @@ func (a *App) Init() {
 	}
 	if b, err := os.ReadFile(a.histPath()); err == nil {
 		_ = json.Unmarshal(b, &a.items)
+	}
+	a.localWake = make(chan struct{}, 1)
+	a.rescanNow = make(chan struct{}, 1)
+	a.localCancel = map[string]context.CancelFunc{}
+	for _, it := range a.items {
+		// A local generation dies with the app; network jobs keep running.
+		if it.Local && (it.Status == "running" || it.Status == "downloading") {
+			it.Status, it.Error = "failed", "interrupted: Nivra was closed while this was generating"
+		}
 	}
 	if a.Log == nil {
 		a.Log = slog.Default()
@@ -247,6 +302,9 @@ func (a *App) poke() {
 
 // Run polls unfinished generations until ctx ends.
 func (a *App) Run(ctx context.Context) {
+	go a.runLocal(ctx)
+	go a.runDiscovery(ctx)
+	a.pokeLocal()
 	a.refresh(ctx)
 	lastRefresh := time.Now()
 	for {
@@ -265,6 +323,13 @@ func (a *App) Run(ctx context.Context) {
 		case <-a.wake:
 		case <-time.After(wait):
 		}
+	}
+}
+
+func (a *App) pokeLocal() {
+	select {
+	case a.localWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -295,7 +360,7 @@ func (a *App) pollOnce(ctx context.Context) bool {
 	base, token := a.controllerURL(), a.cfg.Token
 	var todo []histItem
 	for _, it := range a.items {
-		if unfinished(it.Status) {
+		if unfinished(it.Status) && !it.Local {
 			todo = append(todo, *it)
 		}
 	}
@@ -306,6 +371,10 @@ func (a *App) pollOnce(ctx context.Context) bool {
 	for _, it := range todo {
 		if ctx.Err() != nil {
 			return true
+		}
+		if it.GenerationID != "" {
+			a.pollGeneration(ctx, base, token, it)
+			continue
 		}
 		var j ctlJob
 		err := a.call(ctx, base, token, "GET", "/projects/"+it.ProjectID+"/jobs/"+it.ID, nil, &j)
@@ -346,7 +415,7 @@ func (a *App) pollOnce(ctx context.Context) bool {
 	a.mu.Lock()
 	var dl []histItem
 	for _, it := range a.items {
-		if it.Status == "downloading" {
+		if it.Status == "downloading" && !it.Local {
 			dl = append(dl, *it)
 		}
 	}
@@ -369,7 +438,7 @@ func (a *App) pollOnce(ctx context.Context) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, it := range a.items {
-		if unfinished(it.Status) {
+		if unfinished(it.Status) && !it.Local {
 			return true
 		}
 	}
@@ -383,6 +452,13 @@ func (a *App) update(id string, f func(*histItem)) {
 		if it.ID == id {
 			before := *it
 			f(it)
+			if it.Progress != before.Progress || (it.Status == "running" && before.Status != "running") {
+				it.samples = append(it.samples, progSample{time.Now(), it.Progress})
+				// Keep the last ~3 minutes so the rate follows the current stage.
+				for len(it.samples) > 2 && time.Since(it.samples[0].t) > 3*time.Minute {
+					it.samples = it.samples[1:]
+				}
+			}
 			if before.Status != it.Status || before.Progress != it.Progress || before.Stage != it.Stage || before.Worker != it.Worker {
 				a.saveHistLocked()
 			}
@@ -450,9 +526,13 @@ func (a *App) itemView(h *histItem) map[string]any {
 	if h.FinishedAt != nil {
 		end = *h.FinishedAt
 	}
+	var eta any
+	if e := h.eta(time.Now()); e >= 0 {
+		eta = e
+	}
 	return map[string]any{"id": h.ID, "prompt": h.Prompt, "params": params, "created_at": h.CreatedAt, "status": h.Status,
 		"progress": h.Progress, "stage": h.Stage, "worker": h.Worker, "error": h.Error, "video_url": video,
-		"seconds_total": int(end.Sub(h.CreatedAt).Seconds())}
+		"seconds_total": int(end.Sub(h.CreatedAt).Seconds()), "eta_seconds": eta, "local": h.Local}
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -514,28 +594,37 @@ func (a *App) Register(mux *http.ServeMux) {
 		a.poke()
 		writeJSON(w, 200, a.configView())
 	})
+	a.registerLocal(mux)
+	a.registerDiscovery(mux)
 	mux.HandleFunc("GET /local/api/app/models", func(w http.ResponseWriter, r *http.Request) {
+		out := []map[string]any{}
+		for _, m := range a.localModels() {
+			out = append(out, map[string]any{"id": m.ID, "name": m.Name, "architecture": "", "family": m.Family, "active": false,
+				"parameter_count": m.Params, "styles": m.Styles, "default_style": m.DefaultStyle, "source": "local", "path": m.Path})
+		}
 		base, token, pid, err := a.snapshot()
 		if err != nil {
-			writeErr(w, 409, err.Error())
+			// No controller: local models still work.
+			writeJSON(w, 200, map[string]any{"models": out, "network_error": err.Error()})
 			return
 		}
 		var ms struct {
 			Models []struct {
-				ID             string  `json:"id"`
-				RunName        *string `json:"run_name"`
-				Architecture   *string `json:"architecture"`
-				Family         string  `json:"family"`
-				Active         bool    `json:"active"`
-				ParameterCount int64   `json:"parameter_count"`
-				Verification   string  `json:"verification_state"`
+				ID             string   `json:"id"`
+				RunName        *string  `json:"run_name"`
+				Architecture   *string  `json:"architecture"`
+				Family         string   `json:"family"`
+				Active         bool     `json:"active"`
+				ParameterCount int64    `json:"parameter_count"`
+				Verification   string   `json:"verification_state"`
+				Styles         []string `json:"styles"`
+				DefaultStyle   string   `json:"default_style"`
 			} `json:"models"`
 		}
 		if err := a.call(r.Context(), base, token, "GET", "/projects/"+pid+"/models", nil, &ms); err != nil {
-			writeErr(w, 502, err.Error())
+			writeJSON(w, 200, map[string]any{"models": out, "network_error": err.Error()})
 			return
 		}
-		out := []map[string]any{}
 		for _, m := range ms.Models {
 			name, arch := "", ""
 			if m.RunName != nil {
@@ -551,8 +640,12 @@ func (a *App) Register(mux *http.ServeMux) {
 			if fam != "hd" {
 				fam = "small"
 			}
+			styles := m.Styles
+			if styles == nil {
+				styles = []string{}
+			}
 			out = append(out, map[string]any{"id": m.ID, "name": name, "architecture": arch, "family": fam, "active": m.Active,
-				"parameter_count": m.ParameterCount})
+				"parameter_count": m.ParameterCount, "styles": styles, "default_style": m.DefaultStyle, "source": "network"})
 		}
 		writeJSON(w, 200, map[string]any{"models": out})
 	})
@@ -568,19 +661,33 @@ func (a *App) Register(mux *http.ServeMux) {
 			Height       *int     `json:"height"`
 			Seconds      *float64 `json:"seconds"`
 			Sampler      string   `json:"sampler"`
+			Style        string   `json:"style"`
 		}
 		if !decodeBody(w, r, &req) {
 			return
 		}
 		req.Prompt = strings.TrimSpace(req.Prompt)
-		if req.Prompt == "" || len(req.Prompt) > 2000 {
-			writeErr(w, 400, "the prompt must be 1-2000 characters")
+		if req.Prompt == "" || len(req.Prompt) > 1000 {
+			writeErr(w, 400, "the prompt must be 1-1000 characters")
 			return
 		}
-		base, token, pid, err := a.snapshot()
-		if err != nil {
-			writeErr(w, 409, err.Error())
-			return
+		local := strings.HasPrefix(req.ModelVersion, localPrefix)
+		var base, token, pid string
+		if local {
+			if a.Runtime == nil {
+				writeErr(w, 400, "this app cannot run models locally")
+				return
+			}
+			if _, ok := a.findLocal(req.ModelVersion); !ok {
+				writeErr(w, 400, "that model folder is no longer available; load it again")
+				return
+			}
+		} else {
+			var err error
+			if base, token, pid, err = a.snapshot(); err != nil {
+				writeErr(w, 409, err.Error())
+				return
+			}
 		}
 		body := map[string]any{"prompt": req.Prompt}
 		if req.ModelVersion != "" {
@@ -603,9 +710,29 @@ func (a *App) Register(mux *http.ServeMux) {
 		set("height", deref(req.Height), req.Height != nil)
 		set("seconds", derefF(req.Seconds), req.Seconds != nil)
 		set("sampler", req.Sampler, req.Sampler != "")
+		set("style", req.Style, req.Style != "")
+		if local {
+			params := map[string]any{}
+			for k, v := range body {
+				if k != "prompt" {
+					params[k] = v
+				}
+			}
+			id := newLocalJobID()
+			a.mu.Lock()
+			a.items = append(a.items, &histItem{ID: id, Prompt: req.Prompt, Params: params, CreatedAt: time.Now().UTC(),
+				Status: "queued", Stage: "waiting for this computer", Local: true, ModelID: req.ModelVersion})
+			a.saveHistLocked()
+			a.mu.Unlock()
+			a.pokeLocal()
+			writeJSON(w, 200, map[string]any{"id": id})
+			return
+		}
 		var created struct {
 			JobID        string `json:"job_id"`
+			GenerationID string `json:"generation_id"`
 			ModelVersion string `json:"model_version"`
+			Segments     int    `json:"segments"`
 		}
 		if err := a.call(r.Context(), base, token, "POST", "/projects/"+pid+"/generate", body, &created); err != nil {
 			status := 502
@@ -617,7 +744,7 @@ func (a *App) Register(mux *http.ServeMux) {
 			writeErr(w, status, err.Error())
 			return
 		}
-		if !jobIDRe.MatchString(created.JobID) {
+		if !jobIDRe.MatchString(created.JobID) || (created.GenerationID != "" && !jobIDRe.MatchString(created.GenerationID)) {
 			writeErr(w, 502, "the controller returned an unexpected job id")
 			return
 		}
@@ -631,12 +758,18 @@ func (a *App) Register(mux *http.ServeMux) {
 			params["model_version"] = created.ModelVersion
 		}
 		a.mu.Lock()
-		a.items = append(a.items, &histItem{ID: created.JobID, ProjectID: pid, Prompt: req.Prompt, Params: params,
-			CreatedAt: time.Now().UTC(), Status: "queued", Stage: "waiting for a free worker"})
+		item := &histItem{ID: created.JobID, ProjectID: pid, Prompt: req.Prompt, Params: params,
+			CreatedAt: time.Now().UTC(), Status: "queued", Stage: "waiting for a free worker"}
+		if created.GenerationID != "" {
+			// Long video: the history entry follows the whole generation.
+			item.ID, item.GenerationID = created.GenerationID, created.GenerationID
+			item.Params["segments"] = created.Segments
+		}
+		a.items = append(a.items, item)
 		a.saveHistLocked()
 		a.mu.Unlock()
 		a.poke()
-		writeJSON(w, 200, map[string]any{"id": created.JobID})
+		writeJSON(w, 200, map[string]any{"id": item.ID})
 	})
 	mux.HandleFunc("GET /local/api/app/history", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
@@ -673,12 +806,26 @@ func (a *App) Register(mux *http.ServeMux) {
 			writeErr(w, 400, "this generation already finished")
 			return
 		}
+		if it.Local {
+			a.update(it.ID, func(h *histItem) { h.Status, h.Error = "cancelled", "cancelled by you" })
+			a.mu.Lock()
+			if c := a.localCancel[it.ID]; c != nil {
+				c()
+			}
+			a.mu.Unlock()
+			writeJSON(w, 200, map[string]any{"ok": true})
+			return
+		}
 		base, token, _, err := a.snapshot()
 		if err != nil {
 			writeErr(w, 409, err.Error())
 			return
 		}
-		if err := a.call(r.Context(), base, token, "POST", "/projects/"+it.ProjectID+"/jobs/"+it.ID+"/cancel", nil, nil); err != nil {
+		path := "/projects/" + it.ProjectID + "/jobs/" + it.ID + "/cancel"
+		if it.GenerationID != "" {
+			path = "/projects/" + it.ProjectID + "/generations/" + it.GenerationID + "/cancel"
+		}
+		if err := a.call(r.Context(), base, token, "POST", path, nil, nil); err != nil {
 			writeErr(w, 502, err.Error())
 			return
 		}
@@ -745,4 +892,58 @@ func derefF(p *float64) float64 {
 		return 0
 	}
 	return *p
+}
+
+// pollGeneration updates a long-video item from the controller's generation view.
+func (a *App) pollGeneration(ctx context.Context, base, token string, it histItem) {
+	var g struct {
+		Status        string   `json:"status"`
+		Stage         string   `json:"stage"`
+		Progress      float64  `json:"progress"`
+		SegmentsTotal int      `json:"segments_total"`
+		SegmentsDone  int      `json:"segments_done"`
+		Workers       []string `json:"workers"`
+		ArtifactID    *string  `json:"artifact_id"`
+		Failure       string   `json:"failure_reason"`
+	}
+	err := a.call(ctx, base, token, "GET", "/projects/"+it.ProjectID+"/generations/"+it.GenerationID, nil, &g)
+	a.update(it.ID, func(h *histItem) {
+		if err != nil {
+			h.pollFailures++
+			var ce *ctlErr
+			if errors.As(err, &ce) && (ce.Status == 404 || ce.Status == 403) && h.pollFailures >= 3 {
+				h.Status, h.Error = "failed", "the controller no longer has this video"
+			}
+			return
+		}
+		h.pollFailures = 0
+		h.Progress = g.Progress
+		h.Worker = strings.Join(g.Workers, ", ")
+		switch g.Stage {
+		case "draft":
+			h.Stage = "drawing the whole video at low resolution"
+		case "refine":
+			h.Stage = fmt.Sprintf("rendering segments: %d of %d done", g.SegmentsDone, g.SegmentsTotal)
+			if n := len(g.Workers); n > 1 {
+				h.Stage += fmt.Sprintf(" on %d computers", n)
+			}
+		case "stitch":
+			h.Stage = "joining the segments"
+		}
+		switch g.Status {
+		case "completed":
+			if g.ArtifactID == nil {
+				h.Status, h.Error = "failed", "the video finished without a file"
+				return
+			}
+			h.Status, h.Progress, h.Stage = "downloading", 1, "downloading"
+			h.Params["_artifact"] = *g.ArtifactID
+		case "failed", "cancelled":
+			h.Status, h.Error = g.Status, g.Failure
+		default:
+			if g.Progress > 0 || len(g.Workers) > 0 {
+				h.Status = "running"
+			}
+		}
+	})
 }

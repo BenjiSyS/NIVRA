@@ -1,0 +1,7 @@
+# Optional dependencies for `nivra caption` (video captioning + subtitles).
+# Install:  nivra caption --install
+#   or:     python -m pip install -r ai/requirements-caption.txt
+# PyTorch is installed separately (see ai/requirements.txt).
+transformers>=5.0,<6
+faster-whisper>=1.1
+pillow>=10

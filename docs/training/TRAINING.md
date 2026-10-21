@@ -97,3 +97,44 @@ jobs. Hashes of the 6000-step bundle: `EXPERIMENTS.md` E3. Inference: `docs/infe
 Update validation always enforces absolute norm bounds, zero-update rejection, JSON size limits and header-first
 safetensors checks, with no parameters required (`docs/training/DISTRIBUTED.md` section 0 and 1.4). Consequence for
 local experiments: a pseudo-gradient larger than 0.5 x ||base weights|| is rejected (`norm_outlier`).
+
+## Train on your own videos
+
+Goal: a folder of videos you are allowed to use becomes a model that shows up in `Nivra.exe` by itself. Everything runs on
+one machine (a 6 GB GPU is enough for `nivra_base`; a CPU works for tiny tests only). Details and numbers:
+`docs/architecture/HD_TRAINING.md`.
+
+1. **Put the videos in one folder**, for example `D:\anime-clips`. Add a `PROVENANCE.json` there (source, license, license_url,
+   permission, collected, contains_people, consent): ingestion refuses a folder without it, so you always know where the data came from.
+2. **Caption them** (needs `ai/requirements-caption.txt`, see `docs/training/CAPTIONING.md`). Captioning is slow on a laptop, so do it in
+   batches; each run only touches videos that still lack a caption:
+
+       nivra caption D:\anime-clips --limit 100
+       nivra caption D:\anime-clips --limit 100      (again, until it says nothing is left)
+
+   This writes `<video>.txt` next to every video. Read a few and fix wrong ones by hand: the model learns exactly these sentences.
+3. **Look at the plan**, then train:
+
+       python -m nivra.cli train-pipeline --config nivra_base --videos D:\anime-clips --out D:\runs\anime-v1 ^
+           --name anime-v1 --install-dir "C:\Users\you\Nivra" --plan-only
+       python -m nivra.cli train-pipeline --config nivra_base --videos D:\anime-clips --out D:\runs\anime-v1 ^
+           --name anime-v1 --install-dir "C:\Users\you\Nivra"
+
+   It prints the stages with rough time estimates, then runs: ingest (cut into 2 s clips, drop duplicates and junk), tokenizer, text
+   encoder, video VAE, latents, the diffusion transformer, and the bundle. Defaults are 1500 / 4000 / 8000 steps for text / VAE / DiT;
+   raise `--vae-steps` and `--dit-steps` for real quality (days on one 6 GB card, and tens of hours of clips are needed for good
+   results; a few hundred clips only teaches the look and a few motions).
+4. **Stop and resume freely.** Press Ctrl+C any time and run the same command again: finished stages are skipped (a marker file
+   in `RUN\markers` records what each stage was built from) and the VAE/DiT stages continue from their last checkpoint. Changing an
+   option (for example `--dit-steps`) re-runs only that stage and the ones after it. `--from-stage` / `--to-stage` run part of the
+   chain (for instance `--to-stage latents` overnight, DiT the next day); `--force` re-runs the selected stages.
+5. **Use it.** The bundle is written to `<install>\models\anime-v1` (`model_version.json`, `weights.safetensors`, `vae.safetensors`,
+   `text_encoder\`). `Nivra.exe` scans `<install>\models`, so the model appears in its model list (Rescan if it is already open). Without
+   `--install-dir` the bundle is `RUN\bundle`; copy it into any folder the app scans, or point `--bundle-out` at one.
+6. **Or train on the network instead.** Use the finished `RUN\latents` (already encoded, `nivra-latents/1` shards) and the bundle as the
+   starting version: `nivra model import RUN\bundle`, `nivra dataset push RUN\latents --kind latents`, then create an HD training run on
+   the controller (`docs/architecture/HD_TRAINING.md`). Workers then train rounds of the same DiT on those latents.
+
+Troubleshooting: "no train clips" after ingest means the videos were shorter than 2 s, lower resolution than 448x256 or lacked a caption
+(the counts are in `RUN\dataset\dataset.json`, key `rejected`). A `StreamStateTooLarge` error while decoding means the VAE tile size is too small for the output size:
+use a larger `vae_tile` (the cache state grows with the number of tiles).

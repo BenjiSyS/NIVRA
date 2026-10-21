@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 N_HASH_FRAMES = 8
+HOLD_EPS = 0.05          # mean |luma diff| (0-255) at or below this = the frame was held (codec noise only)
 
 
 @dataclass
@@ -16,6 +17,20 @@ class QualityLimits:
     max_brightness: float = 243.0     # above this -> "too_bright"
     min_motion: float = 0.35          # mean |frame diff| (0-255 luma, on a 1/4-res grid) below this -> "static"
     min_contrast: float = 4.0         # luma std over the clip below this -> "flat" (blank / single colour)
+    # Held-frame aware "static" test (stylized profile; 0 = off, the plain `min_motion` test is used):
+    min_motion_active: float = 0.0    # mean |diff| over the frame pairs that actually change, below this -> "static"
+    min_active_fraction: float = 0.0  # fraction of frame pairs that change at all, below this -> "static"
+
+    @staticmethod
+    def for_profile(profile: str) -> "QualityLimits":
+        """'live' = the original thresholds. 'stylized': large flat colour areas are normal in anime / cel
+        shading (reject only truly single-colour clips) and animation is drawn on 2s / 3s (frames are held),
+        so a clip is static only if almost none of its frame pairs change or the changes are negligible."""
+        if profile == "live":
+            return QualityLimits()
+        if profile == "stylized":
+            return QualityLimits(min_contrast=1.0, min_motion=0.0, min_motion_active=0.3, min_active_fraction=0.15)
+        raise ValueError(f"unknown ingest profile {profile!r}; use 'stylized' or 'live'")
 
 
 def _luma(frames: np.ndarray) -> np.ndarray:
@@ -34,9 +49,12 @@ def quality_stats(clip: np.ndarray) -> dict:
         if prev is not None:
             diffs.append(float(np.abs(y - prev).mean()))
         prev = y
+    active = [d for d in diffs if d > HOLD_EPS]
     return {"brightness": round(float(np.mean(means)), 3), "contrast": round(float(np.mean(stds)), 3),
             "motion": round(float(np.mean(diffs)) if diffs else 0.0, 4),
-            "motion_max": round(float(np.max(diffs)) if diffs else 0.0, 4)}
+            "motion_max": round(float(np.max(diffs)) if diffs else 0.0, 4),
+            "motion_active": round(float(np.mean(active)) if active else 0.0, 4),
+            "active_fraction": round(len(active) / len(diffs), 4) if diffs else 0.0}
 
 
 def quality_reject(stats: dict, lim: QualityLimits) -> str | None:
@@ -46,6 +64,10 @@ def quality_reject(stats: dict, lim: QualityLimits) -> str | None:
         return "too_bright"
     if stats["contrast"] < lim.min_contrast:
         return "flat"
+    if lim.min_motion_active > 0 or lim.min_active_fraction > 0:
+        if (stats.get("motion_active", 0.0) < lim.min_motion_active
+                or stats.get("active_fraction", 0.0) < lim.min_active_fraction):
+            return "static"
     if stats["motion"] < lim.min_motion:
         return "static"
     return None

@@ -62,6 +62,7 @@ type Agent struct {
 	loopCtx      context.Context
 	loopDone     chan struct{}
 	completed    int
+	slot         int // GPU slot (0 = primary worker)
 	failed       int
 }
 

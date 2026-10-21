@@ -55,6 +55,8 @@ Usage:
   nivra model import         --project NAME --bundle DIR [--name NAME] [--activate]
   nivra generate             --url URL --user NAME --prompt TEXT [--out clip.mp4]   (runs on a connected worker)
   nivra generate             --bundle DIR --prompt TEXT [--out clip.mp4]            (runs on this computer)
+  nivra dataset push         DIR --url URL [--kind raw|latents] [--name N] [--redistribution owner_devices|any]   Upload + register training data (resumable)
+  nivra caption              PATH [--style S] [--subtitles M] [--frames N] [--overwrite]   Caption videos (.txt + .subtitles.txt); --install for deps
   nivra migrate status|apply                      Inspect or apply database migrations
   nivra worker run           [--config FILE] [--open]   Start the worker and its local website
   nivra app                  [--no-window]  (Nivra App: generate + this computer as a worker)
@@ -94,6 +96,10 @@ func main() {
 		err = cmdJob(ctx, args)
 	case "model":
 		err = cmdModel(ctx, args)
+	case "caption":
+		err = cmdCaption(ctx, args)
+	case "dataset":
+		err = cmdDataset(ctx, args)
 	case "generate":
 		err = cmdGenerate(ctx, args)
 	case "migrate":
@@ -469,28 +475,41 @@ func cmdWorker(ctx context.Context, args []string) error {
 		return err
 	}
 	defer lk.Release()
-	a, err := agent.New(ctx, cfg)
+	slots, err := agent.NewSlots(ctx, cfg)
 	if err != nil {
 		return err
 	}
+	a := slots[0]
+	srv := &localui.Server{A: a, UI: webui.FS(), Slots: slots[1:]}
 	switch verb {
 	case "enroll":
 		if *code == "" {
 			return errors.New("--code is required")
 		}
-		if err := a.Connect(ctx, *url, *code, *name, ""); err != nil {
+		if !a.Status().Enrolled {
+			if err := a.Connect(ctx, *url, *code, *name, ""); err != nil {
+				return err
+			}
+		}
+		if err := srv.ConnectSlots(ctx, *url, *code, *name); err != nil {
 			return err
 		}
-		st := a.Status()
-		a.Stop()
-		fmt.Printf("enrolled as %q in project %q (device %s)\n", st.DeviceName, st.ProjectName, st.DeviceID)
+		for _, sl := range slots {
+			st := sl.Status()
+			sl.Stop()
+			fmt.Printf("enrolled as %q in project %q (device %s)\n", st.DeviceName, st.ProjectName, st.DeviceID)
+		}
 		return nil
 	case "run":
 	default:
 		return errors.New("usage: nivra worker run|enroll")
 	}
-	a.AutoStart()
-	srv := &localui.Server{A: a, UI: webui.FS()}
+	for _, sl := range slots {
+		sl.AutoStart()
+	}
+	if len(slots) > 1 {
+		fmt.Printf("%d GPUs: running one worker slot per GPU\n", len(slots))
+	}
 	err = srv.ListenAndServe(ctx, cfg.UIListenAddr, func(addr net.Addr) {
 		u := "http://" + addr.String() + "/"
 		fmt.Printf("Nivra Worker website: %s\n", u)
@@ -499,7 +518,9 @@ func cmdWorker(ctx context.Context, args []string) error {
 		}
 	})
 	fmt.Println("stopping worker (current task will be returned to the queue)...")
-	a.Shutdown()
+	for _, sl := range slots {
+		sl.Shutdown()
+	}
 	fmt.Println("worker stopped")
 	return err
 }

@@ -160,6 +160,46 @@ export interface RunConfig {
   }
   req_ram_mb: number
   lease_seconds: number
+  // HD runs (family 'hd'); absent for small-model runs.
+  family?: 'small' | 'hd'
+  target?: 'dit' | 'vae'
+  hd_config?: string
+  dataset_id?: string
+  stage?: HDStage
+  init_version_id?: string
+  shards_per_job?: number
+  eval_gate?: 'pi' | 'worker' | 'off'
+  req_vram_mb?: number
+}
+
+export interface HDStage {
+  h: number
+  w: number
+  frames: number
+  fps: number
+}
+
+export interface DatasetInfo {
+  id: string
+  name: string
+  kind: 'raw' | 'latents'
+  parent_id: string | null
+  fingerprint: string
+  encoder: { vae_version_id?: string; text_encoder_id?: string; stage?: HDStage }
+  redistribution: 'owner_devices' | 'any'
+  status: 'encoding' | 'ready' | 'failed'
+  detail: string
+  clip_count: number
+  created_at: string
+}
+
+export interface DatasetView {
+  dataset: DatasetInfo
+  train_shards: number
+  val_shards: number
+  bytes: number
+  encode_done?: number
+  encode_total?: number
 }
 
 export interface Run {
@@ -211,6 +251,7 @@ export interface Model {
   created_at: string
   parameter_count: number
   active: boolean
+  family?: string
 }
 
 export interface Artifact {

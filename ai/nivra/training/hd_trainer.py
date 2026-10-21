@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -23,8 +24,11 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from ..compression.hc_vae import HCVAE, hcvae_loss, load_hcvae, save_hcvae
+from ..data.shards import style_counts
+from ..data.styles import UNSPECIFIED, apply_style
 from ..models.dit import NivraDiT, rf_loss, resolution_shift, sample_t
-from ..models.hd_config import HD_ARCH_VERSION, build_dit, build_hcvae, hd_config_hash, load_hd_config
+from ..models.hd_config import (HD_ARCH_VERSION, build_dit, build_hcvae, hd_config_hash, load_hd_config,
+                                vae_edge_weight)
 from .checkpoint import (apply_retention, capture_rng, load_checkpoint, module_tensors, newest_valid,
                          optimizer_from_flat, optimizer_to_flat, restore_rng, save_checkpoint)
 
@@ -192,6 +196,34 @@ def fit_latent(z: torch.Tensor, t: int, h: int, w: int) -> torch.Tensor:
     return z[:, :t, top:top + h, left:left + w]
 
 
+# ===================================================================== style captions
+def style_dropped(seed: int, epoch: int, clip_id: str, p: float) -> bool:
+    """Deterministic style-tag dropout for one sample: a pure function of (seed, epoch, clip id), so it needs no
+    RNG state in checkpoints (exact resume) and does not disturb the trainer's timestep / noise stream."""
+    if p <= 0.0:
+        return False
+    if p >= 1.0:
+        return True
+    h = hashlib.sha256(f"style-dropout/{seed}/{epoch}/{clip_id}".encode()).digest()
+    return int.from_bytes(h[:8], "little") / 2 ** 64 < p
+
+
+def training_caption(row: dict, style_dropout: float = 0.0, seed: int = 0, epoch: int = 0) -> str:
+    """Caption text the DiT is trained on: ``apply_style(caption, row style)`` when the clip's style is known,
+    except for a `style_dropout` fraction of samples that keep the bare caption (so the model also works
+    without a style tag). Unknown / 'unspecified' styles never get a tag."""
+    cap = row.get("caption", "")
+    style = row.get("style")
+    if not style or style == UNSPECIFIED:
+        return cap
+    if style_dropped(seed, epoch, str(row.get("id", row.get("index", ""))), style_dropout):
+        return cap
+    try:
+        return apply_style(cap, style)
+    except ValueError:               # a style tag this version does not know: train on the plain caption
+        return cap
+
+
 # ===================================================================== trainer
 def _stage_at(stages: list, step: int) -> tuple:
     acc = 0
@@ -217,6 +249,11 @@ def train_hd(cfg, data_root, run_dir, target: str = "dit", text_encoder=None, va
     use_amp = dev.type == "cuda" and bool(tc.get("fp16", True))
     run_dir = Path(run_dir)
     data = ClipShards(data_root, "train")
+    style_dropout = float(tc.get("style_dropout", 0.0))
+    edge_weight = vae_edge_weight(cfg)
+    styles_seen = style_counts(data.rows)
+    log(f"[{target}] clips {len(data)} styles {json.dumps(styles_seen)} style_dropout {style_dropout} "
+        f"edge_weight {edge_weight}")
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -285,7 +322,7 @@ def train_hd(cfg, data_root, run_dir, target: str = "dit", text_encoder=None, va
                 x = fit_latent(x, 1 + (int(stage["frames"]) - 1) // tf, int(stage["height"]) // sf,
                                int(stage["width"]) // sf)
             xs.append(x)
-            caps.append(row.get("caption", ""))
+            caps.append(training_caption(row, style_dropout, seed, epoch))
         return kind, torch.stack(xs).to(dev), caps
 
     def save(protected=False):
@@ -319,7 +356,7 @@ def train_hd(cfg, data_root, run_dir, target: str = "dit", text_encoder=None, va
                 if target == "vae":
                     recon, m, lv = net(x, generator=None)
                     out = hcvae_loss(x, recon, m, lv, float(tc.get("vae_kl_weight", 1e-6)),
-                                     float(tc.get("vae_perc_weight", 0.5)), float(tc.get("vae_tdiff_weight", 0.5)))
+                                     float(tc.get("vae_perc_weight", 0.5)), float(tc.get("vae_tdiff_weight", 0.5)), edge_weight)
                     loss = out["loss"]
                     logs = {k: float(v.detach()) for k, v in out.items()}
                 else:
@@ -359,7 +396,7 @@ def train_hd(cfg, data_root, run_dir, target: str = "dit", text_encoder=None, va
     if status == "stopped":
         last_ckpt = save()
     result = {"status": status, "step": step, "history": history, "ckpt": str(last_ckpt) if last_ckpt else None,
-              "params": sum(p.numel() for p in net.parameters())}
+              "params": sum(p.numel() for p in net.parameters()), "styles": styles_seen}
     if target == "vae" and status == "done":
         # calibrate the latent scale on a few training clips and export the VAE (safetensors + JSON)
         net.eval()

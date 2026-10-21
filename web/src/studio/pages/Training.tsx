@@ -7,6 +7,7 @@ import { api, pbase } from '../api'
 import { Facts, Json, roundPoints } from '../components'
 import { useSession } from '../session'
 import { useLive, useRev } from '../store'
+import { StartHDTraining } from './HDTraining'
 import type { Artifact, Checkpoint, MetricPoint, Run, RunConfig, TrainingUpdate } from '../types'
 
 export const ACTIVE_STATES = ['created', 'initializing', 'running', 'paused', 'stopping']
@@ -28,6 +29,7 @@ function RunList() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [store, rev])
   const [open, setOpen] = useState(false)
+  const [hdOpen, setHdOpen] = useState(false)
 
   return (
     <div className="stack">
@@ -36,7 +38,11 @@ function RunList() {
         <button className="btn primary" disabled={!can('operator')} title={can('operator') ? '' : 'Operators only'} onClick={() => setOpen((o) => !o)}>
           {open ? 'Hide form' : 'New training run'}
         </button>
+        <button className="btn" disabled={!can('operator')} title={can('operator') ? '' : 'Operators only'} onClick={() => setHdOpen((o) => !o)}>
+          {hdOpen ? 'Hide HD form' : 'Start HD training'}
+        </button>
       </div>
+      {hdOpen && <StartHDTraining onCreated={(id) => { setHdOpen(false); navigate('/training/' + id) }} />}
       {(open || (store.loaded && runs.length === 0 && can('operator'))) && <CreateRun onCreated={(id) => { setOpen(false); navigate('/training/' + id) }} />}
       {!store.loaded ? <Spinner /> : runs.length === 0 ? (
         <Empty title="No training runs yet">

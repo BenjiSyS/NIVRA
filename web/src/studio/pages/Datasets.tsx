@@ -5,6 +5,7 @@ import { api, pbase } from '../api'
 import { Json } from '../components'
 import { useSession } from '../session'
 import { useLive, useRev } from '../store'
+import { DatasetRegistry } from './HDTraining'
 import type { Job } from '../types'
 
 interface ShardParams {
@@ -51,7 +52,9 @@ export default function Datasets() {
   const clips = jobs * count
   return (
     <div className="stack">
-      <div className="page-head"><h1>Datasets</h1><span className="dim">Generate synthetic training shards on workers</span></div>
+      <div className="page-head"><h1>Datasets</h1><span className="dim">Real-video datasets and synthetic training shards</span></div>
+      <DatasetRegistry />
+      <h2>Synthetic shards</h2>
       <form className="card stack" onSubmit={(e) => { e.preventDefault(); void submit() }}>
         <div className="form-grid">
           <Field label="Seed">{(id) => <input id={id} className="input" type="number" value={seed} onChange={(e) => setSeed(+e.target.value || 0)} />}</Field>

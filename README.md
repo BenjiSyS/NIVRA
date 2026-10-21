@@ -254,6 +254,13 @@ Current training data is procedurally generated (legal, original): 1–3 coloure
 scene specifications and English/Swedish captions, deterministic per (generator version, seed, index).
 Workers can generate verified shards (`ai.dataset_shard`), which the controller re-computes.
 
+### Captioning downloaded videos
+
+`nivra caption --install` once, then `nivra caption D:ideos --limit 100` writes `<name>.txt` (what is visible, with a
+style tag such as "Anime style.") and, when there is speech or an embedded subtitle track, `<name>.subtitles.txt` next to
+each video. Existing captions are never overwritten without `--overwrite`; run the same command again to continue with the
+next 100. Uses Florence-2 and faster-whisper locally. Details: [docs/training/CAPTIONING.md](docs/training/CAPTIONING.md).
+
 ## 21. Model Architecture
 
 * **Nivra tokenizer**: 3D-conv VAE, ×4 spatial and ×2 temporal compression, continuous latents.

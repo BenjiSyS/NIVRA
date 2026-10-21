@@ -1,8 +1,12 @@
 {
   "name": "nivra_large",
   "arch_version": "nivra-hd/1",
+  "domain": "stylized",
+  "styles": ["anime", "3d animation", "cartoon", "2d animation", "cel-shaded 3d", "pixel art", "claymation",
+             "painterly", "realistic"],
+  "default_style": "anime",
   "vae": {"latent_channels": 128, "channels": [64, 128, 256, 256, 512, 512], "temporal_down": [1, 2, 3],
-          "n_res": 2, "n_res_dec": 2},
+          "n_res": 2, "n_res_dec": 2, "edge_weight": 0.5},
   "model": {"dim": 2304, "depth": 32, "heads": 32, "mlp_ratio": 4.0, "patch": [1, 1, 1], "text_dim": 768,
             "qk_norm": true},
   "inference": {"width": 1280, "height": 720, "seconds": 8, "fps": 30, "steps": 30, "cfg_scale": 5.0,
@@ -16,7 +20,7 @@
       {"name": "720p_8s", "height": 736, "width": 1280, "frames": 241, "steps": 50000}
     ],
     "batch_size": 1, "grad_accum": 8, "lr": 1e-4, "weight_decay": 0.0, "warmup": 1000, "grad_clip": 1.0,
-    "optimizer": "adamw8", "grad_checkpoint": true, "fp16": true, "caption_dropout": 0.1,
+    "optimizer": "adamw8", "grad_checkpoint": true, "fp16": true, "caption_dropout": 0.1, "style_dropout": 0.1,
     "shift_base_tokens": 4096, "vae_lr": 1e-4, "vae_kl_weight": 1e-6, "vae_perc_weight": 0.5,
     "vae_tdiff_weight": 0.5, "save_every": 1000, "keep_last": 3
   }

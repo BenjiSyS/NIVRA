@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -151,6 +152,8 @@ func (s *Service) Register(r *api.Router) {
 		api.WriteJSON(w, 200, map[string]any{"updates": out})
 	})
 	s.registerModelRoutes(r)
+	s.registerGenerationRoutes(r)
+	s.registerDatasetRoutes(r)
 	r.Admin("GET", "/checkpoints", auth.RoleViewer, s.handleCheckpoints)
 	r.Admin("GET", "/models", auth.RoleViewer, s.handleModels)
 	r.Admin("GET", "/artifacts", auth.RoleViewer, s.handleListArtifacts)
@@ -263,7 +266,8 @@ func (s *Service) handleCheckpoints(w http.ResponseWriter, req *http.Request, a 
 func (s *Service) handleModels(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
 	rows, err := s.d.DB.Query(req.Context(), `SELECT v.id, v.run_id::text, COALESCE(NULLIF(v.display_name, ''), r.name), v.architecture_id, v.version_number, v.parent_version::text,
 			v.weights_artifact::text, v.manifest_artifact::text, v.verification_state, v.created_at, COALESCE(m.parameter_count, 0),
-			p.active_model_version = v.id, COALESCE(v.manifest->>'family', '')
+			p.active_model_version = v.id, COALESCE(v.manifest->>'family', ''),
+			COALESCE(v.manifest->'styles', '[]'::jsonb), COALESCE(v.manifest->>'default_style', '')
 		FROM model_versions v LEFT JOIN training_runs r ON r.id=v.run_id LEFT JOIN model_architectures m ON m.id=v.architecture_id
 		JOIN projects p ON p.id=v.project_id
 		WHERE v.project_id=$1 ORDER BY v.created_at DESC LIMIT 500`, a.ProjectID)
@@ -279,11 +283,13 @@ func (s *Service) handleModels(w http.ResponseWriter, req *http.Request, a *api.
 		var created time.Time
 		var params int64
 		var active *bool
-		var family string
-		if rows.Scan(&id, &run, &rname, &arch, &num, &parent, &wts, &man, &verif, &created, &params, &active, &family) == nil {
+		var family, defStyle string
+		var styles []string
+		if rows.Scan(&id, &run, &rname, &arch, &num, &parent, &wts, &man, &verif, &created, &params, &active, &family, &styles, &defStyle) == nil {
 			out = append(out, map[string]any{"id": id, "run_id": run, "run_name": rname, "architecture": arch, "version_number": num,
 				"parent_version": parent, "weights_artifact": wts, "manifest_artifact": man, "verification_state": verif,
-				"created_at": created, "parameter_count": params, "active": active != nil && *active, "family": family})
+				"created_at": created, "parameter_count": params, "active": active != nil && *active, "family": family,
+				"styles": styles, "default_style": defStyle})
 		}
 	}
 	rows.Close()
@@ -366,6 +372,16 @@ func (s *Service) versionInputs(ctx context.Context, projectID, versionID string
 	return []protocol.ArtifactRef{{ID: *wts, Role: "weights"}, {ID: *man, Role: "manifest"}, {ID: *vae, Role: "vae_weights"}}, versionID, nil
 }
 
+// hdFrameRAMMB is the extra host RAM for decoding frames of w x h.
+func hdFrameRAMMB(w, h int) int {
+	return int(5400 * float64(w*h) / (2560 * 1440))
+}
+
+// maxVideoSeconds is the longest video one request may ask for (3 hours).
+const maxVideoSeconds = 3 * 3600
+
+var styleRe = regexp.MustCompile(`^[A-Za-z0-9 -]{1,40}$`)
+
 // modelReq are scheduling requirements derived from a model version's manifest.
 type modelReq struct {
 	HD     bool
@@ -421,18 +437,26 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 		Height  int     `json:"height"`
 		Seconds float64 `json:"seconds"`
 		Sampler string  `json:"sampler"`
+		// Style tag for stylized HD models ("anime", "3d animation", ... or
+		// "none"); validated against the model's list by the worker.
+		Style string `json:"style"`
 	}
 	if err := api.DecodeJSON(w, req, 8192, &body); err != nil {
 		api.WriteErr(w, 400, protocol.ErrBadRequest, "malformed request")
 		return
 	}
-	if body.Prompt == "" || len(body.Prompt) > 200 {
-		api.WriteErr(w, 400, protocol.ErrValidation, "prompt must be 1-200 characters")
-		return
-	}
 	inputs, mv, err := s.versionInputs(req.Context(), a.ProjectID, body.ModelVersion)
 	if err != nil {
 		s.writeErr(w, req, r, err)
+		return
+	}
+	req2 := s.modelRequirements(req.Context(), mv)
+	maxPrompt := 200
+	if req2.HD {
+		maxPrompt = 1000 // HD text encoders take long, detailed prompts
+	}
+	if body.Prompt == "" || len(body.Prompt) > maxPrompt {
+		api.WriteErr(w, 400, protocol.ErrValidation, "prompt must be 1-"+strconv.Itoa(maxPrompt)+" characters")
 		return
 	}
 	params := map[string]any{"prompt": body.Prompt, "seed": body.Seed, "name": "nivra-" + strconv.Itoa(body.Seed)}
@@ -445,11 +469,18 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 	if body.FPS > 0 {
 		params["fps"] = body.FPS
 	}
-	req2 := s.modelRequirements(req.Context(), mv)
 	if req2.HD {
+		// Decoding big frames needs RAM beyond the weights: measured ~5.3 GB extra at
+		// 2560x1440 (VAE decode), scaling with the pixel count.
+		fw, fh := body.Width, body.Height
+		if fw == 0 || fh == 0 {
+			fw, fh = 1280, 720
+		}
+		req2.RAMMB += hdFrameRAMMB(fw, fh)
 		// HD bundles: native resolution/duration, no nearest-neighbour upscale.
-		if body.Width < 0 || body.Width > 1920 || body.Height < 0 || body.Height > 1088 || body.Seconds < 0 || body.Seconds > 30 {
-			api.WriteErr(w, 400, protocol.ErrValidation, "width <= 1920, height <= 1088, seconds <= 30")
+		if body.Width < 0 || body.Width > 2560 || body.Height < 0 || body.Height > 1440 || body.Seconds < 0 || body.Seconds > maxVideoSeconds ||
+			body.FPS < 0 || body.FPS > 60 {
+			api.WriteErr(w, 400, protocol.ErrValidation, "width <= 2560, height <= 1440, fps <= 60, seconds <= 10800 (3 hours)")
 			return
 		}
 		if body.Width > 0 {
@@ -464,11 +495,45 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 		if body.Sampler == "euler" || body.Sampler == "ab2" {
 			params["sampler"] = body.Sampler
 		}
+		if body.Style != "" {
+			if !styleRe.MatchString(body.Style) {
+				api.WriteErr(w, 400, protocol.ErrValidation, "style must be 1-40 letters, digits, spaces or hyphens")
+				return
+			}
+			params["style"] = body.Style
+		}
 	} else if body.Upscale > 0 {
 		params["upscale"] = body.Upscale
 	}
-	pb, _ := json.Marshal(params)
 	uid := a.Session.User.ID
+	if req2.HD {
+		// Longer than one model clip: draft -> parallel segments -> stitch.
+		segSeconds, defFPS := s.hdDefaults(req.Context(), mv)
+		if body.Seconds > segSeconds {
+			fps := body.FPS
+			if fps <= 0 {
+				fps = defFPS
+			}
+			sampler, _ := params["sampler"].(string)
+			style, _ := params["style"].(string)
+			gp := genParams{Prompt: body.Prompt, Seed: body.Seed, Style: style, Sampler: sampler, Steps: body.Steps, CFGScale: body.CFGScale,
+				Width: body.Width, Height: body.Height, FPS: fps, Seconds: body.Seconds, SegFrame: segmentFrames(segSeconds, fps),
+				Frames: int(math.Round(body.Seconds*float64(fps))) + 1, Inputs: []string{inputs[0].ID, inputs[1].ID, inputs[2].ID},
+				RAMMB: req2.RAMMB, VRAMMB: req2.VRAMMB}
+			if gp.Width == 0 || gp.Height == 0 {
+				gp.Width, gp.Height = 1280, 720
+			}
+			gid, draft, err := s.createGeneration(req.Context(), a.ProjectID, mv, &uid, gp)
+			if err != nil {
+				api.WriteErr(w, 400, protocol.ErrValidation, err.Error())
+				return
+			}
+			api.WriteJSON(w, 201, map[string]any{"generation_id": gid, "job_id": draft, "model_version": mv,
+				"segments": len(segmentPlan(gp.Frames, gp.SegFrame))})
+			return
+		}
+	}
+	pb, _ := json.Marshal(params)
 	id, err := s.sched.Create(req.Context(), nil, scheduler.NewJob{ProjectID: a.ProjectID, JobType: "ai.generate", Params: pb, Inputs: inputs,
 		ModelVersion: &mv, Priority: 20, ReqRAMMB: req2.RAMMB, ReqVRAMMB: req2.VRAMMB, ReqGPU: req2.VRAMMB > 0,
 		LeaseSeconds: 900, CreatedBy: &uid})

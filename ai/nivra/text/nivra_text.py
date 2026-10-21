@@ -179,7 +179,7 @@ def save_checkpoint(directory, model: NivraTextModel, tokenizer: BPETokenizer, e
     d.mkdir(parents=True, exist_ok=True)
     tokenizer.save(d / "tokenizer.json")
     sd = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
-    save_file(sd, str(d / "model.safetensors"))
+    save_file(sd, str(d / "model.safetensors"), metadata={"nivra_text_config": json.dumps(asdict(model.cfg), sort_keys=True)})
     wsha = hashlib.sha256((d / "model.safetensors").read_bytes()).hexdigest()
     meta = {"ckpt_version": CKPT_VERSION, "id": f"nivra-text-{model.cfg.name}@{tokenizer.sha256[:12]}",
             "model": asdict(model.cfg), "tokenizer_sha256": tokenizer.sha256, "weights_sha256": wsha,

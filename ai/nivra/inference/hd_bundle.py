@@ -33,6 +33,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
+from ..data.styles import normalize_style, validate_style_list
 from ..distributed import version as ver
 from ..models.dit import count_params_meta
 from ..models.hd_config import (HD_ARCH_VERSION, build_dit, build_hcvae, dit_config, hd_config_hash, load_hd_config,
@@ -55,7 +56,8 @@ HD_MANIFEST_FIELDS = (
     "schema", "family", "version_id", "round", "parent_version_id", "architecture_version", "config_name", "config",
     "tokenizer_version", "vocab_hash", "param_count", "vae_param_count", "tensor_shapes", "weights_file",
     "weights_dtype", "weights_sha256", "outer_state_file", "outer_state_sha256", "vae_sha256", "applied_update_ids",
-    "created_unix", "min_vram_mb", "default_resolution", "default_seconds", "default_fps", "text_encoder")
+    "created_unix", "min_vram_mb", "default_resolution", "default_seconds", "default_fps", "text_encoder",
+    "domain", "styles", "default_style")
 
 
 def is_hd_manifest(manifest) -> bool:
@@ -287,7 +289,8 @@ def write_hd_bundle(out_dir, cfg, dit_state: Optional[dict] = None, vae_state: O
         "created_unix": int(time.time()), "min_vram_mb": estimate_min_vram_mb(cfg),
         "default_resolution": [int(inf.get("width", 1280)), int(inf.get("height", 720))],
         "default_seconds": float(inf.get("seconds", 8)), "default_fps": int(inf.get("fps", 30)),
-        "text_encoder": te_entry, "config_hash": hd_config_hash(cfg),
+        "text_encoder": te_entry, "config_hash": hd_config_hash(cfg), "hd_config_sha": hd_config_hash(cfg),
+        "domain": cfg["domain"], "styles": list(cfg["styles"]), "default_style": cfg["default_style"],
     }
     (out / ver.MANIFEST_FILE).write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
     return manifest
@@ -357,10 +360,22 @@ def load_hd_bundle_files(weights, manifest, vae_weights, device: str = "cpu", *,
     if not cuda:
         overrides["offload"] = False             # block offload only makes sense with a GPU
     try:
-        return HDPipeline.from_config(cfg, enc, dit=dit, vae=vae, device=device, model_version_id=m["version_id"],
+        pipe = HDPipeline.from_config(cfg, enc, dit=dit, vae=vae, device=device, model_version_id=m["version_id"],
                                       **overrides)
     except (TypeError, ValueError) as e:
         raise BundleError(str(e)) from e
+    try:
+        if m.get("styles"):
+            validate_style_list(m["styles"], "manifest styles")
+        if m.get("default_style") is not None and normalize_style(m["default_style"]) != m["default_style"]:
+            raise ValueError(f"default_style {m['default_style']!r} is not a canonical style")
+    except ValueError as e:
+        raise BundleError(f"invalid style fields in manifest: {e}") from e
+    # the manifest's own domain / styles / default_style win over the embedded config copy (older bundles have none)
+    pipe.domain = m.get("domain", pipe.domain)
+    pipe.styles = list(m.get("styles", pipe.styles) or [])
+    pipe.default_style = m.get("default_style", pipe.default_style)
+    return pipe
 
 
 def load_hd_bundle(source, device: str = "cpu", **kw) -> HDPipeline:
@@ -392,7 +407,8 @@ def save_hd_result(res, out_dir, name: str, extra_meta: Optional[dict] = None) -
 
 def hd_summary(meta: dict) -> dict:
     keys = ("frames", "fps", "width", "height", "seconds", "seconds_text", "seconds_sampling", "seconds_decode",
-            "peak_rss_mb", "cuda_max_allocated_mb", "model_version_id", "text_encoder", "sampler", "steps")
+            "peak_rss_mb", "cuda_max_allocated_mb", "model_version_id", "text_encoder", "sampler", "steps", "style",
+            "prompt_used")
     s = {k: meta[k] for k in keys if k in meta}
     s["family"] = FAMILY
     return s

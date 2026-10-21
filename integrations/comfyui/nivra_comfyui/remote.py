@@ -138,18 +138,20 @@ class NivraRemoteTextToVideo:
             "steps": ("INT", {"default": 30, "min": 1, "max": 200}),
             "cfg_scale": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             "upscale": ("INT", {"default": 4, "min": 1, "max": 8}),
-            "timeout_minutes": ("INT", {"default": 30, "min": 1, "max": 600}),
+            "timeout_minutes": ("INT", {"default": 60, "min": 1, "max": 100000}),
         }, "optional": {
             "project": ("STRING", {"default": ""}),
             "model_version": ("STRING", {"default": ""}),
-            "width": ("INT", {"default": 0, "min": 0, "max": 1920, "step": 32}),
-            "height": ("INT", {"default": 0, "min": 0, "max": 1088, "step": 32}),
-            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 30.0, "step": 0.5}),
+            "width": ("INT", {"default": 0, "min": 0, "max": 2560, "step": 16}),
+            "height": ("INT", {"default": 0, "min": 0, "max": 1440, "step": 16}),
+            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10800.0, "step": 0.5,
+                                  "tooltip": "Longer than the model's clip (8 s) = built from segments that all connected workers render in parallel."}),
             "sampler": (["default", "ab2", "euler"],),
+            "style": ("STRING", {"default": "", "tooltip": "HD stylized models: anime, 3d animation, cartoon, 2d animation, ... or none. Empty = model default."}),
         }}
 
     def run(self, controller_url, prompt, seed, steps, cfg_scale, upscale, timeout_minutes, project="", model_version="",
-            width=0, height=0, seconds=0.0, sampler="default"):
+            width=0, height=0, seconds=0.0, sampler="default", style=""):
         cl = NivraClient(controller_url, load_token())
         pid = cl.project_id(project)
         body = {"prompt": prompt, "seed": int(seed), "steps": int(steps), "cfg_scale": float(cfg_scale), "upscale": int(upscale)}
@@ -164,7 +166,15 @@ class NivraRemoteTextToVideo:
             body["seconds"] = float(seconds)
         if sampler in ("ab2", "euler"):
             body["sampler"] = sampler
-        job = cl.post(f"/projects/{pid}/generate", body)["job_id"]
+        if style.strip():
+            body["style"] = style.strip()
+        created = cl.post(f"/projects/{pid}/generate", body)
+        job = created["job_id"]
+        gen = created.get("generation_id")
+        if gen:
+            print(f"[Nivra] long video: {created.get('segments')} segments rendered in parallel (generation {gen})")
+            art, job = self._wait_generation(cl, pid, gen, timeout_minutes), gen
+            return self._finish(cl, pid, art, job)
         print(f"[Nivra] queued remote generation {job}")
         deadline = time.time() + timeout_minutes * 60
         last = ""
@@ -190,6 +200,36 @@ class NivraRemoteTextToVideo:
             if time.time() > deadline:
                 raise RuntimeError("timed out waiting for a Nivra worker (are AI workers connected and idle?)")
             time.sleep(2)
+        return self._finish(cl, pid, art, job)
+
+    @staticmethod
+    def _wait_generation(cl, pid, gen, timeout_minutes):
+        deadline = time.time() + timeout_minutes * 60
+        last = ""
+        while True:
+            if _interrupted():
+                try:
+                    cl.post(f"/projects/{pid}/generations/{gen}/cancel")
+                finally:
+                    raise RuntimeError("cancelled; the remote video was cancelled too")
+            g = cl.get(f"/projects/{pid}/generations/{gen}")
+            line = (f"{g['status']} {g['stage']} {round(100 * (g.get('progress') or 0))}% "
+                    f"segments {g.get('segments_done')}/{g.get('segments_total')} on {', '.join(g.get('workers') or [])}")
+            if line != last:
+                print(f"[Nivra] {line}")
+                last = line
+            if g["status"] == "completed":
+                if not g.get("artifact_id"):
+                    raise RuntimeError("the video finished without a file")
+                return g["artifact_id"]
+            if g["status"] in ("failed", "cancelled"):
+                raise RuntimeError(f"remote video {g['status']}: {g.get('failure_reason', '')}")
+            if time.time() > deadline:
+                raise RuntimeError("timed out waiting for the Nivra network (raise timeout_minutes for long videos)")
+            time.sleep(3)
+
+    @staticmethod
+    def _finish(cl, pid, art, job):
         out_dir = Path(tempfile.gettempdir()) / "nivra-remote"
         try:
             import folder_paths  # type: ignore

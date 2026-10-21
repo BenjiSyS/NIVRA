@@ -37,6 +37,7 @@ export default function Generate() {
   const [height, setHeight] = useState(0)
   const [seconds, setSeconds] = useState(0)
   const [sampler, setSampler] = useState('')
+  const [style, setStyle] = useState('')
 
   const models = store.models
   const active = models.find((m) => m.active)
@@ -44,6 +45,7 @@ export default function Generate() {
     if (!model && models.length) setModel((active ?? models[0]).id)
   }, [model, models, active])
 
+  const longs = useAsync(async () => (await api.get<{ videos: LongVideo[] | null }>(`${pbase(pid)}/long-videos`)).videos ?? [], [pid], 5000)
   const gens = useAsync(async () => (await api.get<{ generations: Generation[] | null }>(`${pbase(pid)}/generations`)).generations ?? [], [pid], 6000)
 
   // Overlay live job updates (progress, status) on the fetched list.
@@ -70,10 +72,11 @@ export default function Generate() {
 
   const submit = async () => {
     const r = await run(
-      () => api.post<{ job_id: string }>(`${pbase(pid)}/generate`, { prompt: prompt.trim(), seed, steps, cfg_scale: cfg, fps, upscale, model_version: model || undefined, width: width || undefined, height: height || undefined, seconds: seconds || undefined, sampler: sampler || undefined }),
+      () => api.post<{ job_id: string; generation_id?: string; segments?: number }>(`${pbase(pid)}/generate`, { prompt: prompt.trim(), seed, steps, cfg_scale: cfg, fps, upscale, model_version: model || undefined, width: width || undefined, height: height || undefined, seconds: seconds || undefined, sampler: sampler || undefined, style: style || undefined }),
       'Generation queued',
     )
     if (r) {
+      longs.reload()
       gens.reload()
       void jstore.loadJobs()
     }
@@ -87,8 +90,8 @@ export default function Generate() {
       </div>
 
       <form className="card stack" onSubmit={(e) => { e.preventDefault(); void submit() }}>
-        <Field label="Prompt" hint={`${prompt.length}/200 characters`} wide>
-          {(id) => <textarea id={id} className="input" rows={2} maxLength={200} required value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="a red square moving to the right" />}
+        <Field label="Prompt" hint={`${prompt.length}/1000 characters (small models: 200)`} wide>
+          {(id) => <textarea id={id} className="input" rows={2} maxLength={1000} required value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="a red square moving to the right" />}
         </Field>
         <Field label="Negative prompt" hint="Not supported yet" wide>
           {(id) => <input id={id} className="input" disabled placeholder="Not supported yet" />}
@@ -114,10 +117,11 @@ export default function Generate() {
           <Field label="Guidance (cfg)" hint="0 to 20">{(id) => <input id={id} className="input" type="number" min={0} max={20} step={0.5} value={cfg} onChange={(e) => setCfg(+e.target.value)} />}</Field>
           <Field label="Frames per second" hint="1 to 60">{(id) => <input id={id} className="input" type="number" min={1} max={60} value={fps} onChange={(e) => setFps(+e.target.value || 1)} />}</Field>
           <Field label="Upscale" hint="Small models only: pixel scale 1 to 8">{(id) => <input id={id} className="input" type="number" min={1} max={8} value={upscale} onChange={(e) => setUpscale(+e.target.value || 1)} />}</Field>
-          <Field label="Width (HD)" hint="HD models: 0 = model default (1280)">{(id) => <input id={id} className="input" type="number" min={0} max={1920} step={32} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
-          <Field label="Height (HD)" hint="HD models: 0 = model default (720)">{(id) => <input id={id} className="input" type="number" min={0} max={1088} step={32} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
-          <Field label="Seconds (HD)" hint="HD models: 0 = model default (8)">{(id) => <input id={id} className="input" type="number" min={0} max={30} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
+          <Field label="Width (HD)" hint="HD models: 0 = model default (1280)">{(id) => <input id={id} className="input" type="number" min={0} max={2560} step={16} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
+          <Field label="Height (HD)" hint="HD models: 0 = model default (720)">{(id) => <input id={id} className="input" type="number" min={0} max={1440} step={16} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
+          <Field label="Seconds (HD)" hint="0 = model default (8); longer = segments rendered in parallel by all workers (max 10800)">{(id) => <input id={id} className="input" type="number" min={0} max={10800} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
           <Field label="Sampler (HD)" hint="ab2 needs fewer steps">{(id) => <select id={id} className="input" value={sampler} onChange={(e) => setSampler(e.target.value)}><option value="">default</option><option value="ab2">ab2</option><option value="euler">euler</option></select>}</Field>
+          <Field label="Style (HD)" hint="empty = model default; none = no style tag">{(id) => <select id={id} className="input" value={style} onChange={(e) => setStyle(e.target.value)}><option value="">default</option>{['anime', '3d animation', 'cartoon', '2d animation', 'cel-shaded 3d', 'pixel art', 'claymation', 'painterly', 'realistic', 'none'].map((s) => <option key={s} value={s}>{s}</option>)}</select>}</Field>
         </div>
         <div className="row">
           <button className="btn primary" disabled={!can('operator') || busy || !prompt.trim() || !model}>Generate</button>
@@ -126,6 +130,41 @@ export default function Generate() {
           <span className="dim">A worker with the AI runtime picks the job up from the queue.</span>
         </div>
       </form>
+
+      {(longs.data ?? []).length > 0 && (
+        <>
+          <h2>Long videos</h2>
+          <div className="grid cols-2">
+            {(longs.data ?? []).map((v) => (
+              <div className="card gen-card" key={v.id}>
+                <div className="row">
+                  <Pill state={v.status} />
+                  <span className="faint mono">{shortId(v.id)}</span>
+                  <span className="spacer" />
+                  <span className="dim">{fmtAgo(v.created_at, now)}</span>
+                </div>
+                <div style={{ overflowWrap: 'anywhere' }}><strong>{v.prompt || '(no prompt)'}</strong></div>
+                {v.status === 'running' && (
+                  <div>
+                    <Progress value={v.progress} label="Long video progress" />
+                    <div className="dim" style={{ marginTop: 4 }}>
+                      {v.stage === 'draft' ? 'Drawing the whole video at low resolution' : v.stage === 'refine' ? `Segments ${v.segments_done}/${v.segments_total}` : 'Joining segments'}
+                      {v.workers.length ? ` · on ${v.workers.join(', ')}` : ''} · {Math.round(v.progress * 100)}%
+                    </div>
+                  </div>
+                )}
+                {v.status === 'failed' && <div className="notice err">{v.failure_reason || 'Failed.'}</div>}
+                {v.artifact_id && (
+                  <>
+                    <video className="gen" controls preload="metadata" src={artifactUrl(pid, v.artifact_id)} />
+                    <div className="row"><a className="btn sm" href={artifactUrl(pid, v.artifact_id)} download={`nivra-${shortId(v.id)}.mp4`}>Download</a></div>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <h2>History</h2>
       {gens.error ? <ErrorNote error={gens.error} retry={gens.reload} /> : null}
@@ -192,4 +231,18 @@ function GenCard({ g, pid, now }: { g: Generation; pid: string; now: number }) {
       ) : null}
     </div>
   )
+}
+
+interface LongVideo {
+  id: string
+  prompt: string
+  status: string
+  stage: string
+  progress: number
+  segments_total: number
+  segments_done: number
+  workers: string[]
+  artifact_id: string | null
+  failure_reason: string
+  created_at: string
 }

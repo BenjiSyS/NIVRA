@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
@@ -144,7 +145,9 @@ class CausalConv3d(nn.Module):
                 raise ValueError("streaming chunk length is not aligned to the temporal stride "
                                  "(encoder chunks must be 1+8a frames first, then multiples of 8)")
             keep = self.kt - self.st
-            self.cache = x[:, :, x.shape[2] - keep:].detach() if keep > 0 else x[:, :, :0].detach()
+            # clone: a slice is a view that keeps the whole (cache + chunk) input alive, i.e. up to
+            # (kt-1+chunk)/(kt-1) times the memory the cache needs, for every layer of every tile
+            self.cache = x[:, :, x.shape[2] - keep:].detach().clone() if keep > 0 else x[:, :, :0].detach().clone()
         return self.conv(x)
 
     def get_state(self):
@@ -341,6 +344,35 @@ def _ramp(n: int, ramp: int, left: bool, right: bool, device, dtype) -> torch.Te
     return w
 
 
+def available_memory_bytes(device=None) -> Optional[int]:
+    """Free memory of `device` (CUDA free memory, else available host RAM); None when it cannot be determined."""
+    try:
+        if device is not None and torch.device(device).type == "cuda":
+            return int(torch.cuda.mem_get_info(torch.device(device))[0])
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            ms = MS()
+            ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(min(ms.ullAvailPhys, ms.ullAvailPageFile))
+            return None
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, AttributeError, RuntimeError):
+        return None
+
+
+class StreamStateTooLarge(ValueError):
+    """Tiled streaming would keep more per-tile causal-cache state than fits in memory."""
+
+
 # ===================================================================== the VAE
 class HCVAE(nn.Module):
     def __init__(self, cfg: HCVAEConfig):
@@ -394,14 +426,48 @@ class HCVAE(nn.Module):
         return {"latent_shift": self.cfg.latent_shift, "latent_scale": self.cfg.latent_scale}
 
     # ------------------------------------------------------------ chunked / tiled passes
+    def stream_state_bytes_per_tile(self, which: str, win_h: int, win_w: int, dtype=torch.float32, batch: int = 1) -> int:
+        """Bytes of causal-cache state ONE tile keeps between chunks, for a tile window of win_h x win_w latent
+        cells (`which`: 'decoder' | 'encoder'). Dry run on the meta device: no memory is allocated."""
+        with torch.device("meta"):
+            net = HCDecoder(self.cfg) if which == "decoder" else HCEncoder(self.cfg)
+            if which == "decoder":
+                x = torch.empty(batch, self.cfg.latent_channels, 1, win_h, win_w, dtype=dtype)
+            else:
+                s = self.cfg.spatial_factor
+                x = torch.empty(batch, self.cfg.in_channels, 1, win_h * s, win_w * s, dtype=dtype)
+            net.to(dtype).set_streaming(True)
+            net(x)
+            return sum(c.numel() * c.element_size() for c in net.get_stream_state() if isinstance(c, torch.Tensor))
+
+    def _check_state_budget(self, x: torch.Tensor, n_tiles: int, win: tuple, which: str,
+                           max_state_bytes: Optional[int]) -> None:
+        """Raise StreamStateTooLarge up front instead of letting the allocator die mid-decode (the old failure
+        mode was a native crash, exit 139 / access violation, once the per-tile caches exhausted memory)."""
+        per_tile = self.stream_state_bytes_per_tile(which, win[0], win[1], x.dtype, x.shape[0])
+        need = per_tile * n_tiles
+        budget = max_state_bytes
+        if budget is None:
+            free = available_memory_bytes(x.device)
+            budget = int(free * 0.6) if free else 8 << 30
+        if need > budget:
+            raise StreamStateTooLarge(
+                f"tiled streaming needs ~{need / 2 ** 30:.1f} GiB of per-tile cache state ({n_tiles} tiles x "
+                f"{per_tile / 2 ** 20:.0f} MiB) but only {budget / 2 ** 30:.1f} GiB is allowed; use a larger tile "
+                f"(fewer tiles), a smaller output, or pass max_state_bytes")
+
     def _stream_tiled(self, net: _Streamable, x: torch.Tensor, chunks: list, in_scale: int, out_scale: int,
-                      tile: int, overlap: int, margin: Optional[int]) -> Iterator[torch.Tensor]:
+                      tile: int, overlap: int, margin: Optional[int],
+                      max_state_bytes: Optional[int] = None) -> Iterator[torch.Tensor]:
         """Run `net` causally chunk by chunk (time) and tile by tile (space, in latent-cell units)."""
         B, _, _, H, W = x.shape
         Hg, Wg = H // in_scale, W // in_scale
         m = net.radius if margin is None else margin
         th, tw = tile_ranges(Hg, tile, overlap), tile_ranges(Wg, tile, overlap)
         tiles = [(a, b, c, d) for (a, b) in th for (c, d) in tw]
+        if len(tiles) > 1:
+            win = (max(min(Hg, b + m) - max(0, a - m) for a, b in th), max(min(Wg, d + m) - max(0, c - m) for c, d in tw))
+            self._check_state_budget(x, len(tiles), win, "decoder" if net is self.decoder else "encoder", max_state_bytes)
         states = [None] * len(tiles)
         net.set_streaming(True)
         try:
@@ -432,21 +498,22 @@ class HCVAE(nn.Module):
             net.set_streaming(False)
 
     def decode_stream(self, z: torch.Tensor, t_chunk: int = 2, tile: int = 0, overlap: int = 2,
-                      margin: Optional[int] = None) -> Iterator[torch.Tensor]:
+                      margin: Optional[int] = None, max_state_bytes: Optional[int] = None) -> Iterator[torch.Tensor]:
         """Yield decoded frame chunks [B,3,t,H,W]: first chunk 1 + 8(t_chunk-1) frames, then 8*t_chunk frames.
         tile/overlap/margin are in latent cells (tile=0: no spatial tiling). margin=None uses the decoder's
         receptive radius, which makes tiles exactly equal to an untiled decode."""
         T = z.shape[2]
         t_chunk = max(1, int(t_chunk))
         chunks = [slice(i, min(T, i + t_chunk)) for i in range(0, T, t_chunk)]
-        yield from self._stream_tiled(self.decoder, z, chunks, 1, self.cfg.spatial_factor, tile, overlap, margin)
+        yield from self._stream_tiled(self.decoder, z, chunks, 1, self.cfg.spatial_factor, tile, overlap, margin,
+                                      max_state_bytes)
 
     def decode_tiled(self, z: torch.Tensor, t_chunk: int = 2, tile: int = 0, overlap: int = 2,
-                     margin: Optional[int] = None) -> torch.Tensor:
-        return torch.cat(list(self.decode_stream(z, t_chunk, tile, overlap, margin)), 2)
+                     margin: Optional[int] = None, max_state_bytes: Optional[int] = None) -> torch.Tensor:
+        return torch.cat(list(self.decode_stream(z, t_chunk, tile, overlap, margin, max_state_bytes)), 2)
 
     def encode_tiled(self, x: torch.Tensor, t_chunk: int = 2, tile: int = 0, overlap: int = 2,
-                     margin: Optional[int] = None) -> torch.Tensor:
+                     margin: Optional[int] = None, max_state_bytes: Optional[int] = None) -> torch.Tensor:
         """Chunked causal (and optionally tiled) encode; returns the posterior mean."""
         self._check_input(x)
         T, tf = x.shape[2], self.cfg.temporal_factor
@@ -457,7 +524,8 @@ class HCVAE(nn.Module):
         while i < T:
             chunks.append(slice(i, min(T, i + tf * t_chunk)))
             i += tf * t_chunk
-        outs = list(self._stream_tiled(self.encoder, x, chunks, self.cfg.spatial_factor, 1, tile, overlap, margin))
+        outs = list(self._stream_tiled(self.encoder, x, chunks, self.cfg.spatial_factor, 1, tile, overlap, margin,
+                                       max_state_bytes))
         h = torch.cat(outs, 2)
         return h[:, : self.cfg.latent_channels]
 
@@ -506,8 +574,18 @@ def perceptual_proxy(recon: torch.Tensor, target: torch.Tensor, scales: tuple = 
     return loss
 
 
+def edge_loss(x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
+    """L1 between the spatial finite differences (horizontal and vertical) of x and recon, [B,C,T,H,W].
+    Penalises blurred outlines: crisp line art / cel edges. Zero iff both gradient fields agree."""
+    x, recon = x.float(), recon.float()
+    dx = ((recon[..., :, 1:] - recon[..., :, :-1]) - (x[..., :, 1:] - x[..., :, :-1])).abs().mean()
+    dy = ((recon[..., 1:, :] - recon[..., :-1, :]) - (x[..., 1:, :] - x[..., :-1, :])).abs().mean()
+    return 0.5 * (dx + dy)
+
+
 def hcvae_loss(x: torch.Tensor, recon: torch.Tensor, mean: torch.Tensor, logvar: torch.Tensor,
-               kl_weight: float = 1e-6, perc_weight: float = 0.5, tdiff_weight: float = 0.5) -> dict:
+               kl_weight: float = 1e-6, perc_weight: float = 0.5, tdiff_weight: float = 0.5,
+               edge_weight: float = 0.0) -> dict:
     rec = (recon.float() - x.float()).abs().mean()
     kl = 0.5 * (mean.float().pow(2) + logvar.float().exp() - 1.0 - logvar.float()).mean()
     if x.shape[2] > 1:
@@ -516,7 +594,12 @@ def hcvae_loss(x: torch.Tensor, recon: torch.Tensor, mean: torch.Tensor, logvar:
         td = rec.new_zeros(())
     perc = perceptual_proxy(recon, x)
     total = rec + kl_weight * kl + perc_weight * perc + tdiff_weight * td
-    return {"loss": total, "l1": rec.detach(), "kl": kl.detach(), "perc": perc.detach(), "tdiff": td.detach()}
+    out = {"l1": rec.detach(), "kl": kl.detach(), "perc": perc.detach(), "tdiff": td.detach()}
+    if edge_weight:
+        ed = edge_loss(x, recon)
+        total = total + edge_weight * ed
+        out["edge"] = ed.detach()
+    return {"loss": total, **out}
 
 
 # ===================================================================== save / load (safetensors + JSON)

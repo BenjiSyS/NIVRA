@@ -47,3 +47,11 @@ html, body, #root { height: 100%; }
   .bubble { max-width: 94%; }
 }
 .side-foot .btn[aria-current="true"] { background: var(--surface-3); color: var(--text); }
+
+.eta { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }
+.composer-bar .seg button { min-height: 32px; }
+
+.gen-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.gen-settings label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-dim); }
+.gen-settings select.input { width: auto; }
+.input.bad { border-color: #a5484f; }

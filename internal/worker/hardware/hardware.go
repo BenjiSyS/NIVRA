@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"nivra/internal/shared/procattr"
 	"nivra/internal/shared/protocol"
 	"nivra/internal/shared/sysinfo"
 )
@@ -62,8 +63,10 @@ func GPUs(ctx context.Context) []protocol.GPUInfo {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, smi, "--query-gpu=index,name,memory.total,driver_version,compute_cap",
-		"--format=csv,noheader,nounits").Output()
+	q := exec.CommandContext(ctx, smi, "--query-gpu=index,name,memory.total,driver_version,compute_cap",
+		"--format=csv,noheader,nounits")
+	procattr.HideConsole(q)
+	out, err := q.Output()
 	if err != nil {
 		return []protocol.GPUInfo{}
 	}
@@ -95,8 +98,10 @@ func GPUUtilisation(ctx context.Context, index int) (float64, int64) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, smi, "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits",
-		"-i", strconv.Itoa(index)).Output()
+	q := exec.CommandContext(ctx, smi, "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits",
+		"-i", strconv.Itoa(index))
+	procattr.HideConsole(q)
+	out, err := q.Output()
 	if err != nil {
 		return 0, 0
 	}
@@ -147,6 +152,7 @@ func ProbeAI(ctx context.Context, python, aiDir string) AIProbe {
 		abs, _ := filepath.Abs(aiDir)
 		cmd = exec.CommandContext(ctx, python, "-I", "-c", "import sys; sys.path.insert(0, "+strconv.Quote(abs)+")\n"+probeScript)
 	}
+	procattr.HideConsole(cmd)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {

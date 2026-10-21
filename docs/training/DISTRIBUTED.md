@@ -266,3 +266,12 @@ mismatching encoder is `INPUT_INVALID` (exit 5), as is a weights/VAE sha256 mism
    `updates` = all accepted worker outputs -> new version. Persist
    `outer_state.safetensors` next to the version.
 5. Updates whose `base_version_id` is not the current version are rejected as stale.
+
+## 3. HD runs (family `hd`)
+
+A run whose config has `"family": "hd"` uses the HD path instead of the sequence above: `ai.hd_train` jobs (fp16 deltas, several data
+shards per job, GPU with `req_vram_mb`, trusted devices by default), controller-side validation of the update file (echo binding, exact
+size, bounds, duplicate content hash), `ai.hd_aggregate` on the controller, a held-out gate (`pi`, `worker` or `off`) before a version is
+promoted, and retention of the last 5 round checkpoints plus every 10th. Datasets are uploaded with `nivra dataset push` and encoded to
+latents with `POST /datasets/{id}/encode`; the Studio Datasets and Training pages drive both. The exact job shapes and conventions are in
+`docs/architecture/HD_TRAINING.md` (section "Controller conventions"). The small-model path in this document is unchanged.

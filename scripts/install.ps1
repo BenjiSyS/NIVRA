@@ -115,6 +115,9 @@ function Setup-Python {
     if ($LASTEXITCODE -ne 0) { Warn 'PyTorch installation failed; AI jobs stay disabled until setup is run again.'; return '' }
   }
   & $vpy -m pip install --quiet -r (Join-Path $Root 'ai\requirements.txt') | Out-Host
+  # Captioning tools for `nivra caption` (describing and transcribing training videos).
+  & $vpy -m pip install --quiet -r (Join-Path $Root 'ai\requirements-caption.txt') | Out-Host
+  if ($LASTEXITCODE -ne 0) { Warn 'Caption tools did not install; run "bin\nivra.exe caption --install" later.' }
   $env:PYTHONPATH = Join-Path $Root 'ai'
   & $vpy -c "import nivra.cli, torch; print('    AI executor OK: torch', torch.__version__, 'cuda', torch.cuda.is_available())" | Out-Host
   if ($LASTEXITCODE -ne 0) { Warn 'AI executor self-test failed; run diagnostics.' }

@@ -53,6 +53,8 @@ func (s *Service) RunLoop(ctx context.Context) {
 	defer t.Stop()
 	for {
 		s.tick(ctx)
+		s.tickGenerations(ctx)
+		s.tickDatasets(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -98,6 +100,9 @@ func (s *Service) setStatus(ctx context.Context, runID, status, detail string) {
 }
 
 func (s *Service) step(ctx context.Context, run *Run) error {
+	if run.Config.Family == FamilyHD {
+		return s.stepHD(ctx, run)
+	}
 	switch run.Status {
 	case "created", "initializing":
 		return s.initRun(ctx, run)

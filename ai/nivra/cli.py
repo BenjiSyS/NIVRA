@@ -58,7 +58,13 @@ def _cmd_generate_hd(a, dev):
         return 5
     out = Path(a.out)
     kw = {k: v for k, v in (("steps", a.steps), ("cfg_scale", a.cfg), ("fps", a.fps), ("width", a.width),
-                            ("height", a.height), ("seconds", a.seconds), ("sampler", a.sampler)) if v is not None}
+                            ("height", a.height), ("seconds", a.seconds), ("sampler", a.sampler), ("style", a.style))
+          if v is not None}
+    try:
+        pipe.resolve_style(a.style)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     res = pipe.generate(a.prompt, seed=a.seed, out_path=out / f"{a.name}.mp4", **kw)
     meta = save_hd_result(res, out, a.name)
     s = hd_summary(meta)
@@ -75,7 +81,7 @@ def _cmd_generate(a):
     from .inference.hd_bundle import read_manifest_if_hd
     if read_manifest_if_hd(Path(a.bundle) / "model_version.json") is not None:
         return _cmd_generate_hd(a, dev)
-    hd_only = [f"--{k}" for k in ("width", "height", "seconds", "sampler", "offload") if getattr(a, k) is not None]
+    hd_only = [f"--{k}" for k in ("width", "height", "seconds", "sampler", "offload", "style") if getattr(a, k) is not None]
     if a.fp16 is not None:
         hd_only.append("--fp16/--no-fp16")
     if hd_only:
@@ -194,7 +200,8 @@ def _cmd_text_pretrain(a):
 def _cmd_data_ingest(a):
     from .data.ingest import IngestError, IngestOptions, ingest_folder
     opts = IngestOptions(bucket=a.bucket, fps=a.fps, max_clips=a.max_clips,
-                         scene_threshold=None if a.no_scenes else a.scene_threshold, shard_bytes=a.shard_mb * 1024 * 1024,
+                         scene_threshold=None if a.no_scenes else ("auto" if a.scene_threshold is None else a.scene_threshold),
+                         profile=a.profile, default_style=a.default_style, shard_bytes=a.shard_mb * 1024 * 1024,
                          val_fraction=a.val_fraction, dedup_bits=a.dedup_bits, allow_upscale=a.allow_upscale,
                          default_lang=a.default_lang, overwrite=a.overwrite)
     try:
@@ -206,11 +213,55 @@ def _cmd_data_ingest(a):
     return 0
 
 
+def _cmd_caption(a):
+    from .captioning import runner
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+    opts = runner.Options(style=a.style, subtitles=a.subtitles, frames=a.frames, device=a.device,
+                          overwrite=a.overwrite, model=a.model, limit=a.limit)
+    return runner.run(Path(a.path), opts)
+
+
 def _cmd_data_inspect(a):
     from .data.ingest import inspect_dataset
     rep = inspect_dataset(a.dataset)
     print(json.dumps(rep, indent=1, ensure_ascii=False))
     return 0 if rep["ok"] else 1
+
+
+def _cmd_train_pipeline(a):
+    from .config import setup_runtime
+    from .training.hd_pipeline import Pipeline, PipelineError, PipelineOptions
+    setup_runtime()
+    keys = ("config", "videos", "dataset", "bucket", "profile", "default_style", "fps", "max_clips", "val_fraction", "vocab_size",
+            "text_steps", "vae_steps", "dit_steps", "seed", "device", "style_dropout", "name", "install_dir", "bundle_out",
+            "from_stage", "to_stage", "force", "save_every")
+    opts = PipelineOptions(out=a.out, **{k: getattr(a, k) for k in keys if getattr(a, k, None) is not None})
+    try:
+        pipe = Pipeline(opts)
+        if a.plan_only:
+            print(pipe.format_plan())
+            return 0
+        res = pipe.run()
+    except PipelineError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if "bundle" in res:
+        print(json.dumps({"bundle": res["bundle"]["dir"], "version_id": res["bundle"]["version_id"],
+                          "param_count": res["bundle"]["param_count"]}))
+    return 0
+
+
+def _cmd_export_hd_bundle(a):
+    a.videos, a.dataset = None, a.dataset
+    a.from_stage = a.to_stage = "bundle"
+    for k in ("bucket", "profile", "default_style", "fps", "max_clips", "val_fraction", "vocab_size", "text_steps", "vae_steps",
+              "dit_steps", "seed", "device", "style_dropout", "save_every", "force", "plan_only"):
+        setattr(a, k, None if k not in ("force", "plan_only") else False)
+    return _cmd_train_pipeline(a)
 
 
 def build_parser():
@@ -254,6 +305,7 @@ def build_parser():
     s.add_argument("--sampler", choices=["euler", "ab2"], help="HD bundles only")
     s.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=None, help="HD bundles only (CUDA)")
     s.add_argument("--offload", choices=["none", "blocks"], help="HD bundles only (CUDA)")
+    s.add_argument("--style", help="style tag, alias or 'none' (HD bundles only; default: the bundle's default_style)")
     s.set_defaults(fn=_cmd_generate)
 
     s = sub.add_parser("continue", help="continue a generated video from its saved generation state")
@@ -330,7 +382,10 @@ def build_parser():
     s.add_argument("--bucket", choices=["256p2s", "480p4s", "720p8s"], default="256p2s")
     s.add_argument("--fps", type=float, help="default: 8 for 256p2s, 30 otherwise")
     s.add_argument("--max-clips", type=int)
-    s.add_argument("--scene-threshold", type=float, default=0.3)
+    s.add_argument("--scene-threshold", type=float, default=None, help="default: by profile (stylized 0.4, live 0.3)")
+    s.add_argument("--profile", choices=["stylized", "live"], default="stylized",
+                   help="stylized (anime/3D/cartoon: flat colours and held frames are fine) or live action")
+    s.add_argument("--default-style", help="style for clips with no style label (tag or alias)")
     s.add_argument("--no-scenes", action="store_true", help="skip scene detection; fixed-length windows only")
     s.add_argument("--shard-mb", type=int, default=128)
     s.add_argument("--val-fraction", type=float, default=0.05)
@@ -343,6 +398,57 @@ def build_parser():
     s = sub.add_parser("data-inspect", help="summarise and verify an ingested dataset")
     s.add_argument("dataset")
     s.set_defaults(fn=_cmd_data_inspect)
+
+    from .data.ingest import BUCKETS
+    s = sub.add_parser("train-pipeline", help="captioned videos -> trained HD bundle on this machine (resumable, staged)")
+    s.add_argument("--config", default="nivra_base", help="HD config name or path (default nivra_base)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--videos", help="folder of videos with <name>.txt captions (from `nivra caption`) and PROVENANCE.json")
+    g.add_argument("--dataset", help="already ingested dataset folder (from data-ingest)")
+    s.add_argument("--out", required=True, help="run directory (stage markers, checkpoints, latents)")
+    s.add_argument("--bucket", choices=sorted(BUCKETS), default="256p2s")
+    s.add_argument("--profile", choices=["stylized", "live"], default="stylized")
+    s.add_argument("--default-style", help="style tag for clips with no style (default: the config's default_style)")
+    s.add_argument("--fps", type=float)
+    s.add_argument("--max-clips", type=int)
+    s.add_argument("--val-fraction", type=float)
+    s.add_argument("--vocab-size", type=int, help="BPE vocabulary size (default 4000)")
+    s.add_argument("--text-steps", type=int, help="text-encoder MLM steps (default 1500)")
+    s.add_argument("--vae-steps", type=int, help="HC-VAE steps (default 4000)")
+    s.add_argument("--dit-steps", type=int, help="DiT steps (default 8000)")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--device", default="auto", help="auto | cpu | cuda")
+    s.add_argument("--style-dropout", type=float, help="fraction of captions left without the style tag")
+    s.add_argument("--name", help="bundle folder name (default <config>-<hash>)")
+    s.add_argument("--install-dir", help="Nivra install folder: the bundle goes to <install-dir>/models/<name> (the app finds it)")
+    s.add_argument("--bundle-out", help="write the bundle to exactly this folder instead")
+    s.add_argument("--from-stage", default="ingest", choices=["ingest", "tokenizer", "text", "vae", "latents", "dit", "bundle"])
+    s.add_argument("--to-stage", default="bundle", choices=["ingest", "tokenizer", "text", "vae", "latents", "dit", "bundle"])
+    s.add_argument("--save-every", type=int, help="checkpoint every N steps in the vae/dit stages")
+    s.add_argument("--force", action="store_true", help="re-run the selected stages even if their markers match")
+    s.add_argument("--plan-only", action="store_true", help="print the plan with time estimates and exit")
+    s.set_defaults(fn=_cmd_train_pipeline)
+
+    s = sub.add_parser("export-hd-bundle", help="(re)write the bundle of a finished train-pipeline run")
+    s.add_argument("--run", dest="out", required=True)
+    s.add_argument("--dataset", default=None, help=argparse.SUPPRESS)
+    s.add_argument("--config", default="nivra_base")
+    s.add_argument("--name")
+    s.add_argument("--install-dir")
+    s.add_argument("--bundle-out")
+    s.set_defaults(fn=_cmd_export_hd_bundle, videos=None)
+
+    from .captioning import STYLE_CHOICES, SUBTITLE_MODES
+    s = sub.add_parser("caption", help="write <name>.txt (description) and <name>.subtitles.txt next to each video")
+    s.add_argument("path", help="a video file or a folder (searched recursively for .mp4 .mov .mkv .webm)")
+    s.add_argument("--style", default="auto", choices=STYLE_CHOICES)
+    s.add_argument("--subtitles", default="auto", choices=SUBTITLE_MODES)
+    s.add_argument("--frames", type=int, default=6)
+    s.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    s.add_argument("--overwrite", action="store_true", help="replace existing .txt captions")
+    s.add_argument("--limit", type=int, default=None, help="caption at most N videos that still need captions (re-run to continue)")
+    s.add_argument("--model", default=None, help="Florence-2 model id or local directory (default: florence-community/Florence-2-large)")
+    s.set_defaults(fn=_cmd_caption)
     return p
 
 

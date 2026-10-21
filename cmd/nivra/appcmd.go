@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"nivra/internal/shared/config"
@@ -69,16 +70,43 @@ func cmdApp(ctx context.Context, args []string) error {
 	defer lk.Release()
 	ctx, quit := context.WithCancel(ctx)
 	defer quit()
-	a, err := agent.New(ctx, cfg)
+	slots, err := agent.NewSlots(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	a.AutoStart()
+	a := slots[0]
+	for _, sl := range slots {
+		sl.AutoStart()
+	}
 	app := &localui.App{Dir: cfg.DataDir, AllowInsecure: cfg.AllowInsecureHTTP, Quit: quit,
-		DefaultController: func() string { return a.Status().ControllerURL }}
+		DefaultController: func() string { return a.Status().ControllerURL },
+		ModelDirs:         []string{filepath.Join(".", "models"), filepath.Join(cfg.DataDir, "models")},
+		ScanRoots:         localui.DefaultScanRoots(),
+		Runtime: func() localui.LocalRuntime {
+			// Same hardware choice as worker jobs: the selected CUDA GPU, else CPU.
+			st := a.Status()
+			rt := localui.LocalRuntime{Python: cfg.PythonPath, AIDir: cfg.AIPackageDir, Device: "cpu", Threads: st.Settings.CPUThreads}
+			if gi := st.Settings.GPUIndex; gi >= 0 && st.Hardware.AI.CUDA {
+				rt.Device = "cuda:" + strconv.Itoa(gi)
+			}
+			if rt.AIDir == "" {
+				rt.AIDir = "ai"
+			}
+			// Long videos render one segment per GPU worker slot at once.
+			for _, sl := range slots {
+				ss := sl.Status()
+				if gi := ss.Settings.GPUIndex; gi >= 0 && ss.Hardware.AI.CUDA {
+					rt.Devices = append(rt.Devices, "cuda:"+strconv.Itoa(gi))
+				}
+			}
+			if len(rt.Devices) == 0 {
+				rt.Devices = []string{rt.Device}
+			}
+			return rt
+		}}
 	app.Init()
 	go app.Run(ctx)
-	srv := &localui.Server{A: a, UI: webui.FS(), App: app}
+	srv := &localui.Server{A: a, UI: webui.FS(), App: app, Slots: slots[1:]}
 	err = srv.ListenAndServe(ctx, cfg.UIListenAddr, func(addr net.Addr) {
 		u := "http://" + addr.String() + "/app"
 		fmt.Printf("Nivra App: %s\n", u)
@@ -99,7 +127,9 @@ func cmdApp(ctx context.Context, args []string) error {
 		}()
 	})
 	fmt.Println("stopping Nivra (a running task is returned to the queue)...")
-	a.Shutdown()
+	for _, sl := range slots {
+		sl.Shutdown()
+	}
 	return err
 }
 

@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { errMsg, fmtAgo } from '../shared/format'
 import { app, isFinished, type AppConfig, type AppModel, type GenerateRequest, type HistoryItem, type JobStatus } from './api'
 import { Composer } from './Composer'
+import { ModelsPanel } from './ModelPanels'
 import { SettingsPanel, WorkerPanel } from './Panels'
+import { fmtDuration, fmtLength, loadPrefs, savePrefs, type Prefs } from './prefs'
 
-type View = 'chat' | 'settings' | 'worker'
+type View = 'chat' | 'settings' | 'worker' | 'models'
 
 const STATUS_PILL: Record<JobStatus, { cls: string; text: string }> = {
   queued: { cls: 'muted', text: 'queued' },
@@ -26,11 +28,12 @@ function ParamChips({ item, models }: { item: HistoryItem; models: AppModel[] })
   const chips: string[] = []
   if (p.model_version) chips.push(m ? m.name || m.id : p.model_version)
   if (p.width && p.height) chips.push(`${p.width}×${p.height}`)
-  if (p.seconds) chips.push(`${p.seconds} s`)
+  if (p.seconds) chips.push(fmtLength(p.seconds))
   if (p.fps) chips.push(`${p.fps} fps`)
   if (p.steps) chips.push(`${p.steps} steps`)
   if (p.cfg_scale !== undefined) chips.push(`cfg ${p.cfg_scale}`)
   if (p.sampler) chips.push(p.sampler)
+  if (p.style) chips.push(p.style === 'none' ? 'no style tag' : p.style)
   if (p.seed !== undefined) chips.push(`seed ${p.seed}`)
   return (
     <div className="params" aria-label="Generation parameters">
@@ -78,6 +81,13 @@ function Turn(props: {
               {item.stage || (item.status === 'queued' ? 'Waiting for a worker' : item.status)} · {pct}%
               {item.worker ? ` · on ${item.worker}` : ''}
             </div>
+            <div className="eta">
+              {item.status === 'queued'
+                ? 'Waiting to start…'
+                : typeof item.eta_seconds === 'number'
+                  ? <>About <b>{fmtDuration(item.eta_seconds)}</b> left · running {fmtDuration(item.seconds_total ?? 0)}</>
+                  : `Estimating time left… · running ${fmtDuration(item.seconds_total ?? 0)}`}
+            </div>
           </div>
         )}
         {item.status === 'done' && item.video_url && (
@@ -86,7 +96,7 @@ function Turn(props: {
             <div className="row">
               <a className="btn sm" href={item.video_url} download={`nivra-${item.id}.mp4`}>Download</a>
               {item.worker && <span className="faint" style={{ fontSize: 12 }}>made on {item.worker}</span>}
-              {item.seconds_total ? <span className="faint" style={{ fontSize: 12 }}>took {Math.round(item.seconds_total)} s</span> : null}
+              {item.seconds_total ? <span className="faint" style={{ fontSize: 12 }}>took {fmtDuration(item.seconds_total)}</span> : null}
             </div>
           </>
         )}
@@ -111,6 +121,11 @@ export function App() {
   const [cfgErr, setCfgErr] = useState('')
   const [models, setModels] = useState<AppModel[]>([])
   const [modelsErr, setModelsErr] = useState('')
+  const [prefs, setPrefsState] = useState<Prefs>(() => loadPrefs())
+  const setPrefs = (p: Prefs) => {
+    setPrefsState(p)
+    savePrefs(p)
+  }
   const [items, setItems] = useState<HistoryItem[]>([])
   const [histErr, setHistErr] = useState('')
   const [sending, setSending] = useState(false)
@@ -139,10 +154,13 @@ export function App() {
 
   const loadModels = useCallback(async () => {
     try {
-      setModels(await app.models())
-      setModelsErr('')
+      const r = await app.models()
+      setModels(r.models)
+      setModelsErr(r.models.length === 0 && r.networkError ? r.networkError : '')
+      return r.models
     } catch (e) {
       setModelsErr('Could not load models: ' + errMsg(e))
+      return []
     }
   }, [])
 
@@ -159,10 +177,11 @@ export function App() {
   // First load: config decides whether the first-run screen is shown.
   useEffect(() => {
     void (async () => {
-      const c = await loadConfig()
+      const [c, ms] = await Promise.all([loadConfig(), loadModels()])
       if (!initialView.current) {
         initialView.current = true
-        if (!c || !c.controller_url || !c.has_token || !c.connected) setView('settings')
+        // A loaded local model is enough to start; otherwise connect first.
+        if (ms.length === 0 && (!c || !c.controller_url || !c.has_token || !c.connected)) setView('settings')
       }
     })()
   }, [loadConfig])
@@ -170,6 +189,11 @@ export function App() {
   useEffect(() => {
     if (ready) void loadModels()
   }, [ready, loadModels])
+  // Pick up model folders copied into the models folder while the app runs.
+  useEffect(() => {
+    const t = window.setInterval(() => void loadModels(), 30000)
+    return () => window.clearInterval(t)
+  }, [loadModels])
 
   // History polling: every 2 s while anything is unfinished, otherwise every 15 s.
   const anyActive = items.some((i) => !isFinished(i.status))
@@ -259,13 +283,15 @@ export function App() {
 
   const disabledReason = !config
     ? cfgErr || 'Loading…'
-    : !config.controller_url || !config.has_token
-      ? 'Not connected to a controller yet. Open Connection settings.'
-      : !config.connected
-        ? config.error || 'Cannot reach the controller right now.'
-        : ''
+    : models.length === 0
+      ? 'No model yet: load a model folder (Models) or connect to a controller (Connection).'
+      : !config.controller_url || !config.has_token
+        ? 'This model runs on the network: connect to a controller first (Connection).'
+        : !config.connected
+          ? config.error || 'Cannot reach the controller right now.'
+          : ''
 
-  const title = view === 'chat' ? 'Nivra' : view === 'worker' ? 'This computer as a worker' : 'Connection'
+  const title = { chat: 'Nivra', worker: 'This computer as a worker', settings: 'Connection', models: 'Models' }[view]
 
   return (
     <div className={'app' + (navOpen ? ' open' : '')}>
@@ -299,6 +325,7 @@ export function App() {
           })}
         </ul>
         <div className="side-foot">
+          <button className="btn ghost" aria-current={view === 'models'} onClick={() => go('models')}>Models ({models.length})</button>
           <button className="btn ghost" aria-current={view === 'worker'} onClick={() => go('worker')}>This computer as a worker</button>
           <button className="btn ghost" aria-current={view === 'settings'} onClick={() => go('settings')}>
             Connection settings{config?.user ? ` · ${config.user.username}` : ''}
@@ -326,6 +353,7 @@ export function App() {
           />
         )}
         {view === 'worker' && <WorkerPanel />}
+        {view === 'models' && <ModelsPanel models={models} onChanged={() => void loadModels()} onUse={() => go('chat')} />}
         {view === 'chat' && (
           <>
             <div className="convo" ref={convoRef}>
@@ -334,7 +362,12 @@ export function App() {
                 <div className="hero">
                   <h1>Type what you want to see.</h1>
                   <p>Your prompt goes straight to a video model. There is no chat language model, and results from the small research models are rough.</p>
-                  {!ready && config && <p><button className="btn" onClick={() => go('settings')}>Connect to a controller</button></p>}
+                  {models.length === 0 && config && (
+                    <p className="row" style={{ justifyContent: 'center' }}>
+                      <button className="btn primary" onClick={() => go('models')}>Load a model</button>
+                      <button className="btn" onClick={() => go('settings')}>Connect to a controller</button>
+                    </p>
+                  )}
                 </div>
               ) : (
                 <div className="convo-in">
@@ -349,7 +382,7 @@ export function App() {
                 {sendErr} <button className="btn ghost sm" onClick={() => setSendErr('')}>Dismiss</button>
               </div>
             )}
-            <Composer models={models} modelsError={ready ? modelsErr : ''} busy={sending} disabledReason={disabledReason} onSend={send} prefill={prefill} />
+            <Composer models={models} modelsError={modelsErr} busy={sending} disabledReason={disabledReason} onSend={send} prefill={prefill} prefs={prefs} onPrefs={setPrefs} networkReady={ready} history={items} />
           </>
         )}
       </main>

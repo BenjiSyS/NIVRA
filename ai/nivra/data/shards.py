@@ -14,6 +14,15 @@ def read_manifest(root: Path) -> list[dict]:
     return [json.loads(l) for l in (root / "manifest.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
+def style_counts(rows) -> dict[str, int]:
+    """Clips per style tag; rows from datasets written before the style field existed count as 'unspecified'."""
+    out: dict[str, int] = {}
+    for r in rows:
+        k = r.get("style") or "unspecified"
+        out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items()))
+
+
 def verify_shards(root, check_fingerprint: bool = True) -> list[str]:
     """Return a list of problems (empty = dataset is intact): shard checksums, sizes, manifest fingerprint."""
     root = Path(root)
@@ -57,6 +66,7 @@ class ShardDataset:
         rows = read_manifest(self.root)
         self.rows = [r for r in rows if split is None or r["split"] == split]
         self.fingerprint = self.info["fingerprint"]
+        self.styles = style_counts(self.rows)
 
     def __len__(self):
         return len(self.rows)

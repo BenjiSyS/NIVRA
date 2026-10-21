@@ -1,0 +1,174 @@
+{
+ "version": "nivra-stylized-bench/1",
+ "note": "English prompts for stylized HD models; each carries the style tag it is generated with. Plumbing/diversity set, not a quality benchmark.",
+ "prompts": [
+  {
+   "id": "s01",
+   "category": "anime",
+   "lang": "en",
+   "style": "anime",
+   "prompt": "a girl with long pink hair runs across a rooftop at sunset"
+  },
+  {
+   "id": "s02",
+   "category": "anime",
+   "lang": "en",
+   "style": "anime",
+   "prompt": "two swordsmen clash on a snowy bridge while petals fall"
+  },
+  {
+   "id": "s03",
+   "category": "anime",
+   "lang": "en",
+   "style": "anime",
+   "prompt": "a boy and a fox spirit walk through a lantern-lit festival street"
+  },
+  {
+   "id": "s04",
+   "category": "3d animation",
+   "lang": "en",
+   "style": "3d animation",
+   "prompt": "a small robot waters a tiny garden on a sunny balcony"
+  },
+  {
+   "id": "s05",
+   "category": "3d animation",
+   "lang": "en",
+   "style": "3d animation",
+   "prompt": "a fluffy monster chases a bouncing ball through a colourful toy room"
+  },
+  {
+   "id": "s06",
+   "category": "3d animation",
+   "lang": "en",
+   "style": "3d animation",
+   "prompt": "a cheerful chef cat flips a pancake in a bright kitchen"
+  },
+  {
+   "id": "s07",
+   "category": "cartoon",
+   "lang": "en",
+   "style": "cartoon",
+   "prompt": "a clumsy dog slides across a kitchen floor and crashes into a stack of pies"
+  },
+  {
+   "id": "s08",
+   "category": "cartoon",
+   "lang": "en",
+   "style": "cartoon",
+   "prompt": "a tall purple alien and a round yellow blob dance on a cartoon moon"
+  },
+  {
+   "id": "s09",
+   "category": "cartoon",
+   "lang": "en",
+   "style": "cartoon",
+   "prompt": "a grumpy cat chases a mouse around a dinner table"
+  },
+  {
+   "id": "s10",
+   "category": "2d animation",
+   "lang": "en",
+   "style": "2d animation",
+   "prompt": "a lantern swings in the wind above a quiet village at night"
+  },
+  {
+   "id": "s11",
+   "category": "2d animation",
+   "lang": "en",
+   "style": "2d animation",
+   "prompt": "a young witch rides a broom over rolling green hills"
+  },
+  {
+   "id": "s12",
+   "category": "2d animation",
+   "lang": "en",
+   "style": "2d animation",
+   "prompt": "a paper boat drifts down a rainy street gutter"
+  },
+  {
+   "id": "s13",
+   "category": "cel-shaded 3d",
+   "lang": "en",
+   "style": "cel-shaded 3d",
+   "prompt": "a knight in bright armor jumps over a glowing river"
+  },
+  {
+   "id": "s14",
+   "category": "cel-shaded 3d",
+   "lang": "en",
+   "style": "cel-shaded 3d",
+   "prompt": "a fox with a scarf sprints through a stylized autumn forest"
+  },
+  {
+   "id": "s15",
+   "category": "cel-shaded 3d",
+   "lang": "en",
+   "style": "cel-shaded 3d",
+   "prompt": "a spaceship banks past a ringed planet with bold outlines"
+  },
+  {
+   "id": "s16",
+   "category": "pixel art",
+   "lang": "en",
+   "style": "pixel art",
+   "prompt": "a pixel hero hops across floating platforms in a cave"
+  },
+  {
+   "id": "s17",
+   "category": "pixel art",
+   "lang": "en",
+   "style": "pixel art",
+   "prompt": "a tiny pixel farmer waters rows of glowing crops"
+  },
+  {
+   "id": "s18",
+   "category": "pixel art",
+   "lang": "en",
+   "style": "pixel art",
+   "prompt": "a pixel dragon flies over a castle at dusk"
+  },
+  {
+   "id": "s19",
+   "category": "claymation",
+   "lang": "en",
+   "style": "claymation",
+   "prompt": "a clay rabbit knocks on a round wooden door"
+  },
+  {
+   "id": "s20",
+   "category": "claymation",
+   "lang": "en",
+   "style": "claymation",
+   "prompt": "a stop-motion bear bakes a lumpy birthday cake"
+  },
+  {
+   "id": "s21",
+   "category": "claymation",
+   "lang": "en",
+   "style": "claymation",
+   "prompt": "two clay birds argue over a bright red button"
+  },
+  {
+   "id": "s22",
+   "category": "painterly",
+   "lang": "en",
+   "style": "painterly",
+   "prompt": "waves roll against a lighthouse in thick brush strokes"
+  },
+  {
+   "id": "s23",
+   "category": "painterly",
+   "lang": "en",
+   "style": "painterly",
+   "prompt": "a horse gallops across a golden wheat field"
+  },
+  {
+   "id": "s24",
+   "category": "painterly",
+   "lang": "en",
+   "style": "painterly",
+   "prompt": "a boat sails under a swirling night sky"
+  }
+ ]
+}

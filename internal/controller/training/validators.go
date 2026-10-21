@@ -241,9 +241,20 @@ func (s *Service) validateEvaluate(ctx context.Context, in scheduler.ValidationI
 
 // validateGenerate accepts a generation if an MP4 artifact was produced.
 func (s *Service) validateGenerate(ctx context.Context, in scheduler.ValidationInput) (scheduler.Verdict, error) {
-	id := in.Artifacts["video"]
+	return s.validateMP4(ctx, in, "video")
+}
+
+// mp4Validator accepts a result whose artifact of the given kind is an MP4.
+func mp4Validator(kind string) func(*Service, context.Context, scheduler.ValidationInput) (scheduler.Verdict, error) {
+	return func(s *Service, ctx context.Context, in scheduler.ValidationInput) (scheduler.Verdict, error) {
+		return s.validateMP4(ctx, in, kind)
+	}
+}
+
+func (s *Service) validateMP4(ctx context.Context, in scheduler.ValidationInput, kind string) (scheduler.Verdict, error) {
+	id := in.Artifacts[kind]
 	if id == "" {
-		return scheduler.Verdict{Reason: "no video artifact produced", Retry: true}, nil
+		return scheduler.Verdict{Reason: "no " + kind + " artifact produced", Retry: true}, nil
 	}
 	info, err := s.store.Get(ctx, in.ProjectID, id)
 	if err != nil || info.Size < 100 {

@@ -12,9 +12,15 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from . import media
+from ..styles import UNSPECIFIED, detect_leading_style, parse_data_style
 from .quality import DedupIndex, QualityLimits, clip_phash, phash_hex, quality_reject, quality_stats
 
-INGEST_VERSION = 1
+INGEST_VERSION = 2
+PROFILES = ("stylized", "live")
+LIVE_SCENE_THRESHOLD = 0.3
+# Hard anime cuts score far above this; a higher threshold avoids false cuts from limited animation drawn on
+# 2s/3s (a held frame followed by a big pose change looks like a cut to ffmpeg's scene score).
+STYLIZED_SCENE_THRESHOLD = 0.4
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
 
@@ -44,15 +50,25 @@ class IngestOptions:
     bucket: str = "256p2s"
     fps: float | None = None              # None -> bucket default
     max_clips: int | None = None
-    scene_threshold: float | None = 0.3   # None -> no scene detection, fixed-length windows only
+    scene_threshold: float | str | None = "auto"   # "auto" -> by profile; None -> no scene detection (fixed windows)
     scene_margin: float = 0.1             # seconds trimmed at each side of a detected cut
     shard_bytes: int = 128 * 1024 * 1024
     val_fraction: float = 0.05
     dedup_bits: float = 4.0
     allow_upscale: bool = False
     default_lang: str = "und"
-    quality: QualityLimits = field(default_factory=QualityLimits)
+    quality: QualityLimits | None = None  # None -> QualityLimits.for_profile(profile)
     overwrite: bool = False
+    profile: str = "stylized"             # "stylized" (anime/cartoon/3D: relaxed flat+static filters) | "live" (original)
+    default_style: str | None = None      # style for clips without any style label (a tag / alias, or None)
+
+    def resolved_scene_threshold(self) -> float | None:
+        if self.scene_threshold == "auto":
+            return STYLIZED_SCENE_THRESHOLD if self.profile == "stylized" else LIVE_SCENE_THRESHOLD
+        return self.scene_threshold            # type: ignore[return-value]
+
+    def resolved_quality(self) -> QualityLimits:
+        return self.quality if self.quality is not None else QualityLimits.for_profile(self.profile)
 
 
 REQUIRED_PROVENANCE = {"source": str, "license": str, "license_url": str, "permission": str, "collected": str,
@@ -80,6 +96,11 @@ def load_provenance(root: Path) -> dict:
             raise IngestError(f"{p}: field {k!r} must not be empty")
     if d["contains_people"] and not d["consent"].strip():
         raise IngestError(f"{p}: contains_people is true, so 'consent' must describe the consent obtained")
+    if "style" in d and d["style"] is not None:
+        try:
+            parse_data_style(d["style"])
+        except ValueError as e:
+            raise IngestError(f"{p}: field 'style': {e}")
     return d
 
 
@@ -96,7 +117,13 @@ def load_captions(root: Path) -> dict[str, dict]:
                 f, c = r["file"], r["caption"]
             except (json.JSONDecodeError, KeyError, TypeError):
                 raise IngestError(f"{p}:{n}: each line needs JSON keys 'file' and 'caption'")
-            row = {"caption": str(c).strip(), "lang": r.get("lang")}
+            style = r.get("style")
+            if style is not None:
+                try:
+                    style = parse_data_style(style)
+                except ValueError as e:
+                    raise IngestError(f"{p}:{n}: field 'style': {e}")
+            row = {"caption": str(c).strip(), "lang": r.get("lang"), "style": style}
             fp = Path(f)
             for key in (fp.as_posix(), fp.name, fp.stem):
                 out.setdefault(key, row)
@@ -116,6 +143,27 @@ def find_caption(video: Path, root: Path, jsonl: dict[str, dict], default_lang: 
     return None
 
 
+def find_style_hint(video: Path, root: Path, jsonl: dict[str, dict]) -> str | None:
+    """The captions.jsonl `style` field for this video (independent of where the caption text came from)."""
+    rel = video.relative_to(root).as_posix()
+    for key in (rel, video.name, video.stem):
+        if key in jsonl and jsonl[key].get("style"):
+            return jsonl[key]["style"]
+    return None
+
+
+def resolve_style(caption: str, jsonl_style: str | None, prov: dict, default_style: str | None) -> tuple[str, str]:
+    """(style, caption without its leading style phrase). Order: leading phrase in the caption, captions.jsonl
+    `style`, PROVENANCE.json `style`, the default_style option, else 'unspecified'."""
+    lead, rest = detect_leading_style(caption)
+    if lead is not None:
+        return lead, rest
+    for cand in (jsonl_style, prov.get("style"), default_style):
+        if cand:
+            return parse_data_style(cand), caption
+    return UNSPECIFIED, caption
+
+
 class ShardWriter:
     """Fixed-capacity shard buffer (all clips share one shape) -> safetensors files with sha256 recorded."""
 
@@ -124,17 +172,19 @@ class ShardWriter:
         self.cap = max(1, shard_bytes // int(np.prod(shape)))
         self.buf: np.ndarray | None = None
         self.n = 0
+        self.rows: list = []
         self.shard_no = 0
         self.files: list[dict] = []
 
     def current_name(self) -> str:
         return f"shard-{self.split}-{self.shard_no:05d}.safetensors"
 
-    def add(self, clip: np.ndarray) -> tuple[str, int]:
+    def add(self, clip: np.ndarray, row: dict | None = None) -> tuple[str, int]:
         if self.buf is None:
             self.buf = np.empty((self.cap, *self.shape), dtype=np.uint8)
         name, idx = self.current_name(), self.n
         self.buf[self.n] = clip
+        self.rows.append(row or {})
         self.n += 1
         if self.n == self.cap:
             self.flush()
@@ -145,14 +195,14 @@ class ShardWriter:
             return
         name = self.current_name()
         path = self.out / name
-        save_file({"videos": self.buf[: self.n]}, str(path), metadata={"nivra": json.dumps({"format": "nivra-clips/1", "split": self.split}, sort_keys=True)})  # one key: safetensors orders several keys randomly
+        save_file({"videos": self.buf[: self.n]}, str(path), metadata={"nivra": json.dumps({"format": "nivra-clips/1", "split": self.split, "rows": self.rows[: self.n]}, sort_keys=True, ensure_ascii=False)})  # one key: safetensors orders several keys randomly
         h = hashlib.sha256()
         with open(path, "rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         self.files.append({"file": name, "split": self.split, "clips": self.n, "bytes": path.stat().st_size,
                            "sha256": h.hexdigest()})
-        self.buf, self.n, self.shard_no = None, 0, self.shard_no + 1
+        self.buf, self.n, self.rows, self.shard_no = None, 0, [], self.shard_no + 1
 
 
 def _split_of(rel: str, val_fraction: float) -> str:
@@ -169,7 +219,16 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
         raise IngestError(f"unknown bucket {opts.bucket!r}; choose from {sorted(BUCKETS)}")
     if not root.is_dir():
         raise IngestError(f"input folder not found: {root}")
+    if opts.profile not in PROFILES:
+        raise IngestError(f"unknown profile {opts.profile!r}; choose from {list(PROFILES)}")
+    if opts.default_style is not None:
+        try:
+            parse_data_style(opts.default_style)
+        except ValueError as e:
+            raise IngestError(f"default_style: {e}")
     prov = load_provenance(root)                 # refuse before touching the output directory
+    scene_threshold = opts.resolved_scene_threshold()
+    qlim = opts.resolved_quality()
     b = BUCKETS[opts.bucket]
     fps = float(opts.fps or b.default_fps)
     window = b.frames / fps                       # source seconds consumed per clip
@@ -208,6 +267,10 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
             continue
         caption, lang = cap
         try:
+            style, caption = resolve_style(caption, find_style_hint(vp, root, captions), prov, opts.default_style)
+        except ValueError as e:
+            raise IngestError(f"{rel}: {e}")
+        try:
             info = media.probe(vp)
         except media.MediaError as e:
             reject("corrupt", rel, str(e))
@@ -220,7 +283,7 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
             reject("too_short", rel, f"{info.duration:.2f}s < {window:.2f}s")
             continue
         try:
-            cuts = media.detect_cuts(vp, opts.scene_threshold) if opts.scene_threshold else []
+            cuts = media.detect_cuts(vp, scene_threshold) if scene_threshold else []
         except media.MediaError as e:
             reject("corrupt", rel, str(e))
             continue
@@ -246,7 +309,7 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
                     reject("short_read", rel, f"@{start:.2f}s")
                     continue
                 st = quality_stats(clip)
-                why = quality_reject(st, opts.quality)
+                why = quality_reject(st, qlim)
                 if why:
                     reject(why, rel, f"@{start:.2f}s")
                     continue
@@ -257,10 +320,10 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
                     continue
                 dedup.add(ph)
                 cid = f"{b.name}-{hashlib.sha256(rel.encode()).hexdigest()[:8]}-{int(round(start * 1000)):07d}"
-                shard, idx = writers[split].add(clip)
+                shard, idx = writers[split].add(clip, {"id": cid, "caption": caption, "style": style, "lang": lang})
                 manifest.append({
                     "id": cid, "split": split, "shard": shard, "index": idx, "bucket": b.name, "caption": caption,
-                    "lang": lang, "source_file": rel, "start": round(start, 3), "end": round(start + window, 3),
+                    "style": style, "lang": lang, "source_file": rel, "start": round(start, 3), "end": round(start + window, 3),
                     "fps": fps, "frames": b.frames, "width": b.width, "height": b.height,
                     "source_resolution": [info.width, info.height], "source_codec": info.codec,
                     "scene_index": si, "provenance": prov, "phash": phash_hex(ph), "quality": st})
@@ -284,9 +347,10 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
         "clips": len(manifest), "train_clips": sum(m["split"] == "train" for m in manifest),
         "val_clips": sum(m["split"] == "val" for m in manifest), "videos_seen": len(videos),
         "rejected": dict(sorted(rejects.items())), "rejected_files": rejected_files,
-        "options": {"scene_threshold": opts.scene_threshold, "scene_margin": opts.scene_margin,
+        "styles": dict(sorted(Counter(m["style"] for m in manifest).items())), "profile": opts.profile,
+        "options": {"profile": opts.profile, "default_style": opts.default_style, "scene_threshold": scene_threshold, "scene_margin": opts.scene_margin,
                     "val_fraction": opts.val_fraction, "dedup_bits": opts.dedup_bits, "shard_bytes": opts.shard_bytes,
-                    "allow_upscale": opts.allow_upscale, "quality": vars(opts.quality)},
+                    "allow_upscale": opts.allow_upscale, "quality": vars(qlim)},
         "provenance": prov, "shards": shards}
     (out / "dataset.json").write_text(json.dumps(summary, indent=1, sort_keys=True, ensure_ascii=False), encoding="utf-8")
     return summary

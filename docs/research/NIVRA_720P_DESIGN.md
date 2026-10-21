@@ -90,3 +90,28 @@ Fewer steps (distilled/few-step sampling) is the main later speed-up.
   the HC-VAE into safetensors shards.
 * **Public datasets**: a researched shortlist with licences is kept in `docs/research/DATASETS.md`;
   nothing is downloaded without the owner's explicit approval per dataset.
+
+## 8. Stylized specialization (3D animation, anime, cartoon, 2D animation)
+
+The shipped configs (`nivra_hd_tiny`, `nivra_medium`, `nivra_large`) target stylized content: `"domain": "stylized"`, `"styles"` (the canonical list
+from `ai/nivra/data/styles.py`, `realistic` last and never the default), `"default_style": "anime"`. Configs without these keys load as
+`domain: "general"`, `styles: []`, `default_style: null` and behave as before. This is a data and conditioning choice, not an architecture change:
+`hd_config_hash` and the parameter counts are unchanged.
+
+* **Style conditioning**: a style is a text prefix, `"<style> style. <prompt>"` (`apply_style`; skipped when the prompt already names a style alias or
+  the style is `none`). Ingest stores a `style` per clip; the DiT trainer encodes `apply_style(caption, clip style)` and drops the tag for a
+  `train.style_dropout` fraction of samples (0.1; a pure function of seed, epoch and clip id, so resume is exact) so the model also works untagged.
+  Clips with `unspecified` style are trained on the plain caption.
+* **HC-VAE edge loss**: `vae.edge_weight` (0.5 in the stylized configs, 0 = old loss) adds the L1 between horizontal/vertical finite differences of input
+  and reconstruction (`edge_loss`) to push for crisp outlines instead of blurred line art. It is a training option (stripped from the architecture
+  config), so VAE files and hashes are unaffected.
+* **Data**: ingest `--profile stylized` relaxes the flat/static filters for flat colour areas and animation on 2s/3s and uses a scene threshold suited
+  to hard cuts (see `docs/training/DATA_PIPELINE.md`). Only licensed data with `PROVENANCE.json` is ingested.
+* **Bundles / inference**: `model_version.json` carries `domain`, `styles`, `default_style`; the loader exposes them on the pipeline. `ai.generate` takes
+  `style` (canonical tag, alias, or `"none"`); omitted = the manifest `default_style`; unknown or unsupported = exit 2; small bundles reject it. The
+  result summary and metadata contain `style` and `prompt_used` (the text actually encoded). Continuations reuse the stored, already-tagged prompt.
+* **Evaluation**: `ai.evaluate` mode `adherence` on a stylized HD bundle runs the 24-prompt English set `ai/nivra/evaluation/stylized_prompts.json`
+  (3 prompts for each of the 8 stylized styles) and reports plumbing statistics only (non-blank rate, motion, edge density). There is no detector for
+  open-vocabulary stylized content, so no prompt-adherence or quality number is produced.
+* **Not claimed**: nothing here has been trained on real stylized data; the tiny tests only show that tags, filters, losses and plumbing behave as
+  specified. Output quality of trained models is unknown until training runs exist.

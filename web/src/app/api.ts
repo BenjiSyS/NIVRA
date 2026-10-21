@@ -18,6 +18,10 @@ export interface AppModel {
   family: 'small' | 'hd'
   active: boolean
   parameter_count?: number
+  styles?: string[]
+  default_style?: string
+  source?: 'local' | 'network'
+  path?: string
 }
 export type JobStatus = 'queued' | 'running' | 'downloading' | 'done' | 'failed' | 'cancelled'
 export interface GenParams {
@@ -30,6 +34,7 @@ export interface GenParams {
   height?: number
   seconds?: number
   sampler?: string
+  style?: string
 }
 export interface HistoryItem {
   id: string
@@ -43,6 +48,8 @@ export interface HistoryItem {
   error?: string
   video_url: string | null
   seconds_total?: number
+  eta_seconds?: number | null
+  local?: boolean
 }
 export interface GenerateRequest extends GenParams {
   prompt: string
@@ -68,7 +75,14 @@ async function call<T>(method: string, path: string, body?: unknown, signal?: Ab
 export const app = {
   config: (signal?: AbortSignal) => call<AppConfig>('GET', '/config', undefined, signal),
   saveConfig: (b: { controller_url: string; token?: string; project?: string }) => call<AppConfig>('PUT', '/config', b),
-  models: async (signal?: AbortSignal) => (await call<{ models: AppModel[] | null }>('GET', '/models', undefined, signal)).models ?? [],
+  models: async (signal?: AbortSignal) => {
+    const r = await call<{ models: AppModel[] | null; network_error?: string }>('GET', '/models', undefined, signal)
+    return { models: r.models ?? [], networkError: r.network_error ?? '' }
+  },
+  addLocalModel: (path: string) => call<AppModel>('POST', '/local-models', { path }),
+  browseLocalModel: () => call<AppModel & { cancelled?: boolean }>('POST', '/local-models/browse', {}),
+  rescanLocalModels: () => call<{ models: number }>('POST', '/local-models/rescan', {}),
+  removeLocalModel: (id: string) => call<void>('DELETE', `/local-models/${encodeURIComponent(id.replace(/^local:/, ''))}`),
   generate: (r: GenerateRequest) => call<{ id: string }>('POST', '/generate', r),
   history: async (signal?: AbortSignal) => (await call<{ items: HistoryItem[] | null }>('GET', '/history', undefined, signal)).items ?? [],
   cancel: (id: string) => call<void>('POST', `/history/${encodeURIComponent(id)}/cancel`, {}),

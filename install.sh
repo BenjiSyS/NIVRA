@@ -96,6 +96,7 @@ setup_python() { # $1 = purpose (controller|worker)
     fi
   fi
   "$PY" -m pip install --quiet -r ai/requirements.txt || warn "installing ai/requirements.txt failed"
+  "$PY" -m pip install --quiet -r ai/requirements-caption.txt || warn "caption tools did not install (nivra caption --install)"
   if PYTHONPATH="$ROOT/ai" "$PY" -c "import nivra.cli, torch; print('    python AI executor OK: torch', torch.__version__, 'cuda', torch.cuda.is_available())"; then :; else
     warn "AI executor self-test failed; run 'nivra doctor' for details"
   fi

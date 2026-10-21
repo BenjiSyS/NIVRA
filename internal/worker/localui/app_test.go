@@ -45,7 +45,8 @@ func fakeController(t *testing.T) (*httptest.Server, *sync.Map) {
 	}))
 	mux.HandleFunc("GET /api/v1/projects/{pid}/models", auth(func(w http.ResponseWriter, r *http.Request) {
 		j(w, map[string]any{"models": []any{
-			map[string]any{"id": "m1", "run_name": "Nivra Medium", "architecture": "nivra-dit-medium", "family": "hd", "active": true, "parameter_count": 932333696},
+			map[string]any{"id": "m1", "run_name": "Nivra Medium", "architecture": "nivra-dit-medium", "family": "hd", "active": true, "parameter_count": 932333696,
+				"styles": []string{"anime", "3d animation"}, "default_style": "anime"},
 			map[string]any{"id": "m2", "run_name": nil, "architecture": "nivra-small", "family": "", "active": false, "parameter_count": 2410000},
 		}})
 	}))
@@ -133,7 +134,8 @@ func TestAppFlow(t *testing.T) {
 	}
 
 	rec = doLocal(t, h, "GET", "/local/api/app/models", "", nil)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"family":"hd"`) || !strings.Contains(rec.Body.String(), `"name":"nivra-small"`) {
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"family":"hd"`) || !strings.Contains(rec.Body.String(), `"name":"nivra-small"`) ||
+		!strings.Contains(rec.Body.String(), `"default_style":"anime"`) || !strings.Contains(rec.Body.String(), `"styles":[]`) {
 		t.Fatalf("models: %d %s", rec.Code, rec.Body)
 	}
 
@@ -141,13 +143,13 @@ func TestAppFlow(t *testing.T) {
 	if rec = doLocal(t, h, "POST", "/local/api/app/generate", `{"prompt":"x","evil":1}`, nil); rec.Code != 400 {
 		t.Fatalf("unknown field: %d", rec.Code)
 	}
-	rec = doLocal(t, h, "POST", "/local/api/app/generate", `{"prompt":" a cat in fog ","width":1280,"height":720,"seconds":8,"sampler":"ab2"}`, nil)
+	rec = doLocal(t, h, "POST", "/local/api/app/generate", `{"prompt":" a cat in fog ","width":1280,"height":720,"seconds":8,"sampler":"ab2","style":"3d animation"}`, nil)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), testJob) {
 		t.Fatalf("generate: %d %s", rec.Code, rec.Body)
 	}
 	b, _ := seen.Load("generate")
 	body := b.(map[string]any)
-	if body["prompt"] != "a cat in fog" || body["width"] != float64(1280) || body["seconds"] != float64(8) || body["seed"] == nil {
+	if body["prompt"] != "a cat in fog" || body["width"] != float64(1280) || body["seconds"] != float64(8) || body["seed"] == nil || body["style"] != "3d animation" {
 		t.Fatalf("forwarded body: %v", body)
 	}
 

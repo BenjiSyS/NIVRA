@@ -21,6 +21,18 @@ model; the text goes to the video model.
 | `DELETE /local/api/app/history/{id}` | removes the local entry and its video file |
 | `GET /local/api/app/videos/{id}.mp4` | the downloaded video (Range supported) |
 
+| `POST /local/api/app/local-models` | `{path}` → the model; validates `model_version.json`, `weights.safetensors`, `vae.safetensors` and remembers the folder |
+| `POST /local/api/app/local-models/browse` | opens the Windows folder picker on this computer → the model, or `{cancelled: true}` |
+| `DELETE /local/api/app/local-models/{id}` | forgets a loaded folder (files stay) |
+| `POST /local/api/app/quit` | stops Nivra.exe |
+
+Models: `GET models` returns local models (`source: "local"`, id `local:<hash>`, from loaded folders and every
+subfolder of `<install>/models` and `<data_dir>/models`) plus network models (`source: "network"`) when connected;
+`network_error` explains a missing network list. A `model_version` starting with `local:` runs on this computer
+(one at a time, through the same Python executor as worker jobs, on the worker's selected CUDA GPU or the CPU) and
+needs no controller. History items carry `local`, and `eta_seconds` (time left, from the progress rate over the last
+~3 minutes; `null` while unknown or queued).
+
 Existing worker routes (`/local/api/status`, `start`, `pause`, `resume`, `stop`, `connect`, `settings`,
 `logs`) stay available; the app shows them as "This computer as a worker".
 

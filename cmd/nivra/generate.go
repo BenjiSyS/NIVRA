@@ -52,6 +52,7 @@ func cmdGenerate(ctx context.Context, args []string) error {
 	height := fs.Int("height", 0, "HD models: output height (default from the model, e.g. 720)")
 	seconds := fs.Float64("seconds", 0, "HD models: duration in seconds (default from the model, e.g. 8)")
 	sampler := fs.String("sampler", "", "HD models: euler or ab2")
+	style := fs.String("style", "", `HD models: style tag ("anime", "3d animation", "cartoon", ...; "none" = no tag; default from the model)`)
 	python := fs.String("python", "", "Python interpreter (local mode; default from config/worker.json)")
 	_ = fs.Parse(args)
 	if strings.TrimSpace(*prompt) == "" {
@@ -74,6 +75,9 @@ func cmdGenerate(ctx context.Context, args []string) error {
 		}
 		if *sampler != "" {
 			hd["sampler"] = *sampler
+		}
+		if *style != "" {
+			hd["style"] = *style
 		}
 		return generateRemote(ctx, *url, *user, *project, *model, *prompt, *seed, *steps, *cfg, *fps, *upscale, *out)
 	default:
@@ -220,10 +224,17 @@ func generateRemote(ctx context.Context, url, user, project, model, prompt strin
 	}
 	var created struct {
 		JobID        string `json:"job_id"`
+		GenerationID string `json:"generation_id"`
 		ModelVersion string `json:"model_version"`
+		Segments     int    `json:"segments"`
 	}
 	if err := r.do(ctx, "POST", "/projects/"+pid+"/generate", body, &created); err != nil {
 		return err
+	}
+	if created.GenerationID != "" {
+		fmt.Fprintf(os.Stderr, "long video: %d segments rendered in parallel by the connected workers (generation %s)\n",
+			created.Segments, created.GenerationID)
+		return r.waitGeneration(ctx, pid, created.GenerationID, out)
 	}
 	fmt.Fprintf(os.Stderr, "queued job %s (model %s); waiting for a worker...\n", created.JobID, created.ModelVersion)
 	last := ""
@@ -306,4 +317,44 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return os.WriteFile(dst, b, 0o644)
+}
+
+// waitGeneration follows a long (segmented) video until it is done.
+func (r *remote) waitGeneration(ctx context.Context, pid, gid, out string) error {
+	last := ""
+	for {
+		var g struct {
+			Status        string   `json:"status"`
+			Stage         string   `json:"stage"`
+			Progress      float64  `json:"progress"`
+			SegmentsTotal int      `json:"segments_total"`
+			SegmentsDone  int      `json:"segments_done"`
+			Workers       []string `json:"workers"`
+			ArtifactID    *string  `json:"artifact_id"`
+			Failure       string   `json:"failure_reason"`
+		}
+		if err := r.do(ctx, "GET", "/projects/"+pid+"/generations/"+gid, nil, &g); err != nil {
+			return err
+		}
+		line := fmt.Sprintf("%s %s %3.0f%% segments %d/%d workers %s", g.Status, g.Stage, g.Progress*100,
+			g.SegmentsDone, g.SegmentsTotal, strings.Join(g.Workers, ","))
+		if line != last {
+			fmt.Fprintln(os.Stderr, "  "+line)
+			last = line
+		}
+		switch g.Status {
+		case "completed":
+			if g.ArtifactID == nil {
+				return errors.New("generation completed without a video")
+			}
+			return r.download(ctx, "/projects/"+pid+"/artifacts/"+*g.ArtifactID, out)
+		case "failed", "cancelled":
+			return fmt.Errorf("generation %s: %s", g.Status, g.Failure)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
