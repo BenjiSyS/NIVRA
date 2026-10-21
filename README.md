@@ -334,6 +334,16 @@ synthesised sound effects; speech and lip-sync later. No voice cloning.
 
 Step-by-step beginner guide: [docs/comfyui/COMFYUI.md](docs/comfyui/COMFYUI.md).
 
+### Shared use from ComfyUI (many people, one network)
+
+Add the **Nivra Remote Text-to-Video (network)** node: ComfyUI sends the prompt to your Nivra controller
+and a connected worker computer does the rendering, so several people (each with their own ComfyUI,
+no GPU needed) can generate at the same time on the same set of workers. Each person creates a personal
+API token in Nivra Studio → Settings → API tokens and sets it as `NIVRA_TOKEN` (or saves it in
+`ComfyUI/user/nivra_token.txt`) — never inside a shared workflow. Details: [docs/comfyui/COMFYUI.md](docs/comfyui/COMFYUI.md#two-ways-to-run).
+
+The command line works the same way with a token: `NIVRA_TOKEN=... nivra generate --url https://studio.benjiserver.com --prompt "..."`.
+
 ## 31. ComfyUI Workflows
 
 Example workflows: [examples/workflows](examples/workflows).

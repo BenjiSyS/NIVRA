@@ -5,6 +5,7 @@ Nivra model really implements:
 
 | Node | Inputs → Outputs |
 |------|------------------|
+| **Nivra Remote Text-to-Video (network)** | controller URL, prompt, seed, steps, cfg_scale, upscale, timeout, optional project/model → `IMAGE` frames, MP4 path. Runs on a worker computer of your Nivra network, not on the ComfyUI machine |
 | **Nivra Model Loader** | bundle (folder in `models/nivra/`), device (`auto`, `cpu`, `cuda:N`) → `NIVRA_MODEL` |
 | **Nivra Text-to-Video** | model, prompt, seed, steps, cfg_scale, decode_tile → `IMAGE` frames, `NIVRA_STATE` |
 | **Nivra Image-to-Video** | model, image, prompt, seed, steps, cfg_scale → `IMAGE`, `NIVRA_STATE` |
@@ -14,6 +15,28 @@ Nivra model really implements:
 Not provided (not implemented by the model yet): negative prompts, external VAEs, audio nodes,
 reference-identity conditioning. Nivra latents are only decodable by the Nivra VAE that ships in the
 same bundle; the loader refuses a VAE whose SHA-256 differs from the one the model was trained with.
+
+## Two ways to run
+
+* **Local nodes** (Model Loader → Text-to-Video → Export): the model runs inside ComfyUI on this computer.
+  Needs a model bundle in `ComfyUI/models/nivra/`.
+* **Nivra Remote Text-to-Video**: ComfyUI only sends the prompt; the Nivra controller queues it and any
+  connected worker computer (for example a GPU PC) renders it, then the frames come back into ComfyUI.
+  Many people — each with their own ComfyUI, or sharing one — can use the same network at the same
+  time; the controller's queue spreads their requests over all idle AI workers. The ComfyUI machine
+  needs no model files and no GPU.
+
+### Setting up the remote node (each person)
+
+1. Ask the Nivra administrator for an account with the **operator** role
+   (`bin/nivra admin create --username alice --role operator` on the controller).
+2. Sign in to Nivra Studio → **Settings → API tokens → Create token**, copy it once.
+3. Give it to ComfyUI **outside the workflow** (so shared workflows never contain it), either:
+   * environment variable `NIVRA_TOKEN=nivra_pat_...` before starting ComfyUI, or
+   * a text file `ComfyUI/user/nivra_token.txt` containing only the token.
+4. In the node, set `controller_url` to the Studio address (e.g. `https://studio.benjiserver.com`) and
+   type a prompt. Load `examples/workflows/nivra_remote_network_api.json` for a ready-made graph.
+5. Revoke a token any time in Studio Settings; it stops working immediately.
 
 ## Installation (manual Git install)
 

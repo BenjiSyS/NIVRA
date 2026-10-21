@@ -1,0 +1,4 @@
+{
+  "1": {"class_type": "NivraRemoteTextToVideo", "inputs": {"controller_url": "https://studio.benjiserver.com", "prompt": "a yellow triangle moves down", "seed": 2, "steps": 30, "cfg_scale": 3.0, "upscale": 4, "timeout_minutes": 30, "project": "", "model_version": ""}},
+  "2": {"class_type": "NivraExportMP4", "inputs": {"frames": ["1", 0], "fps": 8, "upscale": 1, "filename_prefix": "nivra_remote"}}
+}
