@@ -1,6 +1,6 @@
 # Project Status
 
-Last updated: 2026-10-21 (end of the first implementation session).
+Last updated: 2026-10-22 (second session: app, long videos, stylized models, training on real data).
 Status values: **Verified complete** · **Implemented, not verified** · **Experimental** · **Pending** · **Blocked**.
 Evidence: [TEST_RESULTS.md](TEST_RESULTS.md), [PERFORMANCE.md](PERFORMANCE.md),
 [research/EXPERIMENTS.md](research/EXPERIMENTS.md), [research/DISTRIBUTED_RUN_001.md](research/DISTRIBUTED_RUN_001.md),
@@ -11,7 +11,7 @@ Evidence: [TEST_RESULTS.md](TEST_RESULTS.md), [PERFORMANCE.md](PERFORMANCE.md),
 | Feature | Status | Evidence / notes |
 |---------|--------|------------------|
 | Single `nivra` binary (controller, worker, doctor, repair, admin, generate, loadtest) | Verified | builds for windows/amd64, linux/arm64 (deployed), linux/amd64, darwin/arm64 |
-| PostgreSQL schema + checksummed migrations (1–6) | Verified | applied incrementally to the live Pi database |
+| PostgreSQL schema + checksummed migrations (1–9) | Verified | 7–9 applied to the live Pi database on 2026-10-22 after a pg_dump backup |
 | Admin accounts (argon2id), cookie sessions + CSRF, roles | Verified | e2e + token tests |
 | Personal API tokens (ComfyUI, scripts) | Verified | `TestAPITokens`, real ComfyUI use |
 | Project enrollment codes (display, copy, rotate, close) | Verified | enrollment tests, Studio |
@@ -24,10 +24,10 @@ Evidence: [TEST_RESULTS.md](TEST_RESULTS.md), [PERFORMANCE.md](PERFORMANCE.md),
 | Security review findings F1–F13 | Fixed in code with tests; public exposure still needs owner steps | [security/THREAT_MODEL.md](security/THREAT_MODEL.md) |
 | Nivra Studio (all pages) | Verified (most flows) | training charts with real data were exercised via API, not visually |
 | Worker website | Verified | |
-| Installers `install.sh` (controller verified on Pi), `install.bat`/`install.ps1` | Implemented; Windows installer not run end-to-end | |
+| One-file `Nivra-Setup.bat` (clone + tools + hardware-aware PyTorch + Nivra.exe + caption tools) | Verified from a local clone | needs the GitHub repo to be published for other people |
 | `nivra doctor` / `repair` | Implemented, partially verified | |
 | Raspberry Pi deployment | Verified | controller + worker running there during tests |
-| Cloudflare public hostnames | **Blocked** on owner (dashboard login + consent) | guide in `deploy/cloudflare/README.md` |
+| Cloudflare public hostnames | Verified | `studio.benjiserver.com` (Studio, app, ComfyUI) and `api.benjiserver.com` (workers), host-separated |
 | Autostart on boot | Not configured (by design) | opt-in units in `deploy/systemd/` |
 | 50 / 100 worker control-plane load | Verified | PERFORMANCE.md |
 
@@ -64,3 +64,20 @@ Evidence: [TEST_RESULTS.md](TEST_RESULTS.md), [PERFORMANCE.md](PERFORMANCE.md),
 2. Rotate the project code before public use (it was printed in a deployment log).
 3. Decide whether to publish via Cloudflare (`deploy/cloudflare/README.md`) and whether to enable autostart.
 4. Connect the RTX 2060 PC as a worker to start GPU-scale training.
+
+## Second session (2026-10-22)
+
+| Feature | Status | Evidence / notes |
+|---------|--------|------------------|
+| Nivra App (`Nivra.exe`): chat-style generation, local + network models, auto-discovery, resolution menu, typed fps/length, time estimate + time left | Verified | real e2e (controller + 2 workers + app); `internal/worker/localui` tests |
+| Long videos (draft → parallel segments → stitch), up to 3 h | Verified with the tiny HD model | segments rendered by 2 devices; cancel; controller restart mid-video |
+| Multi-GPU workers (one slot per GPU) | Implemented, **not verified** | no multi-GPU machine available |
+| Stylized specialization (anime/3D/cartoon…), style param everywhere | Verified (plumbing) | no quality claims: nothing trained on real data yet |
+| `nivra caption` (Florence-2 + Whisper/embedded subtitles, batches) | Verified on synthetic clips | ~2–3 min per video on this CPU |
+| `train-pipeline` (one machine) | Verified with `nivra_hd_tiny` | `nivra_base` GPU memory is an estimate until run on the RTX 2060 |
+| HD distributed training on real data (datasets, encode, rounds, validation, aggregation, eval gate) | Verified with the tiny config on CPU workers | GPU paths (fp16, GradScaler) untested |
+| Trained text encoder shipped with network models | Verified | e2e without NIVRA_TEXT_ENCODERS_DIR |
+
+Owner actions still open: publish the repository (GitHub) so `Nivra-Setup.bat` works for others; change the Pi
+password, the Nivra admin password (an `initial-admin-password` file is still on the Pi) and rotate the project
+code; connect the RTX 2060 PC as a trusted worker and measure `nivra_base` training; optional autostart.
