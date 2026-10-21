@@ -105,6 +105,58 @@ def _cmd_info(a):
     return 0
 
 
+def _cmd_text_train_tokenizer(a):
+    import time
+    from .text.bpe import BPETokenizer, expand_text_paths
+    files = expand_text_paths(a.input)
+    t0 = time.time()
+    tok = BPETokenizer.train_files(files, a.vocab_size, a.min_frequency)
+    dt = time.time() - t0
+    sha = tok.save(a.out)
+    nbytes = sum(f.stat().st_size for f in files)
+    print(json.dumps({"out": a.out, "vocab_size": tok.vocab_size, "sha256": sha, "files": len(files),
+                      "train_bytes": nbytes, "train_seconds": round(dt, 2)}))
+    return 0
+
+
+def _cmd_text_pretrain(a):
+    from .config import setup_runtime
+    from .text.bpe import BPETokenizer
+    from .text.nivra_text import pretrain_mlm
+    rt = setup_runtime()
+    dev = rt if a.device == "auto" else a.device
+    tok = BPETokenizer.load(a.tokenizer)
+    res = pretrain_mlm(a.corpus, tok, a.out, size=a.size, steps=a.steps, batch=a.batch, seq_len=a.seq_len, lr=a.lr,
+                       seed=a.seed, device=dev, fp16=a.fp16, save_every=a.save_every_steps)
+    h = res["history"]
+    print(json.dumps({"out": a.out, "id": res["meta"]["id"], "params": res["meta"]["params"], "steps": len(h),
+                      "first_loss": h[0][1], "last_loss": h[-1][1], "random_baseline_loss": res["random_baseline_loss"],
+                      "tokens": res["tokens"], "seconds": round(res["seconds"], 1)}))
+    return 0
+
+
+def _cmd_data_ingest(a):
+    from .data.ingest import IngestError, IngestOptions, ingest_folder
+    opts = IngestOptions(bucket=a.bucket, fps=a.fps, max_clips=a.max_clips,
+                         scene_threshold=None if a.no_scenes else a.scene_threshold, shard_bytes=a.shard_mb * 1024 * 1024,
+                         val_fraction=a.val_fraction, dedup_bits=a.dedup_bits, allow_upscale=a.allow_upscale,
+                         default_lang=a.default_lang, overwrite=a.overwrite)
+    try:
+        s = ingest_folder(a.input, a.output, opts)
+    except IngestError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps({k: s[k] for k in ("fingerprint", "bucket", "fps", "clips", "train_clips", "val_clips", "videos_seen", "rejected")}, indent=1))
+    return 0
+
+
+def _cmd_data_inspect(a):
+    from .data.ingest import inspect_dataset
+    rep = inspect_dataset(a.dataset)
+    print(json.dumps(rep, indent=1, ensure_ascii=False))
+    return 0 if rep["ok"] else 1
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="nivra")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -179,6 +231,48 @@ def build_parser():
     s = sub.add_parser("info", help="parameter counts / shapes of a config")
     s.add_argument("--config", default="nivra_small")
     s.set_defaults(fn=_cmd_info)
+
+    s = sub.add_parser("text-train-tokenizer", help="train the Nivra byte-level BPE tokenizer on text files")
+    s.add_argument("--input", nargs="+", required=True, help="text files or directories (.txt/.md)")
+    s.add_argument("--out", required=True, help="tokenizer.json to write")
+    s.add_argument("--vocab-size", type=int, default=32000)
+    s.add_argument("--min-frequency", type=int, default=2)
+    s.set_defaults(fn=_cmd_text_train_tokenizer)
+
+    s = sub.add_parser("text-pretrain", help="masked-LM pretraining of the Nivra text encoder")
+    s.add_argument("--corpus", nargs="+", required=True)
+    s.add_argument("--tokenizer", required=True)
+    s.add_argument("--out", required=True, help="checkpoint directory")
+    s.add_argument("--size", choices=["tiny", "small", "base"], default="tiny")
+    s.add_argument("--steps", type=int, default=200)
+    s.add_argument("--batch", type=int, default=16)
+    s.add_argument("--seq-len", type=int)
+    s.add_argument("--lr", type=float, default=1e-3)
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--device", default="auto")
+    s.add_argument("--fp16", action="store_true", help="CUDA autocast fp16 (untested path)")
+    s.add_argument("--save-every-steps", type=int, default=0)
+    s.set_defaults(fn=_cmd_text_pretrain)
+
+    s = sub.add_parser("data-ingest", help="folder of videos + captions + PROVENANCE.json -> sharded dataset")
+    s.add_argument("--input", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--bucket", choices=["256p2s", "480p4s", "720p8s"], default="256p2s")
+    s.add_argument("--fps", type=float, help="default: 8 for 256p2s, 30 otherwise")
+    s.add_argument("--max-clips", type=int)
+    s.add_argument("--scene-threshold", type=float, default=0.3)
+    s.add_argument("--no-scenes", action="store_true", help="skip scene detection; fixed-length windows only")
+    s.add_argument("--shard-mb", type=int, default=128)
+    s.add_argument("--val-fraction", type=float, default=0.05)
+    s.add_argument("--dedup-bits", type=float, default=4.0, help="mean dHash bits (of 64) under which clips are duplicates")
+    s.add_argument("--allow-upscale", action="store_true")
+    s.add_argument("--default-lang", default="und")
+    s.add_argument("--overwrite", action="store_true")
+    s.set_defaults(fn=_cmd_data_ingest)
+
+    s = sub.add_parser("data-inspect", help="summarise and verify an ingested dataset")
+    s.add_argument("dataset")
+    s.set_defaults(fn=_cmd_data_inspect)
     return p
 
 
