@@ -61,6 +61,7 @@ find "$DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 cp -a "$TMP/$PKG/." "$DIR/"
 if [ -d "$DIR/config.keep" ]; then rm -rf "$DIR/config"; mv "$DIR/config.keep" "$DIR/config"; fi
 rm -rf "$TMP"
+chmod +x "$DIR/bin/nivra" "$DIR/install.sh" "$DIR/start.sh" "$DIR"/scripts/*.sh
 "$DIR/bin/nivra" version
 echo "==> deployed to $DIR"
 EOF
