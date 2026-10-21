@@ -21,7 +21,9 @@ Findings:
   Pi's torch 2.6 — this closes the "untested on torch 2.6/aarch64" gap reported by the AI package work.
 * Continuing an already converged model with DiLoCo on tiny shards slightly **worsens** held-out loss
   (+1.0 % over two rounds), matching the single-machine simulation in EXPERIMENTS.md. The increase stayed
-  below the 10 % gate, so versions were accepted; the project's active generation model remains the
-  imported `nivra-small-6000` bundle unless an operator changes it.
+  below the 10 % gate, so versions were accepted. At the time, each aggregation also became the project's
+  default generation model; this was changed afterwards so a run only advances the default when the
+  default is its own previous version (an operator-chosen model such as the imported bundle is kept), and
+  the imported `nivra-small-6000` bundle was re-selected as the default.
 * Conclusion: DiLoCo is useful here for early training (run 001: 2.04 → 1.46), not for fine-tuning this
   converged baseline; larger shards, more inner steps and lower outer learning rates are the next things to test.

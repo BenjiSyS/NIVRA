@@ -194,7 +194,8 @@ func (s *Service) initRun(ctx context.Context, run *Run) error {
 			run.ID, pending, run.Config.Architecture); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1`, run.ProjectID, pending); err != nil {
+		// Only become the default generation model if none is set yet.
+		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1 AND active_model_version IS NULL`, run.ProjectID, pending); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO checkpoints (run_id, project_id, model_version, step, round, trigger, manifest, artifact_id, checksum, protected)
@@ -532,7 +533,9 @@ func (s *Service) aggregate(ctx context.Context, run *Run, ups []acceptedUpdate)
 			run.ID, pending, newRound, newStep, fmt.Sprintf("round %d aggregated (%d update(s))", run.Round, sum.AggregatedCount)); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1`, run.ProjectID, pending); err != nil {
+		// Advance the default model only if it currently is this run's previous version
+		// (an operator-chosen default, e.g. an imported better model, is kept).
+		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1 AND (active_model_version IS NULL OR active_model_version=$3)`, run.ProjectID, pending, base.ID); err != nil {
 			return err
 		}
 		metrics := map[string]any{"delta_l2": sum.DeltaL2, "aggregated": sum.AggregatedCount, "method": sum.Method}
@@ -707,7 +710,7 @@ func (s *Service) initFromBundle(ctx context.Context, run *Run, pending, vaeSHA 
 			run.ID, pending, run.Config.Architecture); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1`, run.ProjectID, pending); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1 AND active_model_version IS NULL`, run.ProjectID, pending); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO checkpoints (run_id, project_id, model_version, step, round, trigger, manifest, artifact_id, checksum, protected)
