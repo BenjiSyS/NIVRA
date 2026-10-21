@@ -138,10 +138,13 @@ func (s *Service) initRun(ctx context.Context, run *Run) error {
 		s.setStatus(ctx, run.ID, "failed", "no VAE artifact")
 		return nil
 	}
-	vaePath, _, err := s.store.Path(ctx, run.ProjectID, *run.VAEArtifact)
+	vaePath, vaeInfo, err := s.store.Path(ctx, run.ProjectID, *run.VAEArtifact)
 	if err != nil {
 		s.setStatus(ctx, run.ID, "failed", "VAE artifact unavailable")
 		return nil
+	}
+	if run.Config.InitWeightsArtifact != "" {
+		return s.initFromBundle(ctx, run, pending, vaeInfo.SHA256)
 	}
 	res, _, cleanup, err := s.runPython(ctx, "ai.init_model", run.ID,
 		map[string]any{"config": run.Config.Architecture, "seed": run.Config.Seed, "version_id": pending},
@@ -639,4 +642,66 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// initFromBundle registers an existing bundle (weights + manifest) as
+// version 0 after checking it was trained against the run's VAE.
+func (s *Service) initFromBundle(ctx context.Context, run *Run, pending, vaeSHA string) error {
+	wPath, wi, err := s.store.Path(ctx, run.ProjectID, run.Config.InitWeightsArtifact)
+	if err != nil {
+		s.setStatus(ctx, run.ID, "failed", "init_weights_artifact unavailable")
+		return nil
+	}
+	var man map[string]any
+	mPath, err := s.readJSONArtifact(ctx, run.ProjectID, run.Config.InitManifestArtifact, &man)
+	if err != nil {
+		s.setStatus(ctx, run.ID, "failed", "init_manifest_artifact unreadable")
+		return nil
+	}
+	_ = wPath
+	if got, _ := man["vae_sha256"].(string); got != vaeSHA {
+		s.setStatus(ctx, run.ID, "failed", "the bundle was trained against a different VAE than vae_artifact")
+		return nil
+	}
+	if got, _ := man["weights_sha256"].(string); got != wi.SHA256 {
+		s.setStatus(ctx, run.ID, "failed", "init weights do not match the manifest's weights_sha256")
+		return nil
+	}
+	raw, err := os.ReadFile(mPath)
+	if err != nil {
+		return err
+	}
+	paramCount, _ := man["param_count"].(float64)
+	arch, _ := man["architecture_version"].(string)
+	tokv, _ := man["tokenizer_version"].(string)
+	err = core.WithTx(ctx, s.d.DB, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO model_architectures (id, source_revision, config, tokenizer_version, parameter_count)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`, run.Config.Architecture, arch,
+			toJSON(map[string]any{"architecture_version": arch}), tokv, int64(paramCount)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO model_versions (id, project_id, run_id, architecture_id, version_number, weights_artifact, manifest_artifact, manifest)
+			VALUES ($1,$2,$3,$4,0,$5,$6,$7) ON CONFLICT (id) DO NOTHING`, pending, run.ProjectID, run.ID, run.Config.Architecture,
+			run.Config.InitWeightsArtifact, run.Config.InitManifestArtifact, raw); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE training_runs SET model_version=$2, architecture_id=$3, pending_version=NULL, status='running',
+			status_detail='initialised from bundle', current_round=0, round_batch=0, round_started_at=NULL, updated_at=now() WHERE id=$1`,
+			run.ID, pending, run.Config.Architecture); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE projects SET active_model_version=$2, updated_at=now() WHERE id=$1`, run.ProjectID, pending); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO checkpoints (run_id, project_id, model_version, step, round, trigger, manifest, artifact_id, checksum, protected)
+			VALUES ($1,$2,$3,0,0,'import',$4,$5,$6,true)`, run.ID, run.ProjectID, pending, raw, wi.ID, wi.SHA256)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	s.d.Log.Info("training run initialised from bundle", "run_id", run.ID, "project_id", run.ProjectID)
+	s.publishRun(ctx, run.ID)
+	s.Kick()
+	return nil
 }

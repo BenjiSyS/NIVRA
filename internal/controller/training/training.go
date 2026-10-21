@@ -54,6 +54,11 @@ type RunConfig struct {
 	Inner           InnerConfig `json:"inner"`
 	ReqRAMMB        int         `json:"req_ram_mb"`
 	LeaseSeconds    int         `json:"lease_seconds"`
+	// InitWeightsArtifact / InitManifestArtifact optionally seed version 0
+	// from an existing model bundle (e.g. a single-node trained checkpoint)
+	// instead of random initialisation. Both must be set together.
+	InitWeightsArtifact  string `json:"init_weights_artifact,omitempty"`
+	InitManifestArtifact string `json:"init_manifest_artifact,omitempty"`
 }
 
 // Defaults fills unset fields with conservative values sized for CPU workers.
@@ -128,6 +133,8 @@ func (c RunConfig) Validate() error {
 		return fmt.Errorf("%w: inner lr (0, 0.01]", ErrBadConfig)
 	case c.LeaseSeconds < 30 || c.LeaseSeconds > 86400:
 		return fmt.Errorf("%w: lease_seconds 30..86400", ErrBadConfig)
+	case (c.InitWeightsArtifact == "") != (c.InitManifestArtifact == ""):
+		return fmt.Errorf("%w: init_weights_artifact and init_manifest_artifact must be given together", ErrBadConfig)
 	}
 	return nil
 }
