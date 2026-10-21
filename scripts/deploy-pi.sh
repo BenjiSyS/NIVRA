@@ -16,7 +16,9 @@ SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
 SCP="scp -o BatchMode=yes -o StrictHostKeyChecking=yes"
 
 if [ "${1:-}" != "--skip-build" ]; then
-  bash scripts/build.sh --target linux/arm64
+  # --skip-web: deploy never reinstalls web dependencies; build the web UI
+  # separately (scripts/build.sh) when it changed.
+  bash scripts/build.sh --skip-web --target linux/arm64
 fi
 BIN=dist/bin/nivra-linux-arm64
 [ -x "$BIN" ] || [ -f "$BIN" ] || { echo "missing $BIN"; exit 1; }
