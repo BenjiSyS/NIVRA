@@ -1,0 +1,4 @@
+# Runtime dependencies of the Nivra AI package (in addition to PyTorch, which
+# the installer chooses per platform: CPU, or CUDA when an NVIDIA GPU exists).
+numpy>=1.26
+safetensors>=0.4
