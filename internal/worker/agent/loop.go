@@ -239,6 +239,12 @@ func (a *Agent) heartbeatLoop(ctx context.Context, cl *client.Client) error {
 
 // refreshState derives the visible state from task/pause flags.
 func (a *Agent) refreshState() {
+	a.mu.Lock()
+	terminal := a.state == StateRevoked || !a.running
+	a.mu.Unlock()
+	if terminal {
+		return // revoked/stopped states are only changed by Connect/Start
+	}
 	if t := a.currentTask(); t != nil {
 		v := t.view()
 		a.setState(StateBusy, v.JobType+" — "+v.Stage)
