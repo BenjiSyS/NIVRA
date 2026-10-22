@@ -6,7 +6,8 @@ import { api, artifactUrl, pbase } from '../api'
 import { Json } from '../components'
 import { useSession } from '../session'
 import { useLive, useRev } from '../store'
-import type { Generation, Job } from '../types'
+import { fmtParams, pickTiers } from '../../shared/modelTiers'
+import type { Generation, Job, Model } from '../types'
 
 interface GenParams {
   prompt?: string
@@ -29,21 +30,37 @@ export default function Generate() {
   const [prompt, setPrompt] = useState('')
   const [model, setModel] = useState(route.query.get('model') ?? '')
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 1_000_000))
-  const [steps, setSteps] = useState(30)
-  const [cfg, setCfg] = useState(3)
-  const [fps, setFps] = useState(8)
-  const [upscale, setUpscale] = useState(4)
+  const [fps, setFps] = useState(0)
   const [width, setWidth] = useState(0)
   const [height, setHeight] = useState(0)
   const [seconds, setSeconds] = useState(0)
-  const [sampler, setSampler] = useState('')
   const [style, setStyle] = useState('')
+  // Advanced overrides; empty = automatic.
+  const [advanced, setAdvanced] = useState(false)
+  const [steps, setSteps] = useState('')
+  const [cfg, setCfg] = useState('')
+  const [upscale, setUpscale] = useState('')
+  const [sampler, setSampler] = useState('')
 
   const models = store.models
-  const active = models.find((m) => m.active)
+  const tiers = useMemo(() => pickTiers(models, modelRank), [models])
   useEffect(() => {
-    if (!model && models.length) setModel((active ?? models[0]).id)
-  }, [model, models, active])
+    if (tiers.length && !tiers.some((t) => t.model.id === model)) {
+      // A link may name any version; otherwise start on the active model's tier.
+      const linked = models.find((m) => m.id === model)
+      setModel((linked ?? tiers.find((t) => t.model.active)?.model ?? tiers[0].model).id)
+    }
+  }, [model, models, tiers])
+  const selected = models.find((m) => m.id === model)
+  const hd = selected?.family === 'hd'
+  const auto = autoParams(hd, width, height, seconds, fps)
+  const num = (s: string) => (s.trim() === '' || !isFinite(+s) ? undefined : +s)
+  const eff = {
+    steps: num(steps) ?? auto.steps,
+    cfg: num(cfg) ?? auto.cfg,
+    upscale: hd ? undefined : num(upscale) ?? auto.upscale,
+    fps: fps || auto.fps,
+  }
 
   const longs = useAsync(async () => (await api.get<{ videos: LongVideo[] | null }>(`${pbase(pid)}/long-videos`)).videos ?? [], [pid], 5000)
   const gens = useAsync(async () => (await api.get<{ generations: Generation[] | null }>(`${pbase(pid)}/generations`)).generations ?? [], [pid], 6000)
@@ -72,7 +89,11 @@ export default function Generate() {
 
   const submit = async () => {
     const r = await run(
-      () => api.post<{ job_id: string; generation_id?: string; segments?: number }>(`${pbase(pid)}/generate`, { prompt: prompt.trim(), seed, steps, cfg_scale: cfg, fps, upscale, model_version: model || undefined, width: width || undefined, height: height || undefined, seconds: seconds || undefined, sampler: sampler || undefined, style: style || undefined }),
+      () => api.post<{ job_id: string; generation_id?: string; segments?: number }>(`${pbase(pid)}/generate`, {
+        prompt: prompt.trim(), seed, steps: eff.steps, cfg_scale: eff.cfg, fps: eff.fps, upscale: eff.upscale, model_version: model || undefined,
+        width: (hd && width) || undefined, height: (hd && height) || undefined, seconds: (hd && seconds) || undefined,
+        sampler: (hd && sampler) || undefined, style: (hd && style) || undefined,
+      }),
       'Generation queued',
     )
     if (r) {
@@ -97,11 +118,12 @@ export default function Generate() {
           {(id) => <input id={id} className="input" disabled placeholder="Not supported yet" />}
         </Field>
         <div className="form-grid">
-          <Field label="Model version">
+          <Field label="Model" hint={selected ? `${selected.run_name ?? 'imported'} v${selected.version_number}` : undefined}>
             {(id) => (
               <select id={id} className="input" value={model} onChange={(e) => setModel(e.target.value)} disabled={models.length === 0}>
                 {models.length === 0 && <option value="">No model yet</option>}
-                {models.map((m) => <option key={m.id} value={m.id}>v{m.version_number}{m.run_name ? ` · ${m.run_name}` : ''}{m.active ? ' (active)' : ''}</option>)}
+                {tiers.map(({ tier, model: m }) => <option key={m.id} value={m.id}>{tier}{m.parameter_count ? ` · ${fmtParams(m.parameter_count)} parameters` : ''}{m.family === 'hd' ? ' · HD' : ''}</option>)}
+                {selected && !tiers.some((t) => t.model.id === selected.id) && <option value={selected.id}>v{selected.version_number}{selected.run_name ? ` · ${selected.run_name}` : ''}</option>}
               </select>
             )}
           </Field>
@@ -113,16 +135,26 @@ export default function Generate() {
               </div>
             )}
           </Field>
-          <Field label="Steps" hint="1 to 200">{(id) => <input id={id} className="input" type="number" min={1} max={200} value={steps} onChange={(e) => setSteps(+e.target.value || 1)} />}</Field>
-          <Field label="Guidance (cfg)" hint="0 to 20">{(id) => <input id={id} className="input" type="number" min={0} max={20} step={0.5} value={cfg} onChange={(e) => setCfg(+e.target.value)} />}</Field>
-          <Field label="Frames per second" hint="1 to 60">{(id) => <input id={id} className="input" type="number" min={1} max={60} value={fps} onChange={(e) => setFps(+e.target.value || 1)} />}</Field>
-          <Field label="Upscale" hint="Small models only: pixel scale 1 to 8">{(id) => <input id={id} className="input" type="number" min={1} max={8} value={upscale} onChange={(e) => setUpscale(+e.target.value || 1)} />}</Field>
-          <Field label="Width (HD)" hint="HD models: 0 = model default (1280)">{(id) => <input id={id} className="input" type="number" min={0} max={2560} step={16} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
-          <Field label="Height (HD)" hint="HD models: 0 = model default (720)">{(id) => <input id={id} className="input" type="number" min={0} max={1440} step={16} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
-          <Field label="Seconds (HD)" hint="0 = model default (8); longer = segments rendered in parallel by all workers (max 1800 = 30 minutes)">{(id) => <input id={id} className="input" type="number" min={0} max={1800} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
-          <Field label="Sampler (HD)" hint="ab2 needs fewer steps">{(id) => <select id={id} className="input" value={sampler} onChange={(e) => setSampler(e.target.value)}><option value="">default</option><option value="ab2">ab2</option><option value="euler">euler</option></select>}</Field>
-          <Field label="Style (HD)" hint="empty = model default; none = no style tag">{(id) => <select id={id} className="input" value={style} onChange={(e) => setStyle(e.target.value)}><option value="">default</option>{['anime', '3d animation', 'cartoon', '2d animation', 'cel-shaded 3d', 'pixel art', 'claymation', 'painterly', 'realistic', 'none'].map((s) => <option key={s} value={s}>{s}</option>)}</select>}</Field>
+          <Field label="Width" hint={hd ? '0 = model default (1280)' : `0 = ${SMALL_SIZE * 4}; the small model draws ${SMALL_SIZE}px and scales up`}>{(id) => <input id={id} className="input" type="number" min={0} max={2560} step={16} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
+          <Field label="Height" hint={hd ? '0 = model default (720)' : '0 = same as width'}>{(id) => <input id={id} className="input" type="number" min={0} max={1440} step={16} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
+          <Field label="Seconds" hint={hd ? '0 = model default (8); longer = segments rendered in parallel (max 1800)' : `the small model makes ${SMALL_FRAMES} frames; 0 = ${SMALL_FRAMES / 8} s`}>{(id) => <input id={id} className="input" type="number" min={0} max={hd ? 1800 : SMALL_FRAMES} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
+          <Field label="Frames per second" hint="0 = automatic">{(id) => <input id={id} className="input" type="number" min={0} max={60} value={fps} onChange={(e) => setFps(Math.max(0, Math.min(60, Math.floor(+e.target.value || 0))))} />}</Field>
+          {hd && <Field label="Style" hint="empty = model default; none = no style tag">{(id) => <select id={id} className="input" value={style} onChange={(e) => setStyle(e.target.value)}><option value="">default</option>{['anime', '3d animation', 'cartoon', '2d animation', 'cel-shaded 3d', 'pixel art', 'claymation', 'painterly', 'realistic', 'none'].map((s) => <option key={s} value={s}>{s}</option>)}</select>}</Field>}
         </div>
+        <div className="row">
+          <span className="dim">
+            Automatic: {eff.steps ?? 'model default'} steps · cfg {eff.cfg ?? 'model default'}{eff.upscale ? ` · ×${eff.upscale} upscale (${auto.outW}×${auto.outH})` : ''}{eff.fps ? ` · ${eff.fps} fps` : ''}
+          </span>
+          <button type="button" className="btn sm ghost" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>{advanced ? 'Hide advanced' : 'Advanced'}</button>
+        </div>
+        {advanced && (
+          <div className="form-grid">
+            <Field label="Steps" hint="empty = automatic">{(id) => <input id={id} className="input" type="number" min={1} max={200} placeholder={String(auto.steps ?? 'model default')} value={steps} onChange={(e) => setSteps(e.target.value)} />}</Field>
+            <Field label="Guidance (cfg)" hint="empty = automatic">{(id) => <input id={id} className="input" type="number" min={0} max={20} step={0.5} placeholder={String(auto.cfg ?? 'model default')} value={cfg} onChange={(e) => setCfg(e.target.value)} />}</Field>
+            {!hd && <Field label="Upscale" hint="empty = from width and height">{(id) => <input id={id} className="input" type="number" min={1} max={8} placeholder={String(auto.upscale)} value={upscale} onChange={(e) => setUpscale(e.target.value)} />}</Field>}
+            {hd && <Field label="Sampler" hint="ab2 needs fewer steps">{(id) => <select id={id} className="input" value={sampler} onChange={(e) => setSampler(e.target.value)}><option value="">default</option><option value="ab2">ab2</option><option value="euler">euler</option></select>}</Field>}
+          </div>
+        )}
         <div className="row">
           <button className="btn primary" disabled={!can('operator') || busy || !prompt.trim() || !model}>Generate</button>
           {models.length === 0 && store.loaded && <span className="dim">Train a model first on the <a href={href('training')}>Training</a> page.</span>}
@@ -213,7 +245,7 @@ function GenCard({ g, pid, now }: { g: Generation; pid: string; now: number }) {
       </div>
       <div style={{ overflowWrap: 'anywhere' }}><strong>{p.prompt ?? '(no prompt)'}</strong></div>
       <div className="dim">
-        seed {p.seed ?? '–'} · {p.steps ?? 30} steps · cfg {p.cfg_scale ?? 3} · {p.fps ?? 8} fps · ×{p.upscale ?? 4}
+        seed {p.seed ?? '–'} · {p.steps ?? 'auto'} steps · cfg {p.cfg_scale ?? 'auto'} · {p.fps ?? 'auto'} fps{p.upscale ? ` · ×${p.upscale}` : ''}
       </div>
       {inFlight && (
         <div>
@@ -242,6 +274,29 @@ function GenCard({ g, pid, now }: { g: Generation; pid: string; now: number }) {
       ) : null}
     </div>
   )
+}
+
+// The small model draws SMALL_FRAMES frames of SMALL_SIZE x SMALL_SIZE pixels (ai/configs/nivra_small.json).
+const SMALL_SIZE = 64
+const SMALL_FRAMES = 16
+
+// Active model first, then the newest verified version.
+function modelRank(m: Model): number {
+  if (m.active) return -Infinity
+  if (m.verification_state !== 'verified') return Infinity
+  return -Date.parse(m.created_at)
+}
+
+// autoParams picks steps, guidance and upscale from the requested size and length.
+// HD models keep the steps and guidance their manifest was tuned for (undefined =
+// model default); the small model scales its fixed 64px clip up to the requested
+// size and stretches its 16 frames over the requested seconds.
+function autoParams(hd: boolean, width: number, height: number, seconds: number, fps: number) {
+  if (hd) return { steps: undefined, cfg: undefined, upscale: undefined, fps: undefined, outW: 0, outH: 0 }
+  const side = Math.max(width, height)
+  const upscale = side > 0 ? Math.min(8, Math.max(1, Math.ceil(side / SMALL_SIZE))) : 4
+  const autoFps = fps ? undefined : seconds > 0 ? Math.min(60, Math.max(1, Math.round(SMALL_FRAMES / seconds))) : 8
+  return { steps: 30, cfg: 3, upscale, fps: autoFps, outW: SMALL_SIZE * upscale, outH: SMALL_SIZE * upscale }
 }
 
 interface LongVideo {

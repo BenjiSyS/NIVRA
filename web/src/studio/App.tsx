@@ -290,21 +290,19 @@ function ProjectPicker(props: { user: User; projects: Project[]; onPick: (id: st
   )
 }
 
-const NAV: { id: string; label: string; min?: Role }[] = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'workers', label: 'Workers' },
-  { id: 'queue', label: 'Queue' },
-  { id: 'training', label: 'Training' },
-  { id: 'experiments', label: 'Experiments' },
-  { id: 'checkpoints', label: 'Checkpoints' },
-  { id: 'models', label: 'Models' },
-  { id: 'generate', label: 'Generate' },
-  { id: 'datasets', label: 'Datasets' },
-  { id: 'contributions', label: 'Contributions' },
-  { id: 'storage', label: 'Storage', min: 'operator' },
-  { id: 'users', label: 'People', min: 'admin' },
-  { id: 'logs', label: 'Logs' },
-  { id: 'settings', label: 'Settings' },
+interface NavPage { id: string; label: string; min?: Role }
+
+// Six sections in the side menu; related pages are tabs inside a section.
+const NAV: { label: string; pages: NavPage[] }[] = [
+  { label: 'Overview', pages: [{ id: 'overview', label: 'Overview' }] },
+  { label: 'Generate', pages: [{ id: 'generate', label: 'Generate' }] },
+  { label: 'Training', pages: [{ id: 'training', label: 'Runs' }, { id: 'datasets', label: 'Datasets' }, { id: 'contributions', label: 'Contributions' }] },
+  { label: 'Models', pages: [{ id: 'models', label: 'Models' }, { id: 'checkpoints', label: 'Checkpoints' }, { id: 'experiments', label: 'Experiments' }] },
+  { label: 'Workers', pages: [{ id: 'workers', label: 'Workers' }, { id: 'queue', label: 'Queue' }, { id: 'logs', label: 'Logs' }] },
+  {
+    label: 'Settings',
+    pages: [{ id: 'settings', label: 'Settings' }, { id: 'users', label: 'People', min: 'admin' }, { id: 'storage', label: 'Storage', min: 'operator' }],
+  },
 ]
 
 function Shell() {
@@ -313,6 +311,8 @@ function Shell() {
   const route = useRoute()
   const page = route.segments[0] ?? 'overview'
   const mainRef = useRef<HTMLElement>(null)
+  const sections = NAV.map((s) => ({ ...s, pages: s.pages.filter((p) => !p.min || can(p.min)) })).filter((s) => s.pages.length > 0)
+  const section = sections.find((s) => s.pages.some((p) => p.id === page))
 
   useEffect(() => {
     const s = new LiveStore(pid)
@@ -368,14 +368,26 @@ function Shell() {
       <div className="app">
         <Header />
         <nav className="side" aria-label="Main">
-          {NAV.filter((n) => !n.min || can(n.min)).map((n) => (
-            <a key={n.id} href={href(n.id)} className={'navlink' + (page === n.id ? ' active' : '')} aria-current={page === n.id ? 'page' : undefined}>
-              {n.label}
-            </a>
-          ))}
+          {sections.map((s) => {
+            const on = s === section
+            return (
+              <a key={s.label} href={href(s.pages[0].id)} className={'navlink' + (on ? ' active' : '')} aria-current={on ? 'page' : undefined}>
+                {s.label}
+              </a>
+            )
+          })}
         </nav>
         <main className="content" id="main" tabIndex={-1} ref={mainRef}>
           <LoadBanner />
+          {section && section.pages.length > 1 && (
+            <nav className="tabs" aria-label={section.label} style={{ marginBottom: 14 }}>
+              {section.pages.map((p) => (
+                <a key={p.id} href={href(p.id)} className="tab" aria-selected={p.id === page} aria-current={p.id === page ? 'page' : undefined} style={{ textDecoration: 'none' }}>
+                  {p.label}
+                </a>
+              ))}
+            </nav>
+          )}
           <Suspense
             fallback={
               <div className="center-screen" style={{ minHeight: 200 }}>

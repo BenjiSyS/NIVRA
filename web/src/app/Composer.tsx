@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { fmtParams, pickTiers } from '../shared/modelTiers'
 import type { AppModel, GenerateRequest, HistoryItem } from './api'
 import { estimateSeconds, fmtDuration, fmtLength, LIMITS, LONG_CONFIRM_SECONDS, parseFps, parseLength, parsePrompt, resolutionById, RESOLUTIONS, segmentPlan, type Prefs } from './prefs'
 
@@ -283,8 +284,10 @@ export function Composer(props: {
             disabled={models.length === 0}
           >
             {models.length === 0 && <option value="">No models found yet</option>}
-            {models.map((m) => (
+            {pickTiers(models, (m) => (m.id === modelId ? -2 : m.id === bestModel(models)?.id ? -1 : models.indexOf(m))).map(({ tier, model: m }) => (
               <option key={m.id} value={m.id}>
+                {tier}
+                {m.parameter_count ? ` · ${fmtParams(m.parameter_count)} · ` : ' · '}
                 {modelLabel(m)}
                 {m.family === 'hd' ? ' (HD)' : ' (small research model)'}
                 {m.source === 'local' ? ' – this computer' : ' – network'}
