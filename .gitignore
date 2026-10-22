@@ -44,3 +44,9 @@ Thumbs.db
 .idea/
 .vscode/
 /logs/
+
+# transcribe/: only the tool itself is tracked, never videos or captions
+/transcribe/*
+!/transcribe/transcribe.py
+!/transcribe/Transcribe.bat
+!/transcribe/README.md
