@@ -64,7 +64,8 @@ def test_vae_overfit_and_export(tmp_path):
     assert res["status"] == "done" and len(losses) == 40
     assert np.mean(losses[-5:]) < 0.6 * np.mean(losses[:5])
     assert (tmp_path / "run" / "hc_vae" / "hc_vae.json").is_file()
-    assert res["latent_norm"]["latent_scale"] > 0
+    ls = res["latent_norm"]["latent_scale"]              # per-channel list with the shipped tiny config
+    assert (min(ls) if isinstance(ls, list) else ls) > 0
 
 
 def test_dit_overfit_progressive_on_videos(tmp_path):

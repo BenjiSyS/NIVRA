@@ -208,7 +208,9 @@ def _cmd_data_ingest(a):
                          scene_threshold=None if a.no_scenes else ("auto" if a.scene_threshold is None else a.scene_threshold),
                          profile=a.profile, default_style=a.default_style, shard_bytes=a.shard_mb * 1024 * 1024,
                          val_fraction=a.val_fraction, dedup_bits=a.dedup_bits, allow_upscale=a.allow_upscale,
-                         default_lang=a.default_lang, overwrite=a.overwrite)
+                         default_lang=a.default_lang, overwrite=a.overwrite,
+                         detect_holds=False if a.no_detect_holds else None,
+                         drawing_rate_sampling=a.drawing_rate_sampling)
     try:
         s = ingest_folder(a.input, a.output, opts)
     except IngestError as e:
@@ -226,8 +228,20 @@ def _cmd_caption(a):
         except Exception:
             pass
     opts = runner.Options(style=a.style, subtitles=a.subtitles, frames=a.frames, device=a.device,
-                          overwrite=a.overwrite, model=a.model, limit=a.limit)
+                          overwrite=a.overwrite, model=a.model, limit=a.limit, captioner=a.captioner,
+                          write_json=a.json)
     return runner.run(Path(a.path), opts)
+
+
+def _cmd_text_encoder_fetch(a):
+    from .text import fetch
+    try:
+        d = fetch.fetch(a.name, Path(a.out) if a.out else None)
+    except fetch.FetchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps({"name": a.name, "dir": str(d), "use": f"external:{d}"}))
+    return 0
 
 
 def _cmd_data_inspect(a):
@@ -243,8 +257,10 @@ def _cmd_train_pipeline(a):
     setup_runtime()
     keys = ("config", "videos", "dataset", "bucket", "profile", "default_style", "fps", "max_clips", "val_fraction", "vocab_size",
             "text_steps", "vae_steps", "dit_steps", "seed", "device", "style_dropout", "name", "install_dir", "bundle_out",
-            "from_stage", "to_stage", "force", "save_every")
+            "from_stage", "to_stage", "force", "save_every", "drawing_rate_sampling")
     opts = PipelineOptions(out=a.out, **{k: getattr(a, k) for k in keys if getattr(a, k, None) is not None})
+    if getattr(a, "no_detect_holds", False):
+        opts.detect_holds = False
     try:
         pipe = Pipeline(opts)
         if a.plan_only:
@@ -264,8 +280,8 @@ def _cmd_export_hd_bundle(a):
     a.videos, a.dataset = None, a.dataset
     a.from_stage = a.to_stage = "bundle"
     for k in ("bucket", "profile", "default_style", "fps", "max_clips", "val_fraction", "vocab_size", "text_steps", "vae_steps",
-              "dit_steps", "seed", "device", "style_dropout", "save_every", "force", "plan_only"):
-        setattr(a, k, None if k not in ("force", "plan_only") else False)
+              "dit_steps", "seed", "device", "style_dropout", "save_every", "force", "plan_only", "drawing_rate_sampling", "no_detect_holds"):
+        setattr(a, k, None if k not in ("force", "plan_only", "drawing_rate_sampling", "no_detect_holds") else False)
     return _cmd_train_pipeline(a)
 
 
@@ -398,6 +414,9 @@ def build_parser():
     s.add_argument("--allow-upscale", action="store_true")
     s.add_argument("--default-lang", default="und")
     s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--no-detect-holds", action="store_true", help="do not detect held (repeated) frames; the stylized profile detects them by default")
+    s.add_argument("--drawing-rate-sampling", action="store_true",
+                   help="stylized: sample at the drawing rate (hold-aware); needs hold detection")
     s.set_defaults(fn=_cmd_data_ingest)
 
     s = sub.add_parser("data-inspect", help="summarise and verify an ingested dataset")
@@ -430,6 +449,10 @@ def build_parser():
     s.add_argument("--from-stage", default="ingest", choices=["ingest", "tokenizer", "text", "vae", "latents", "dit", "bundle"])
     s.add_argument("--to-stage", default="bundle", choices=["ingest", "tokenizer", "text", "vae", "latents", "dit", "bundle"])
     s.add_argument("--save-every", type=int, help="checkpoint every N steps in the vae/dit stages")
+    s.add_argument("--no-detect-holds", action="store_true", help="ingest: do not detect held frames")
+    s.add_argument("--drawing-rate-sampling", action="store_true",
+                   help="ingest: sample at the drawing rate (hold-aware)")
+
     s.add_argument("--force", action="store_true", help="re-run the selected stages even if their markers match")
     s.add_argument("--plan-only", action="store_true", help="print the plan with time estimates and exit")
     s.set_defaults(fn=_cmd_train_pipeline)
@@ -452,8 +475,20 @@ def build_parser():
     s.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     s.add_argument("--overwrite", action="store_true", help="replace existing .txt captions")
     s.add_argument("--limit", type=int, default=None, help="caption at most N videos that still need captions (re-run to continue)")
-    s.add_argument("--model", default=None, help="Florence-2 model id or local directory (default: florence-community/Florence-2-large)")
+    s.add_argument("--captioner", default="auto", choices=["auto", "florence", "qwen3vl"],
+                   help="florence = Florence-2 (MIT, per-frame captions, CPU friendly); qwen3vl = Qwen3-VL-2B-Instruct "
+                        "(Apache-2.0, multi-frame, short + dense motion-aware caption); auto = qwen3vl on CUDA, florence otherwise")
+    s.add_argument("--json", action="store_true", help="qwen3vl: also write <name>.json with the structured fields")
+    s.add_argument("--model", default=None, help="model id or local directory of the chosen captioner (defaults: "
+                   "florence-community/Florence-2-large, Qwen/Qwen3-VL-2B-Instruct; Qwen/Qwen3-VL-4B-Instruct for more detail)")
     s.set_defaults(fn=_cmd_caption)
+
+    from .text.fetch import CATALOG as _TE_CATALOG
+    s = sub.add_parser("text-encoder-fetch", help="download a licensed external text encoder (once, only when you run this) "
+                       "and write its NIVRA_LICENSE.json")
+    s.add_argument("--name", required=True, choices=sorted(_TE_CATALOG))
+    s.add_argument("--out", default=None, help="target directory (default: $NIVRA_TEXT_ENCODER_DIR/<name> or <models dir>/text/<name>)")
+    s.set_defaults(fn=_cmd_text_encoder_fetch)
     return p
 
 

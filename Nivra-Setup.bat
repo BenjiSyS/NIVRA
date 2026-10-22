@@ -22,7 +22,7 @@ rem ======================================================================
 setlocal EnableExtensions
 
 rem ---- Set this to the GitHub repository that publishes the releases (owner/name). ----
-set "REPO=OWNER/nivra"
+set "REPO=BenjiSyS/NIVRA"
 if defined NIVRA_REPO set "REPO=%NIVRA_REPO%"
 if /I "%REPO%"=="OWNER/nivra" (
   echo !! No repository configured. Run:  set NIVRA_REPO=owner/name ^& Nivra-Setup.bat
@@ -215,6 +215,12 @@ try {
   Say "Nivra $tag unpacked into $dest"
 } catch {
   Write-Host ''
+  if ("$($_.Exception.Message)" -match '\(404\)') {
+    # No release published yet: not an error, the source build is the normal path then.
+    Say "No release package published for $repo yet"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+    exit 10
+  }
   Warn "Release download failed: $($_.Exception.Message)"
   Write-Host '   If you are behind a proxy, set HTTPS_PROXY (for example  set HTTPS_PROXY=http://proxy:8080)  and run this again.'
   Write-Host '   Antivirus or a firewall can block the download or quarantine Nivra.exe: allow the file or the folder, then retry.'

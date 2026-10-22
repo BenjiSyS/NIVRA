@@ -148,7 +148,8 @@ def validate_hd_update(update_path, manifest_path, base_manifest: dict, *, expec
     if sha256_file(p) != str(m["update_sha256"]).lower():
         return fail("checksum_mismatch", "update file sha256 differs from its manifest")
     exp_base = expected_base_version_id or expected.get("base_version_id") or base_manifest["version_id"]
-    if m.get("base_version_id") in set(allowed_stale_base_ids) and m.get("base_version_id") != exp_base:
+    stale_ok = m.get("base_version_id") in set(allowed_stale_base_ids) and m.get("base_version_id") != exp_base
+    if stale_ok:
         exp_base = m["base_version_id"]
     if m.get("base_version_id") != exp_base:
         v.reasons.append(("stale_base_version", f"update base {m.get('base_version_id')} != current {exp_base}"))
@@ -159,6 +160,8 @@ def validate_hd_update(update_path, manifest_path, base_manifest: dict, *, expec
         v.reasons.append(("manifest_mismatch", f"delta_dtype {m.get('delta_dtype')!r} != {want_dtype!r}"))
     exp = {k: val for k, val in expected.items() if k in EXPECT_KEYS}
     exp.setdefault("base_version_id", exp_base)
+    if stale_ok:
+        exp["base_version_id"] = exp_base
     v.reasons.extend(check_echo(m, exp))
     if steps <= 0 or lr_ <= 0:
         v.reasons.append(("manifest_mismatch", "inner_steps and lr are required to bound the update"))

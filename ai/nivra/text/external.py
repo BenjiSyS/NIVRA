@@ -118,9 +118,9 @@ class TransformersBackend:
         cfg = transformers.AutoConfig.from_pretrained(str(directory), **kw)
         cls_name = {"t5": "T5EncoderModel", "umt5": "UMT5EncoderModel", "mt5": "MT5EncoderModel"}.get(cfg.model_type)
         if cls_name and hasattr(transformers, cls_name):
-            model = getattr(transformers, cls_name).from_pretrained(str(directory), torch_dtype=dtype, **kw)
+            model = getattr(transformers, cls_name).from_pretrained(str(directory), dtype=dtype, **kw)
         else:
-            model = transformers.AutoModel.from_pretrained(str(directory), torch_dtype=dtype, **kw)
+            model = transformers.AutoModel.from_pretrained(str(directory), dtype=dtype, **kw)
             if hasattr(model, "get_encoder"):
                 model = model.get_encoder()
         self.model = model.eval().to(device)

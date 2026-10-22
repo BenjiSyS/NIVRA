@@ -15,6 +15,7 @@ type Python struct {
 	AIDir       string
 	FFmpeg      string // configured ffmpeg path ("" = auto)
 	JobTypes    []string
+	StateDir    string // persistent per-worker state (NIVRA_STATE_DIR)
 }
 
 // Types implements Executor.
@@ -36,7 +37,7 @@ func (p *Python) Run(ctx context.Context, t *Task, r Reporter) (*Output, error) 
 	for k, v := range t.Inputs {
 		inputs[k] = v
 	}
-	run := &pyexec.Runner{Interpreter: p.Interpreter, AIDir: p.AIDir, FFmpeg: p.FFmpeg, Threads: t.Threads, Device: device}
+	run := &pyexec.Runner{Interpreter: p.Interpreter, AIDir: p.AIDir, FFmpeg: p.FFmpeg, Threads: t.Threads, Device: device, StateDir: p.StateDir}
 	res, err := run.Run(ctx, t.WorkDir, pyexec.Job{JobType: t.Assignment.JobType, JobID: t.Assignment.JobID,
 		AttemptID: t.Assignment.AttemptID, Params: t.Assignment.Params, Inputs: inputs,
 		Limits: map[string]int64{"max_ram_mb": t.RAMMB, "max_vram_mb": t.VRAMMB}}, reporterAdapter{r})

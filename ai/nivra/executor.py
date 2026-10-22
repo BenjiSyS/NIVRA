@@ -241,9 +241,10 @@ SCHEMAS = {
         params={"dataset_id": S(None, maxlen=128), "target_dataset_id": S(None, maxlen=128), "shard_idx": I(0, min=0),
                 "shard_sha256": S(req=True, minlen=64, maxlen=64), "latent": S("mean", choices=["mean"]),
                 "stage": STAGE_SPEC,
-                "style_dropout": F(0.1, min=0.0, max=1.0), "seed": I(0, min=0), "audit": B(False)},
-        inputs={"raw_shard": True, "vae_weights": True, "vae_manifest": True, "text_encoder_weights": True,
-                "tokenizer": True}),
+                "style_dropout": F(0.1, min=0.0, max=1.0), "seed": I(0, min=0), "audit": B(False),
+                "text_encoder_spec": S(None, maxlen=256)},
+        inputs={"raw_shard": True, "vae_weights": True, "vae_manifest": True, "text_encoder_weights": False,
+                "tokenizer": False}),
     "ai.hd_train": dict(
         params={"update_id": S(req=True, minlen=1, maxlen=128), "run_id": S(None, maxlen=128), "round": I(0, min=0),
                 "round_batch": I(0, min=0), "base_version_id": S(None, maxlen=128), "target": S("dit", choices=["dit", "vae"]),
@@ -255,7 +256,7 @@ SCHEMAS = {
                 "grad_clip": F(1.0, min=0.0, max=100.0), "cfg_dropout": F(0.1, min=0.0, max=1.0), "seed": I(0, min=0),
                 "shards": {"type": "objlist", "default": None, "maxlen": 64,
                            "schema": {"artifact_id": S(req=True, maxlen=128), "sha256": S(req=True, minlen=64, maxlen=64)}},
-                "delta_dtype": S("float16", choices=["float16"])},
+                "delta_dtype": S("float16", choices=["float16", "int8"])},
         inputs={"base_train_weights": True, "base_manifest": True}, input_regex=r"data_shard_\d{3,}"),
     "ai.hd_eval": dict(
         params={"version_id": S(None, maxlen=128), "triples_seed": I(0), "n": I(8, min=1, max=256),
@@ -268,7 +269,11 @@ SCHEMAS = {
                 "eval_gate": S("off", choices=["pi", "worker", "off"]), "eval_triples_seed": I(0),
                 "aggregation": S("auto", choices=["auto", "mean", "trimmed_mean"]), "trim_ratio": F(0.2, min=0.0, max=0.45),
                 "max_norm_ratio": F(5.0, min=1.0), "max_rel_norm": F(0.5, exclusive_min=0.0),
-                "clip_factor": F(2.0, exclusive_min=0.0), "eval_n": I(8, min=1, max=64), "eval_buckets": I(4, min=1, max=64)},
+                "clip_factor": F(2.0, exclusive_min=0.0), "eval_n": I(8, min=1, max=64), "eval_buckets": I(4, min=1, max=64),
+                "delta_dtype": S("float16", choices=["float16", "int8"]), "weight_by_samples": B(True),
+                "max_staleness": I(0, min=0, max=1), "staleness_discount": F(0.5, exclusive_min=0.0, max=1.0),
+                "outer_lr_warmup_rounds": I(0, min=0, max=10000),
+                "outer_lr_warmup_start": F(0.3, exclusive_min=0.0, max=1.0)},
         inputs={"base_weights": True, "base_manifest": True, "outer_state": False, "updates": True, "eval_latents": False}),
 }
 
@@ -665,7 +670,7 @@ def h_refine_segment(ctx: Ctx, p: dict) -> dict:
     ctx.em.artifact("segment_video", mp4)
     keys = ("frames", "width", "height", "strength", "steps", "seconds_load", "seconds_text", "seconds_encode",
             "seconds_sampling", "seconds_decode", "seconds_total", "peak_rss_mb", "cuda_max_allocated_mb",
-            "model_version_id", "sampler", "style")
+            "model_version_id", "sampler", "style", "conditioning")
     s = {k: meta[k] for k in keys if k in meta}
     s["index"] = p["index"]
     return s
@@ -805,7 +810,10 @@ def _role_inputs(ctx: Ctx, prefix: str) -> dict:
 
 def h_hd_encode(ctx: Ctx, p: dict) -> dict:
     from .distributed.hd.encode_job import EncodeInputError, hd_encode_job
-    ins = {k: str(ctx.path(k)) for k in ("raw_shard", "vae_weights", "vae_manifest", "text_encoder_weights", "tokenizer")}
+    ins = {k: str(ctx.path(k)) for k in ("raw_shard", "vae_weights", "vae_manifest")}
+    for k in ("text_encoder_weights", "tokenizer"):          # optional when params.text_encoder_spec names a local encoder
+        if k in ctx.inputs:
+            ins[k] = str(ctx.path(k))
     try:
         s = hd_encode_job(ins, p, ctx.out, device=_device(),
                           on_progress=lambda i, n: (ctx.check_stop(), ctx.em.progress("encode", i / max(1, n), i, n)))
@@ -813,6 +821,18 @@ def h_hd_encode(ctx: Ctx, p: dict) -> dict:
         raise InputInvalid(str(e))
     ctx.em.artifact("latent_shard", Path(s.pop("path")))
     return s
+
+
+def _state_dir(ctx: Ctx):
+    """Persistent worker state (int8 error-feedback residual): NIVRA_STATE_DIR, else <data dir>/state when the job
+    runs in <data dir>/work/<attempt>, else None (no error feedback)."""
+    env = os.environ.get("NIVRA_STATE_DIR")
+    if env:
+        return Path(env)
+    wd = ctx.workdir.resolve()
+    if wd.parent.name == "work":
+        return wd.parent.parent / "state"
+    return None
 
 
 def h_hd_train(ctx: Ctx, p: dict) -> dict:
@@ -824,7 +844,7 @@ def h_hd_train(ctx: Ctx, p: dict) -> dict:
     ins.update(_role_inputs(ctx, "data_shard_"))
     try:
         s = hd_train_job(ins, p, ctx.out, attempt_id=ctx.job.get("attempt_id") or "", device=_device(),
-                         should_stop=ctx.should_stop,
+                         should_stop=ctx.should_stop, state_dir=_state_dir(ctx),
                          on_metric=lambda n, v, st: (ctx.em.metric(n, v, st),
                                                      ctx.em.progress("train", st / p["inner_steps"], st, p["inner_steps"])))
     except TrainInputError as e:
@@ -880,7 +900,9 @@ def h_hd_aggregate(ctx: Ctx, p: dict) -> dict:
                          version_id=p["version_id"], eval_gate=p["eval_gate"],
                          eval_latents=_paths(ctx, "eval_latents", ev) if ev else None,
                          eval_triples_seed=p["eval_triples_seed"], eval_n=p["eval_n"], eval_buckets=p["eval_buckets"],
-                         should_stop=ctx.should_stop)
+                         should_stop=ctx.should_stop, delta_dtype=p["delta_dtype"], weight_by_samples=p["weight_by_samples"],
+                         max_staleness=p["max_staleness"], staleness_discount=p["staleness_discount"],
+                         outer_lr_warmup_rounds=p["outer_lr_warmup_rounds"], outer_lr_warmup_start=p["outer_lr_warmup_start"])
     except InterruptedError:
         raise JobStopped("stopped")
     except (AggregateError, ver.VersionError, OSError) as e:

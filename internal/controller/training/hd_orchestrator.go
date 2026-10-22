@@ -56,7 +56,7 @@ type HDFields struct {
 	VAEVersionID   string     `json:"vae_version_id,omitempty"`
 	TextEncoderID  string     `json:"text_encoder_id,omitempty"`
 	ShardsPerJob   int        `json:"shards_per_job,omitempty"`
-	DeltaDtype     string     `json:"delta_dtype,omitempty"`
+	DeltaDtype     string     `json:"delta_dtype,omitempty"` // "float16" (default) | "int8" (per-row scales, error feedback on the worker)
 	ReqVRAMMB      int        `json:"req_vram_mb,omitempty"`
 	AllowCPU       bool       `json:"allow_cpu,omitempty"` // GPU-less workers may take train/eval jobs (tiny configs, smoke tests; req_vram_mb may be 0)
 	EvalGate       string     `json:"eval_gate,omitempty"` // pi | worker | off
@@ -64,6 +64,10 @@ type HDFields struct {
 	BoundC         float64    `json:"bound_c,omitempty"`
 	RedundancyFrac float64    `json:"redundancy_frac,omitempty"`
 	Retention      *Retention `json:"retention,omitempty"`
+	// OuterLRWarmupRounds ramps the outer learning rate linearly from OuterLRWarmupStart x outer_lr (round 0) to outer_lr
+	// over this many rounds (0 = off). Start defaults to 0.3 when a warm-up is configured.
+	OuterLRWarmupRounds int     `json:"outer_lr_warmup_rounds,omitempty"`
+	OuterLRWarmupStart  float64 `json:"outer_lr_warmup_start,omitempty"`
 	// InitVersionID is the imported model version (nivra model import) that
 	// becomes version 0 of the run.
 	InitVersionID string `json:"init_version_id,omitempty"`
@@ -129,6 +133,9 @@ func (c *RunConfig) hdDefaults() {
 	if c.BoundC == 0 {
 		c.BoundC = 3
 	}
+	if c.OuterLRWarmupRounds > 0 && c.OuterLRWarmupStart == 0 {
+		c.OuterLRWarmupStart = 0.3
+	}
 	if c.LeaseSeconds == 0 {
 		c.LeaseSeconds = 900
 	}
@@ -172,8 +179,14 @@ func (c RunConfig) validateHD() error {
 		return bad("init_version_id (an imported model version) is required")
 	case c.ShardsPerJob < 1 || c.ShardsPerJob > 64:
 		return bad("shards_per_job 1..64")
-	case c.DeltaDtype != "float16":
-		return bad("delta_dtype must be float16")
+	case c.DeltaDtype != "float16" && c.DeltaDtype != "int8":
+		return bad("delta_dtype must be float16 or int8")
+	case c.OuterLRWarmupRounds < 0 || c.OuterLRWarmupRounds > 10000:
+		return bad("outer_lr_warmup_rounds 0..10000")
+	case c.OuterLRWarmupRounds > 0 && !(c.OuterLRWarmupStart > 0 && c.OuterLRWarmupStart <= 1):
+		return bad("outer_lr_warmup_start (0, 1]")
+	case c.OuterLRWarmupRounds == 0 && c.OuterLRWarmupStart != 0:
+		return bad("outer_lr_warmup_start needs outer_lr_warmup_rounds > 0")
 	case c.EvalGate != "pi" && c.EvalGate != "worker" && c.EvalGate != "off":
 		return bad("eval_gate must be pi, worker or off")
 	case c.EvalClips < 1 || c.EvalClips > 256:
@@ -723,6 +736,7 @@ type hdAggSummary struct {
 	AggregatedCount int      `json:"aggregated_count"`
 	Method          string   `json:"aggregation_method"`
 	DeltaL2         float64  `json:"delta_l2"`
+	OuterLR         float64  `json:"outer_lr"` // effective (after warm-up)
 	HeldoutBefore   *float64 `json:"heldout_loss_before"`
 	HeldoutAfter    *float64 `json:"heldout_loss_after"`
 }
@@ -808,6 +822,7 @@ func (s *Service) aggregateHD(ctx context.Context, run *Run, ups []acceptedUpdat
 	res, _, cleanup, err := s.runPython(ctx, "ai.hd_aggregate", run.ID, map[string]any{
 		"outer_lr": c.OuterLR, "momentum": c.Momentum, "nesterov": true, "version_id": pending, "bound_c": c.BoundC,
 		"inner_steps": c.Inner.InnerSteps, "lr": c.Inner.LR, "eval_gate": c.EvalGate, "eval_triples_seed": hdTriplesSeed(c),
+		"delta_dtype": c.DeltaDtype, "outer_lr_warmup_rounds": c.OuterLRWarmupRounds, "outer_lr_warmup_start": warmupStart(c),
 	}, inputs)
 	if err != nil {
 		return err
@@ -865,6 +880,14 @@ func (s *Service) aggregateHD(ctx context.Context, run *Run, ups []acceptedUpdat
 		return s.openCandidate(ctx, run, base, out)
 	}
 	return s.promoteHD(ctx, run, base.ID, out, ups, nil)
+}
+
+// warmupStart is the executor's default (0.3) when no warm-up is configured, so the param is always in range.
+func warmupStart(c RunConfig) float64 {
+	if c.OuterLRWarmupStart > 0 {
+		return c.OuterLRWarmupStart
+	}
+	return 0.3
 }
 
 // hdTriplesSeed fixes the held-out (latent, t, noise) triples for the whole run
@@ -1010,6 +1033,9 @@ func (s *Service) promoteHD(ctx context.Context, run *Run, baseID string, o *hdO
 		vals := map[string]float64{"accepted_updates": float64(o.Sum.AggregatedCount), "rejected_updates": float64(len(o.Sum.Rejected)),
 			"delta_l2": o.Sum.DeltaL2, "update_loss_first_mean": lossFirst / nu, "update_loss_last_mean": lossLast / nu,
 			"round_seconds": time.Since(o.Started).Seconds(), "active_workers": float64(len(devices)), "outer_lr": c.OuterLR, "samples_seen": samples}
+		if o.Sum.OuterLR > 0 {
+			vals["outer_lr"] = o.Sum.OuterLR
+		}
 		if run.RoundStarted != nil {
 			vals["round_seconds"] = time.Since(*run.RoundStarted).Seconds()
 		}

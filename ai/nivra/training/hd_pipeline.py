@@ -59,6 +59,8 @@ class PipelineOptions:
     to_stage: str = "bundle"
     force: bool = False
     save_every: Optional[int] = None
+    detect_holds: Optional[bool] = None
+    drawing_rate_sampling: bool = False
 
 
 def _fp(*parts) -> str:
@@ -188,8 +190,13 @@ class Pipeline:
                 except (OSError, ValueError) as e:
                     raise PipelineError(f"--dataset {o.dataset}: dataset.json unreadable ({e})") from e
                 return {"dataset_fingerprint": ds.get("fingerprint")}
-            return {"listing": self.videos_listing(), "bucket": o.bucket, "profile": o.profile, "fps": o.fps,
-                    "max_clips": o.max_clips, "val_fraction": o.val_fraction, "default_style": self.cfg["default_style"]}
+            fp = {"listing": self.videos_listing(), "bucket": o.bucket, "profile": o.profile, "fps": o.fps,
+                  "max_clips": o.max_clips, "val_fraction": o.val_fraction, "default_style": self.cfg["default_style"]}
+            if o.detect_holds is not None:
+                fp["detect_holds"] = o.detect_holds
+            if o.drawing_rate_sampling:
+                fp["drawing_rate_sampling"] = True
+            return fp
         if stage == "tokenizer":
             return {"data": up["ingest"], "vocab_size": o.vocab_size}
         if stage == "text":
@@ -344,7 +351,8 @@ class Pipeline:
             from ..data.ingest import IngestError, IngestOptions, ingest_folder
             ds_dir = self.p("dataset")
             io = IngestOptions(bucket=self.o.bucket, profile=self.o.profile, default_style=self.cfg["default_style"],
-                               fps=self.o.fps, max_clips=self.o.max_clips, val_fraction=self.o.val_fraction, overwrite=True)
+                               fps=self.o.fps, max_clips=self.o.max_clips, val_fraction=self.o.val_fraction, overwrite=True,
+                               detect_holds=self.o.detect_holds, drawing_rate_sampling=self.o.drawing_rate_sampling)
             try:
                 ingest_folder(self.o.videos, ds_dir, io, log=self.log)
             except IngestError as e:

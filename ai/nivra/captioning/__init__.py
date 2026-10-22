@@ -17,6 +17,13 @@ DEFAULT_MODEL = "florence-community/Florence-2-large"
 DEFAULT_MODEL_REVISION: str | None = "4271c66b88cdbc05735372ec13b2360108de5317"
 WHISPER_MODEL = "small"
 
+# Qwen3-VL-2B-Instruct (Apache-2.0, official Qwen org, verified on the model card: license apache-2.0; code repo
+# QwenLM/Qwen3-VL is Apache-2.0). 4B is the fallback for more detail. Pinned commits as verified on 2026-10-22.
+QWEN_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
+QWEN_MODEL_REVISION: str | None = "89644892e4d85e24eaac8bacfd4f463576704203"
+QWEN_MODEL_4B = "Qwen/Qwen3-VL-4B-Instruct"
+CAPTIONERS = ["auto", "florence", "qwen3vl"]
+
 INSTALL_CMD = "python -m pip install -r ai/requirements-caption.txt"
 
 

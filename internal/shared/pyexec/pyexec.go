@@ -94,6 +94,9 @@ type Runner struct {
 	// output line arrived for this long. 0 = the default for the job type
 	// (StallTimeoutFor); negative = no watchdog.
 	StallTimeout time.Duration
+	// StateDir is persistent per-worker state kept across jobs (e.g. the int8
+	// error-feedback residual of HD training); passed as NIVRA_STATE_DIR.
+	StateDir string
 
 	// stallCheck overrides how often the watchdog looks (tests).
 	stallCheck time.Duration
@@ -174,6 +177,11 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 	env = append(env, "NIVRA_THREADS="+strconv.Itoa(threads), "NIVRA_DEVICE="+device, "PYTHONUNBUFFERED=1",
 		"OMP_NUM_THREADS="+strconv.Itoa(threads), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
 	env = append(env, ResolveFFmpeg(r.FFmpeg).Env()...)
+	if r.StateDir != "" {
+		if abs, err := filepath.Abs(r.StateDir); err == nil {
+			env = append(env, "NIVRA_STATE_DIR="+abs)
+		}
+	}
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

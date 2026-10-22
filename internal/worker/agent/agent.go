@@ -140,7 +140,7 @@ func (a *Agent) rebuildExecutors() {
 	}
 	if a.hw.AI.OK && len(a.hw.AI.JobTypes) > 0 {
 		p := &executor.Python{Interpreter: a.cfg.PythonPath, AIDir: a.cfg.AIPackageDir, FFmpeg: a.cfg.FFmpegPath,
-			JobTypes: a.hw.AI.JobTypes}
+			JobTypes: a.hw.AI.JobTypes, StateDir: filepath.Join(a.cfg.DataDir, "state")}
 		for _, t := range p.Types() {
 			// Without ffmpeg a video job would render for minutes and then fail at
 			// encoding, so the controller must not hand such jobs to this worker.

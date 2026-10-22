@@ -5,3 +5,7 @@
 transformers>=5.0,<6
 faster-whisper>=1.1
 pillow>=10
+# --captioner qwen3vl (Qwen3-VL-2B/4B-Instruct, Apache-2.0) needs no extra package: the native Qwen3VL classes ship with
+# transformers>=5 (verified with 5.20.2). Weights (4.3 GB for 2B) are downloaded by the first run into the Hugging Face cache.
+# The licensed text encoder download (`nivra text-encoder-fetch`) additionally uses huggingface_hub and safetensors,
+# both already installed with transformers.

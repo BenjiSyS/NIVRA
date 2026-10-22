@@ -405,11 +405,21 @@ func (s *Service) validateHDTrain(ctx context.Context, in scheduler.ValidationIn
 	if err != nil {
 		return scheduler.Verdict{}, fmt.Errorf("base weights: %w", err)
 	}
-	if why := checkDeltaStructure(uh, bh); why != "" {
-		return scheduler.Verdict{Reason: "update_weights rejected: " + why, Retry: true}, nil
-	}
 	c := run.Config
-	stats, why, err := scanDelta(wPath, uh, c.BoundC*float64(p.InnerSteps)*p.LR)
+	var stats deltaStats
+	var why string
+	switch p.DeltaDtype {
+	case "int8":
+		if why := checkDeltaStructureInt8(uh, bh); why != "" {
+			return scheduler.Verdict{Reason: "update_weights rejected: " + why, Retry: true}, nil
+		}
+		stats, why, err = scanDeltaInt8(wPath, uh, bh, c.BoundC*float64(p.InnerSteps)*p.LR)
+	default:
+		if why := checkDeltaStructure(uh, bh); why != "" {
+			return scheduler.Verdict{Reason: "update_weights rejected: " + why, Retry: true}, nil
+		}
+		stats, why, err = scanDelta(wPath, uh, c.BoundC*float64(p.InnerSteps)*p.LR)
+	}
 	if err != nil {
 		return scheduler.Verdict{}, err
 	}

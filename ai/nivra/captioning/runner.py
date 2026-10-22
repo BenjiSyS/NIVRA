@@ -9,9 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import json
+
 from . import VIDEO_EXTS, CaptionError, DependencyError
 from .describe import merge_caption, resolve_style
-from .frames import extract_frames
+from .frames import extract_frames, extract_frames_timed
 from .subtitles import extract_embedded, probe_streams, run_tool, short_err, split_subtitle_streams
 
 
@@ -24,6 +26,8 @@ class Options:
     overwrite: bool = False
     model: str | None = None
     limit: int | None = None  # caption at most this many videos that still need captions
+    captioner: str = "florence"  # florence | qwen3vl | auto (qwen3vl on CUDA, florence otherwise); see choose_captioner
+    write_json: bool = False  # also write <name>.json with the structured fields (qwen3vl only)
 
 
 @dataclass
@@ -56,6 +60,25 @@ def find_videos(path: Path) -> list[Path]:
 
 def caption_path_for(video: Path) -> Path:
     return video.with_suffix(".txt")
+
+
+def json_path_for(video: Path) -> Path:
+    return video.with_suffix(".json")
+
+
+def choose_captioner(requested: str, device: str = "auto") -> str:
+    """"auto" -> qwen3vl when CUDA is usable (device auto/cuda), else florence (the CPU-only default)."""
+    if requested in ("florence", "qwen3vl"):
+        return requested
+    if requested != "auto":
+        raise ValueError(f"unknown captioner {requested!r}")
+    if device == "cpu":
+        return "florence"
+    try:
+        import torch
+        return "qwen3vl" if torch.cuda.is_available() else "florence"
+    except ImportError:
+        return "florence"
 
 
 def subtitles_path_for(video: Path) -> Path:
@@ -132,7 +155,18 @@ def describe_video(video: Path, opts: Options, florence: Lazy) -> str:
     return cap
 
 
-def process_video(video: Path, opts: Options, florence: Lazy, whisper: Lazy) -> Result:
+def describe_video_qwen(video: Path, opts: Options, qwen: Lazy, model_name: str = "") -> tuple[str, dict]:
+    """Structured caption from several frames at once: (txt contents, json record)."""
+    from .structured import assemble, record_of, txt_of
+    side = 448 if opts.device != "cpu" else 336
+    with tempfile.TemporaryDirectory(prefix="nivra-frames-") as td:
+        frames, times = extract_frames_timed(video, opts.frames, Path(td), max_side=side)
+        raw = qwen.get().describe(frames, times)  # type: ignore[attr-defined]
+    cap = assemble(raw, opts.style)
+    return txt_of(cap), record_of(cap, captioner="qwen3vl", model=model_name or opts.model or "", times=times)
+
+
+def process_video(video: Path, opts: Options, florence: Lazy, whisper: Lazy, qwen: Lazy | None = None) -> Result:
     t0 = time.time()
     res = Result(video, "ok")
     cap_p, sub_p = caption_path_for(video), subtitles_path_for(video)
@@ -141,11 +175,19 @@ def process_video(video: Path, opts: Options, florence: Lazy, whisper: Lazy) -> 
         res.notes.append(f"{cap_p.name} already exists (use --overwrite to replace it)")
         return res
     try:
-        text = describe_video(video, opts, florence)
+        record = None
+        if opts.captioner == "qwen3vl":
+            if qwen is None:
+                raise CaptionError("internal error: no Qwen3-VL captioner")
+            text, record = describe_video_qwen(video, opts, qwen)
+        else:
+            text = describe_video(video, opts, florence)
         src, lines = get_subtitles(video, opts.subtitles, whisper, res.notes)
         if lines:  # subtitles first: the .txt is the "done" marker, so it is always written last
             write_text_atomic(sub_p, "\n".join(lines))
             res.subtitles_path, res.subtitle_source, res.subtitle_lines = sub_p, src, len(lines)
+        if record is not None and opts.write_json:  # sidecar first: the .txt stays the "done" marker
+            write_text_atomic(json_path_for(video), json.dumps(record, indent=1, ensure_ascii=False))
         write_text_atomic(cap_p, text)
         res.caption_path = cap_p
     except DependencyError:
@@ -186,7 +228,7 @@ def _needs_caption(v: Path, opts: Options) -> bool:
 
 
 def run(path: Path, opts: Options, *, florence: Lazy | None = None, whisper: Lazy | None = None,
-        out: Callable[[str], None] = print) -> int:
+        qwen: Lazy | None = None, out: Callable[[str], None] = print) -> int:
     from .models import Florence, Whisper  # light: heavy imports happen inside the constructors
     if not path.exists():
         out(f"error: {path} does not exist")
@@ -194,7 +236,13 @@ def run(path: Path, opts: Options, *, florence: Lazy | None = None, whisper: Laz
     if opts.frames < 1 or (opts.limit is not None and opts.limit < 1):
         out("error: --frames and --limit must be at least 1")
         return 2
-    florence = florence or Lazy(lambda: Florence(opts.model, opts.device))
+    opts.captioner = choose_captioner(opts.captioner, opts.device)
+    florence = florence or Lazy(lambda: Florence(opts.model if opts.captioner == "florence" else None, opts.device))
+    if opts.captioner == "qwen3vl" and qwen is None:
+        def _make_qwen():
+            from .qwen3vl import Qwen3VL
+            return Qwen3VL(opts.model, opts.device)
+        qwen = Lazy(_make_qwen)
     whisper = whisper or Lazy(lambda: Whisper(opts.device))
     videos = find_videos(path)
     if not videos:
@@ -212,7 +260,7 @@ def run(path: Path, opts: Options, *, florence: Lazy | None = None, whisper: Laz
             if opts.limit is not None and attempted >= opts.limit and _needs_caption(v, opts):
                 stopped_early = True
                 break
-            r = process_video(v, opts, florence, whisper)
+            r = process_video(v, opts, florence, whisper, qwen)
             next_idx = i + 1
             if r.status != "skipped":
                 attempted += 1

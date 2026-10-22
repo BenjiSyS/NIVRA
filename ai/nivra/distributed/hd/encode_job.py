@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import fields
 from pathlib import Path
 from typing import Callable, Optional
@@ -17,7 +18,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from ...compression.hc_vae import HCVAE, HCVAEConfig, HCVAE_VERSION
+from ...compression.hc_vae import HCVAE, HCVAEConfig, HCVAE_VERSIONS
 from ...text.bpe import BPETokenizer
 from ...text.nivra_text import NivraTextConfig, NivraTextEncoder, NivraTextModel
 from ...training.hd_trainer import fit_video, training_caption
@@ -37,7 +38,7 @@ def load_vae_files(weights, manifest, device="cpu") -> HCVAE:
         if m.get("family") == "hd":
             from ...models.hd_config import load_hd_config, vae_config
             vc = vae_config(load_hd_config(m["config"]))
-        elif m.get("version") == HCVAE_VERSION:
+        elif m.get("version") in HCVAE_VERSIONS:
             vc = HCVAEConfig.from_dict(m["config"])
         else:
             with safe_open(str(weights), framework="pt") as f:
@@ -100,8 +101,12 @@ def encode_videos(vae: HCVAE, videos: torch.Tensor, stage: dict, device="cpu", b
 
 
 @torch.no_grad()
-def encode_texts(enc, texts: list, batch: int = 32) -> tuple:
-    """(emb float32 [N,L,D], mask bool [N,L]) zero padded to the longest text."""
+def encode_texts(enc, texts: list, batch: int = 32, cache=None) -> tuple:
+    """(emb float32 [N,L,D], mask bool [N,L]) zero padded to the longest text. ``cache``: an
+    ``nivra.text.cache.EmbeddingCache`` (offline embedding cache, mainly for the big licensed encoders)."""
+    if cache is not None:
+        from ...text.cache import encode_cached
+        return encode_cached(enc, texts, cache, batch)
     parts = [enc.encode(texts[i:i + batch]) for i in range(0, len(texts), batch)]
     L = max(e.shape[1] for e, _ in parts)
     D = parts[0][0].shape[2]
@@ -131,7 +136,8 @@ def read_raw_shard(path) -> tuple:
 
 def encode_shard(raw_path, out_path, *, vae: HCVAE, enc, stage: dict, parent_sha: str, vae_version: str,
                  text_encoder_id: str, style_dropout: float = 0.1, seed: int = 0, device="cpu", extra_meta=None,
-                 on_progress=None, rows_override: Optional[list] = None, videos_override=None, split_override=None) -> dict:
+                 on_progress=None, rows_override: Optional[list] = None, videos_override=None, split_override=None,
+                 text_cache=None) -> dict:
     """Encode one raw shard to a latent shard file; returns the summary."""
     if videos_override is not None:
         videos, rows, split = videos_override, rows_override, split_override or "train"
@@ -139,21 +145,40 @@ def encode_shard(raw_path, out_path, *, vae: HCVAE, enc, stage: dict, parent_sha
         videos, rows, split = read_raw_shard(raw_path)
     texts = [training_caption(r, style_dropout, seed, 0) for r in rows]
     lat = encode_videos(vae, videos, stage, device, on_progress=on_progress)
-    emb, mask = encode_texts(enc, texts)
-    nemb, nmask = encode_texts(enc, [""])
+    emb, mask = encode_texts(enc, texts, cache=text_cache)
+    nemb, nmask = encode_texts(enc, [""], cache=text_cache)
+    if not (bool(torch.isfinite(emb.half()).all()) and bool(torch.isfinite(nemb.half()).all())):
+        raise EncodeInputError("text embeddings are not finite in fp16 (the text encoder's activations are too large)")
     lat16 = lat.to(torch.float16)
     if not bool(torch.isfinite(lat16).all()):
         raise EncodeInputError("encoded latents are not finite in fp16 (VAE latent scale looks wrong)")
     meta = {"parent_shard_sha256": parent_sha, "vae_version": vae_version, "text_encoder_id": text_encoder_id,
-            "text_encoder_name": getattr(enc, "id", None), "tokenizer_sha256": enc.tokenizer.sha256,
+            "text_encoder_name": getattr(enc, "id", None), "tokenizer_sha256": getattr(getattr(enc, "tokenizer", None), "sha256", None),
             "stage": {"h": int(stage["h"]), "w": int(stage["w"]), "frames": int(stage["frames"]), "fps": int(stage["fps"])},
             "latent_shift": vae.cfg.latent_shift, "latent_scale": vae.cfg.latent_scale, "split": split,
             "rows": [{"id": r.get("id"), "caption": r.get("caption", ""), "text": t, "style": r.get("style"),
-                      "lang": r.get("lang"), "split": split} for r, t in zip(rows, texts)], **(extra_meta or {})}
+                      "lang": r.get("lang"), "split": split,
+                      **({"effective_fps": r["effective_fps"]} if r.get("effective_fps") else {})} for r, t in zip(rows, texts)], **(extra_meta or {})}
     sha = write_latent_shard(out_path, lat16, emb, mask, nemb, nmask, meta)
     std = float(lat.std()) if lat.numel() > 1 else 0.0
     return {"clips": int(lat.shape[0]), "sha256": sha, "latent_mean": float(lat.mean()),
             "latent_std": std if math.isfinite(std) else 0.0}
+
+
+def load_external_encoder(spec: str, device="cpu", backend_factory=None):
+    """(encoder, id) for ``spec`` = "external:<name>" (looked up in the local text-encoder directory, see
+    nivra.text.fetch.encoder_dir) or "external:<path>". Never downloads."""
+    from ...text.external import ExternalEncoderError, load_external
+    from ...text.fetch import encoder_dir
+    kind, _, target = str(spec).partition(":")
+    if kind != "external" or not target:
+        raise EncodeInputError(f"bad text_encoder_spec {spec!r}; use external:<name>")
+    d = Path(target) if (os.sep in target or "/" in target or Path(target).is_dir()) else encoder_dir(target)
+    try:
+        enc = load_external(d, device=device, backend_factory=backend_factory)
+    except ExternalEncoderError as e:
+        raise EncodeInputError(f"cannot load the external text encoder: {e}") from e
+    return enc, enc.id
 
 
 def hd_encode_job(inputs: dict, params: dict, out_dir, *, device="cpu", on_progress=None) -> dict:
@@ -164,12 +189,24 @@ def hd_encode_job(inputs: dict, params: dict, out_dir, *, device="cpu", on_progr
     if raw_sha != str(p["shard_sha256"]).lower():
         raise EncodeInputError("raw shard sha256 differs from params.shard_sha256")
     vae = load_vae_files(inputs["vae_weights"], inputs["vae_manifest"], device)
-    enc = load_text_encoder_files(inputs["text_encoder_weights"], inputs["tokenizer"], device)
+    spec = p.get("text_encoder_spec")
+    if spec:                                      # a licensed encoder installed on THIS machine (text-encoder-fetch)
+        enc, te_id = load_external_encoder(spec, device)
+    else:
+        if not inputs.get("text_encoder_weights") or not inputs.get("tokenizer"):
+            raise EncodeInputError("text_encoder_weights and tokenizer inputs are required (or params.text_encoder_spec)")
+        enc = load_text_encoder_files(inputs["text_encoder_weights"], inputs["tokenizer"], device)
+        te_id = sha256_file(inputs["text_encoder_weights"])
+    cache = None
+    cdir = os.environ.get("NIVRA_TEXT_CACHE")
+    if cdir and spec:
+        from ...text.cache import EmbeddingCache
+        cache = EmbeddingCache(cdir, enc.id, enc.max_len)
     stage = p["stage"]
     extra = {"dataset_id": p.get("dataset_id"), "target_dataset_id": p.get("target_dataset_id"), "shard_idx": p.get("shard_idx")}
     s = encode_shard(inputs["raw_shard"], out / "latent_shard.safetensors", vae=vae, enc=enc, stage=stage,
                      parent_sha=raw_sha, vae_version=sha256_file(inputs["vae_weights"]),
-                     text_encoder_id=sha256_file(inputs["text_encoder_weights"]), style_dropout=p.get("style_dropout", 0.1),
-                     seed=p.get("seed", 0), device=device, extra_meta=extra, on_progress=on_progress)
+                     text_encoder_id=te_id, style_dropout=p.get("style_dropout", 0.1),
+                     seed=p.get("seed", 0), device=device, extra_meta=extra, on_progress=on_progress, text_cache=cache)
     s["path"] = str(out / "latent_shard.safetensors")
     return s

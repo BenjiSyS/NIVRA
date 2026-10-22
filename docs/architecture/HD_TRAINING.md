@@ -258,6 +258,87 @@ activation checkpointing) is the larger risk: train it on the 128p stage first.
   meta-device dry run) and raise `StreamStateTooLarge` (a `ValueError`) when it exceeds 60 % of free memory instead of crashing.
   Regression tests: `ai/tests/test_hd_vae_tilestate.py`. (tile=8 at that size remains impractical for Medium; use a larger tile.)
 
+## Low-bandwidth rounds (int8 deltas, error feedback, weighting, staleness, warm-up)
+
+Research item 11 and the DiLoCo part of item 8 (`docs/research/IMPROVEMENT_RESEARCH_2026.md`). Everything is opt-in; the defaults are the
+old behaviour (`delta_dtype: "float16"`).
+
+**`delta_dtype: "int8"`** (run config field, echoed in the job params and in the update manifest; format id `int8-rowscale/1`,
+code `ai/nivra/distributed/hd/quant.py`, Go `internal/controller/training/hd_int8.go`). `update_weights` holds, for every base
+tensor `NAME` of shape `S`, in the base's order:
+
+| tensor | dtype | shape | content |
+|---|---|---|---|
+| `NAME` | `I8` | `S` | `q` in `-127..127` (`-128` is rejected) |
+| `NAME#scale` | `F32` | `[rows(S)]` | per-row scale `s >= 0`, finite |
+
+`rows(S) = 0` if `numel(S) = 0`, `S[0]` if rank >= 2, else `1` (vectors and scalars share one scale). Dequantised value =
+`float32(q) * s` (a float32 multiply on both sides, see the golden fixture below). Quantiser: `s = max|row| / 127`, `q = round(x / s)`; an
+all-zero row (or a row whose `s` underflows to 0) has `s = 0, q = 0`. **Exact size** = `8 + header_len + sum(numel) + 4 * sum(rows)`
+(no gap, overlap or trailing byte; the controller and the Python validator check names, dtypes, shapes and the size from the header
+before reading any data). Content rules: finite non-negative scales, no `-128`, no non-zero `q` under a zero scale, finite
+dequantised values, not all zero, and the same bounds as fp16 applied to the **dequantised** values
+(`max|d| <= c*H*lr*slack`, `||d||_2 <= c*H*lr*sqrt(numel)*slack`) with slack `1 + 2^-7` instead of fp16's `1 + 2^-9`, because error
+feedback can add up to half a quantisation step of the previous round. A base tensor name ending in `#scale` is refused. Size: about
+half of fp16 for real shapes (1 byte per element + 4 bytes per row against 2 bytes per element, so
+the 213 M `nivra_base` goes from ~430 MB to ~215 MB); the tiny test model, with very small rows, only reaches ~0.63x.
+
+**Error feedback** (worker side, `train_job.py`, `quant.ResidualStore`): the worker quantises `delta + residual` and keeps
+`residual = (delta + residual) - dequant(q)` in `<state_dir>/hd_residual/<run>_<target>.safetensors` (+ `.json`; fp32, as large as
+the model). `state_dir` = `$NIVRA_STATE_DIR`, else `<worker data dir>/state` derived from the job's work directory, else none (quantisation
+without feedback; the Go worker does not set the variable yet, the derivation covers the normal `<data dir>/work/<attempt>` layout).
+The residual is committed only after `update.safetensors` and `update.json` are written. It is used only when the round's base is the
+**direct successor** of the version it was computed against (`meta.base_version_id == base.parent_version_id`), the update it belongs to is in
+the base's `applied_update_ids`, and run id, `hd_config_sha`, tensor shapes and file sha256 match; otherwise (new run, missed rounds, update
+rejected or clipped out, rolled-back version, damaged file) it is deleted and the round starts clean. The manifest and the summary say
+`error_feedback` and `residual_reset` (reason or null). A retry of the same job quantises from a clean residual.
+
+**Aggregation** (`aggregate.py`): updates are dequantised tensor by tensor while streaming (same peak memory as fp16), clipped, and
+combined as a **weighted** mean / trimmed mean. Weight = `samples_seen / median(samples_seen)` capped at 2 (a worker cannot buy influence by
+over-claiming) times `staleness_discount` for stale updates. With equal `samples_seen` and no stale update all weights are 1 and the result is
+identical to the unweighted aggregate. New `ai.hd_aggregate` params: `delta_dtype`, `weight_by_samples` (true), `max_staleness` (0),
+`staleness_discount` (0.5), `outer_lr_warmup_rounds` (0 = off), `outer_lr_warmup_start` (0.3). The summary reports `update_weights`,
+`stale_update_ids`, `outer_lr` (effective) and `outer_lr_nominal`.
+
+**Staleness** (aggregator only): `max_staleness = 1` also accepts an update computed against the PARENT of the current base (its
+`base_version_id` is then checked against that id), weighted by `staleness_discount`; two or more versions old is always rejected. The
+controller does **not** use this yet: `validateHDTrain` still rejects results for an older model version and the round state machine drops
+in-flight jobs when a round is promoted, so late updates need orchestration work (hold late jobs across a promotion and load them into the
+next round). It is available and tested at the executor level only.
+
+**Outer-lr warm-up**: with `outer_lr_warmup_rounds = K` the effective outer lr after `r` completed rounds is
+`outer_lr * (start + (1 - start) * min(1, r / K))`, i.e. 0.3x in round 0 rising to 1x from round K. Run-config fields
+`outer_lr_warmup_rounds` and `outer_lr_warmup_start` (default 0.3 when K > 0); the controller passes them to the aggregator, which reads
+the round from the base manifest (so it survives a controller restart). To re-warm after a stage change, start a new run.
+
+**Golden fixture shared Go <-> Python**: `ai/tests/fixtures/hd_int8_golden.safetensors` + `.json` (4 tensors: a 2-D one with an all-zero
+row, a vector, a 3-D tensor and a scalar). The Python test regenerates the bytes and compares them byte for byte, the Go test
+(`TestInt8GoldenFixtureSharedWithPython`) reads the same files and compares sizes, scales, `q`, and per-tensor and total L2 / Linf.
+Change the format only together with both sides, then `NIVRA_REGEN_FIXTURES=1 pytest tests/test_hd_int8.py -k golden`.
+
+### Training recipe inside a round
+
+`ai.hd_train` follows `hd_trainer.train_hd` (the config's `train` options through `train_options(cfg)`), using the trainer's own
+functions (`rf_loss_ex`, `sample_t_frames`, `make_xt`, `SRAProjector`, `sra_loss`, `fps_dropped`):
+
+* **Diffusion forcing** (`train.diffusion_forcing.fraction`) and **first/last-frame conditioning** (`cond_fraction`, needs `model.frame_cond`).
+* **fps conditioning** (`model.fps_cond`): each clip's `effective_fps` (carried into the latent shard rows by `ai.hd_encode` when the raw shard
+  rows have it) with the deterministic `train.fps_dropout`.
+* **fp32 islands**: `train.fp32_attn`, and a dynamic `GradScaler` with `train.loss_scale` (`force_loss_scaling` for CPU tests). An overflow
+  skips the optimizer step and backs the scale off; the round still counts `inner_steps` and the delta stays bounded; 200 consecutive skips
+  abort the job. `summary.skipped_steps` and `manifest.recipe.skipped_steps` report it.
+* **SRA** (`train.sra`): there is no EMA on a worker (the outer step does the averaging), so the teacher is a **frozen copy of the weights
+  received for this round** (one extra model copy in memory and one no-grad forward per micro-batch; it aligns an early block to a deeper
+  block of the same starting point at `t_ratio * t`). The projector is training-only and re-initialised every round; it never enters the
+  delta. Set `train.sra.weight = 0` for Medium/Large on small GPUs.
+
+The update/echo format is unchanged (the manifest only gains `recipe`, `delta_format`, `error_feedback`, `residual_reset`,
+`quant_rel_err`; the Go validator ignores unknown keys). The RNG draw order is unchanged for configs without these options.
+
+`ai.hd_encode` accepts `params.text_encoder_spec = "external:<name>"` (see `docs/training/TEXT_ENCODERS.md`; the `text_encoder_weights` /
+`tokenizer` inputs are then optional), loads v1 and v2 HC-VAE directories (`HCVAE_VERSIONS`), always uses the VAE's own `to_scaled` (scalar
+or per-channel) and fails if text embeddings are not finite in fp16.
+
 ## Feasibility (estimates)
 
 * `nivra_base` at 256p on an RTX 2060: ≈ 0.7 s/sample → a 500 × 8-sample round ≈ 45–60 min; ≈ 400 MB down +

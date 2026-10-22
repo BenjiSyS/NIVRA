@@ -34,6 +34,11 @@ def frame_times(duration: float, n: int) -> list[float]:
 
 
 def extract_frames(video: Path, n: int, out_dir: Path, max_side: int = 768) -> list[Path]:
+    return extract_frames_timed(video, n, out_dir, max_side)[0]
+
+
+def extract_frames_timed(video: Path, n: int, out_dir: Path, max_side: int = 768) -> tuple[list[Path], list[float]]:
+    """(frame files, their timestamps in seconds)."""
     times = frame_times(probe_duration(video), n)
     paths = []
     for i, t in enumerate(times):
@@ -44,4 +49,4 @@ def extract_frames(video: Path, n: int, out_dir: Path, max_side: int = 768) -> l
         if r.returncode != 0 or not out.exists():
             raise CaptionError(f"ffmpeg could not extract a frame at {t:.1f}s: {short_err(r.stderr)}")
         paths.append(out)
-    return paths
+    return paths, times

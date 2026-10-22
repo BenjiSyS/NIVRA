@@ -57,7 +57,7 @@ def test_tiled_decode_still_equals_untiled(vae):
     z = torch.randn(1, vae.cfg.latent_channels, 3, 12, 12)
     with torch.no_grad():
         full = vae.decode(z)
-        tiled = vae.decode_tiled(z, t_chunk=1, tile=6, overlap=2)
+        tiled = vae.decode_tiled(z, t_chunk=1, tile=6, overlap=2, max_state_bytes=2 << 30)
     assert tiled.shape == full.shape and (tiled - full).abs().max() < 1e-4
 
 
