@@ -3,8 +3,7 @@ import { fmtBytes, fmtDateTime, shortId } from '../../shared/format'
 import { Empty, ErrorNote, Field, Pill, Progress, Spinner, toast, useAction, useAsync } from '../../shared/ui'
 import { api, pbase } from '../api'
 import { useSession } from '../session'
-import { useLive } from '../store'
-import type { Artifact, DatasetView, HDStage, Model, Run } from '../types'
+import type { Artifact, DatasetView, HDStage, Model } from '../types'
 
 // HD training UI (docs/architecture/HD_TRAINING.md): registered datasets and
 // the "Start HD training" form. Operators only; every number shown as a
@@ -158,108 +157,6 @@ function EncodeForm(props: { datasetId: string; onDone: () => void }) {
       <div className="row">
         <button className="btn primary" disabled={busy || !vae || !te || !tok}>Start encoding</button>
         <span className="hint dim">Running it again with the same inputs returns the same dataset.</span>
-      </div>
-    </form>
-  )
-}
-
-// ---------------------------------------------------------------- HD run form
-
-export function StartHDTraining(props: { onCreated: (id: string) => void }) {
-  const { pid } = useSession()
-  const store = useLive('runs')
-  const { busy, run } = useAction()
-  const datasets = useAsync(async () => (await api.get<{ datasets: DatasetView[] | null }>(`${pbase(pid)}/datasets`)).datasets ?? [], [pid])
-  const models = useModels()
-  const [name, setName] = useState('')
-  const [datasetId, setDatasetId] = useState('')
-  const [target, setTarget] = useState<'dit' | 'vae'>('dit')
-  const [hdConfig, setHdConfig] = useState('nivra_hd_tiny')
-  const [init, setInit] = useState('')
-  const [rounds, setRounds] = useState(20)
-  const [workers, setWorkers] = useState(4)
-  const [gate, setGate] = useState<'pi' | 'worker' | 'off'>('pi')
-  const [innerSteps, setInnerSteps] = useState(500)
-
-  const wantKind = target === 'dit' ? 'latents' : 'raw'
-  const usable = (datasets.data ?? []).filter((v) => v.dataset.kind === wantKind && v.dataset.status === 'ready')
-  const chosen = usable.find((v) => v.dataset.id === datasetId)
-  const large = /medium|large/i.test(hdConfig)
-  const valMissing = gate !== 'off' && chosen && chosen.val_shards === 0
-
-  const submit = async () => {
-    const cfg: Record<string, unknown> = {
-      family: 'hd', target, hd_config: hdConfig, dataset_id: datasetId, init_version_id: init, rounds, workers_per_round: workers,
-      min_updates: Math.min(2, workers), eval_gate: gate, inner: { inner_steps: innerSteps },
-    }
-    const r = await run(() => api.post<Run>(`${pbase(pid)}/training/runs`, { name: name.trim(), config: cfg }), 'HD training run created')
-    if (r) {
-      store.ingestRun(r)
-      props.onCreated(r.id)
-    }
-  }
-
-  return (
-    <form className="card stack" onSubmit={(e) => { e.preventDefault(); void submit() }}>
-      <h2>Start HD training</h2>
-      <div className="notice">
-        Estimates, not measurements: one 500-step round of a base-size DiT at 256p on a 6 GB RTX 2060 should take roughly 45 to 60 minutes and move about
-        400 MB down and 400 MB up per worker (the first round also downloads about 1 GB of data). A few consumer GPUs will not reach general text-to-video
-        quality; start with one narrow style and short clips.
-      </div>
-      <div className="form-grid">
-        <Field label="Run name" wide>{(id) => <input id={id} className="input" value={name} maxLength={80} required onChange={(e) => setName(e.target.value)} />}</Field>
-        <Field label="What to train" hint={target === 'dit' ? 'The video generator, on precomputed latents (the distributed workload).' : 'The video autoencoder, on raw shards (needs trusted 12 GB+ GPUs).'}>
-          {(id) => (
-            <select id={id} className="input" value={target} onChange={(e) => { setTarget(e.target.value as 'dit' | 'vae'); setDatasetId('') }}>
-              <option value="dit">DiT (generator)</option>
-              <option value="vae">VAE (autoencoder)</option>
-            </select>
-          )}
-        </Field>
-        <Field label="Dataset" hint={`Ready ${wantKind} datasets only.`}>
-          {(id) => (
-            <select id={id} className="input" value={datasetId} required onChange={(e) => setDatasetId(e.target.value)}>
-              <option value="">{datasets.loading ? 'Loading…' : usable.length ? 'Choose a dataset…' : `No ready ${wantKind} dataset`}</option>
-              {usable.map((v) => <option key={v.dataset.id} value={v.dataset.id}>{v.dataset.name} · {v.dataset.clip_count.toLocaleString()} clips · {v.train_shards}+{v.val_shards} shards</option>)}
-            </select>
-          )}
-        </Field>
-        <Field label="Starting model version" hint="Import a bundle first with nivra model import." wide>
-          {(id) => (
-            <select id={id} className="input" value={init} required onChange={(e) => setInit(e.target.value)}>
-              <option value="">{models.loading ? 'Loading…' : 'Choose a model version…'}</option>
-              {models.data?.map((m) => <option key={m.id} value={m.id}>{modelLabel(m)}</option>)}
-            </select>
-          )}
-        </Field>
-        <Field label="Model config" hint={large ? 'Needs about 22 GB of GPU memory per worker.' : 'Base-size models need about 5.5 GB of GPU memory per worker.'}>
-          {(id) => <input id={id} className="input" value={hdConfig} pattern="[a-z0-9_-]+" required onChange={(e) => setHdConfig(e.target.value)} />}
-        </Field>
-        <Field label="Rounds">{(id) => <input id={id} className="input" type="number" min={1} value={rounds} onChange={(e) => setRounds(Number(e.target.value) || 1)} />}</Field>
-        <Field label="Workers per round" hint="Each trains on different shards.">{(id) => <input id={id} className="input" type="number" min={1} max={64} value={workers} onChange={(e) => setWorkers(Number(e.target.value) || 1)} />}</Field>
-        <Field label="Steps per worker per round">{(id) => <input id={id} className="input" type="number" min={1} max={2000} value={innerSteps} onChange={(e) => setInnerSteps(Number(e.target.value) || 1)} />}</Field>
-        <Field label="Held-out check" hint="A new version is only kept if its loss on held-out clips does not rise.">
-          {(id) => (
-            <select id={id} className="input" value={gate} onChange={(e) => setGate(e.target.value as 'pi' | 'worker' | 'off')}>
-              <option value="pi">On the controller (small models)</option>
-              <option value="worker">On a trusted worker (large models)</option>
-              <option value="off">Off (not recommended)</option>
-            </select>
-          )}
-        </Field>
-      </div>
-      {chosen && (
-        <p className="dim">
-          {chosen.dataset.redistribution === 'any'
-            ? 'This dataset may go to any enrolled device, but training jobs still go to trusted devices only unless you change that in the run configuration through the API.'
-            : 'Training data stays on your trusted devices only (workers marked trusted in the Workers page).'}
-        </p>
-      )}
-      {valMissing && <div className="notice">This dataset has no validation shards, so the held-out check cannot run. Choose Off or ingest with a validation split.</div>}
-      <div className="row">
-        <button className="btn primary" disabled={busy || !name.trim() || !datasetId || !init || !!valMissing}>Start HD training</button>
-        <span className="hint dim">Needs trusted workers with a GPU. The run waits until one is available.</span>
       </div>
     </form>
   )

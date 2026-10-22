@@ -1,8 +1,11 @@
-import { fmtAgo, fmtBytes, fmtDateTime, fmtDuration, fmtLoss, fmtNum, fmtPct } from '../../shared/format'
+import { fmtBytes, fmtDateTime, fmtDuration, fmtLoss, fmtNum, fmtPct } from '../../shared/format'
 import { href } from '../../shared/router'
-import { Empty, Pill, Progress, Spinner, Stat, useNow } from '../../shared/ui'
+import { fmtParams } from '../../shared/modelTiers'
+import { Empty, ErrorNote, Pill, Progress, Spinner, Stat, useAction, useAsync, useNow } from '../../shared/ui'
+import { api, pbase } from '../api'
+import { useSession } from '../session'
 import { useLive } from '../store'
-import type { Run } from '../types'
+import type { Run, SlotView } from '../types'
 
 const JOB_ORDER = ['ready', 'leased', 'running', 'uploading', 'validating', 'completed', 'failed', 'cancelled']
 
@@ -20,9 +23,7 @@ export default function Overview() {
   const memUsed = host.mem_total - host.mem_available
   const diskUsed = host.disk_total - host.disk_free
   // Prefer the live copy of the run (updated by SSE) over the polled overview.
-  const run: Run | null = o.training ? (s.runs.get(o.training.id) ?? o.training) : null
   const queue: Record<string, number> = Object.keys(s.counts).length ? s.counts : (o.queue ?? {})
-  const lm = run?.latest_metrics ?? {}
 
   return (
     <div className="stack">
@@ -30,6 +31,8 @@ export default function Overview() {
         <h1>Overview</h1>
         <span className="dim">{o.project.name}</span>
       </div>
+
+      <Slots runs={s.runs} />
 
       <div className="grid cols-3">
         <div className="card">
@@ -92,40 +95,6 @@ export default function Overview() {
       <div className="grid cols-2">
         <div className="card">
           <div className="card-head">
-            <h2>Training</h2>
-            {run && <Pill state={run.status} />}
-            <span className="spacer" />
-            <a href={run ? href('training', run.id) : href('training')}>{run ? 'Open run' : 'Training'}</a>
-          </div>
-          {run ? (
-            <>
-              <p style={{ marginBottom: 6 }}><strong>{run.name}</strong> <span className="dim">{run.status_detail}</span></p>
-              <div className="row" style={{ marginBottom: 8 }}>
-                <span>Round <strong>{run.current_round}</strong> / {run.config.rounds}</span>
-                <span className="faint">·</span>
-                <span>Step <strong>{fmtNum(run.current_step)}</strong></span>
-                <span className="faint">·</span>
-                <span className="dim">updated {fmtAgo(run.updated_at)}</span>
-              </div>
-              <Progress value={run.config.rounds ? run.current_round / run.config.rounds : 0} large label="Training progress" />
-              <dl className="kv" style={{ marginTop: 10 }}>
-                <dt>Held-out loss (before)</dt>
-                <dd>{fmtLoss(lm.heldout_loss_before)}</dd>
-                <dt>Held-out loss (after)</dt>
-                <dd>{fmtLoss(lm.heldout_loss_after)}</dd>
-                <dt>Update loss (first → last)</dt>
-                <dd>{fmtLoss(lm.update_loss_first_mean)} → {fmtLoss(lm.update_loss_last_mean)}</dd>
-              </dl>
-            </>
-          ) : (
-            <Empty title="No active training run">
-              Create one on the <a href={href('training')}>Training</a> page. Losses appear here after the first round.
-            </Empty>
-          )}
-        </div>
-
-        <div className="card">
-          <div className="card-head">
             <h2>Queue</h2>
             <span className="spacer" />
             <a href={href('queue')}>Open queue</a>
@@ -159,6 +128,58 @@ export default function Overview() {
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+const TRAINING = ['created', 'initializing', 'running']
+
+// The four fixed models with one Start/Stop button each.
+function Slots(props: { runs: Map<string, Run> }) {
+  const { pid, can } = useSession()
+  const { busy, run } = useAction()
+  const slots = useAsync(async () => (await api.get<{ slots: SlotView[] }>(`${pbase(pid)}/training/slots`)).slots, [pid], 5000)
+  const act = async (sl: SlotView, what: 'start' | 'stop') => {
+    const r = await run(() => api.post(`${pbase(pid)}/training/slots/${sl.key}/${what}`, {}), what === 'start' ? `${sl.label} training` : `${sl.label} stopped`)
+    if (r) slots.reload()
+  }
+  if (slots.error) return <ErrorNote error={slots.error} retry={slots.reload} />
+  if (!slots.data) return <Spinner />
+  return (
+    <div className="grid cols-2">
+      {slots.data.map((sl) => {
+        // Prefer the live copy of the run (updated by SSE) over the polled one.
+        const r = sl.run ? (props.runs.get(sl.run.id) ?? sl.run) : null
+        const on = !!r && TRAINING.includes(r.status)
+        const state = on ? 'running' : r?.status === 'stopping' ? 'stopping' : r ? 'paused' : 'idle'
+        const lm = r?.latest_metrics ?? {}
+        return (
+          <div className="card" key={sl.key}>
+            <div className="card-head">
+              <h2>{sl.label}</h2>
+              <span className="dim">{fmtParams(sl.params)} parameters</span>
+              <span className="spacer" />
+              <Pill state={state}>{on ? 'training' : state === 'stopping' ? 'stopping' : 'stopped'}</Pill>
+            </div>
+            <p className="dim" style={{ marginBottom: 8 }}>
+              {sl.version_number != null ? `Latest version v${sl.version_number}` : 'Not trained yet'}
+              {r ? ` · round ${fmtNum(r.current_round)} · step ${fmtNum(r.current_step)}` : ''}
+              {lm.heldout_loss_after != null ? ` · loss ${fmtLoss(lm.heldout_loss_after)}` : ''}
+              {r && on ? ` · ${r.status_detail || 'waiting for workers'}` : ''}
+            </p>
+            <p className="faint" style={{ marginBottom: 10 }}>Trains on: {sl.hardware}</p>
+            {sl.blocked && !r && <div className="notice warn" style={{ marginBottom: 10 }}>{sl.blocked}</div>}
+            <div className="row">
+              {on ? (
+                <button className="btn" disabled={!can('operator') || busy} onClick={() => void act(sl, 'stop')}>Stop</button>
+              ) : (
+                <button className="btn primary" disabled={!can('operator') || busy || state === 'stopping' || (!!sl.blocked && r?.status !== 'paused')} onClick={() => void act(sl, 'start')}>Start</button>
+              )}
+              {r && <a href={href('training', r.id)}>Details</a>}
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }

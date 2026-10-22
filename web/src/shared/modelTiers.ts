@@ -1,14 +1,16 @@
-// Model pickers show at most three choices, one per size tier, instead of every
-// version of every run. The tier comes from the parameter count.
+// Model pickers show one choice per fixed model (Small, Medium, Large and
+// Unlimited; see internal/controller/training/slots.go) instead of every version
+// of every run. The tier comes from the parameter count.
 
-export type Tier = 'Small' | 'Medium' | 'Large'
-const ORDER: Tier[] = ['Small', 'Medium', 'Large']
+export type Tier = 'Small' | 'Medium' | 'Large' | 'Unlimited'
+const ORDER: Tier[] = ['Small', 'Medium', 'Large', 'Unlimited']
 
 export function tierOf(params: number | undefined): Tier {
   const p = params ?? 0
   if (p < 50e6) return 'Small'
-  if (p < 500e6) return 'Medium'
-  return 'Large'
+  if (p < 400e6) return 'Medium'
+  if (p < 1.5e9) return 'Large'
+  return 'Unlimited'
 }
 
 export function fmtParams(p: number | undefined): string {

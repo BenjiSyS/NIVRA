@@ -28,6 +28,7 @@ var kindRe = regexp.MustCompile(`^[a-z_]{1,32}$`)
 
 // Register implements api.Extension.
 func (s *Service) Register(r *api.Router) {
+	s.registerSlots(r)
 	r.Admin("GET", "/training/runs", auth.RoleViewer, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
 		runs, err := s.ListRuns(req.Context(), a.ProjectID)
 		if err != nil {

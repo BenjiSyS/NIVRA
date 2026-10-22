@@ -377,3 +377,17 @@ export interface AuditEvent {
   remote_addr: string
   detail: unknown
 }
+
+// One of the four fixed models (GET /training/slots).
+export interface SlotView {
+  key: 'small' | 'medium' | 'large' | 'unlimited'
+  label: string
+  family: 'small' | 'hd'
+  config: string
+  params: number
+  hardware: string
+  run: Run | null
+  version_id: string | null
+  version_number: number | null
+  blocked: string
+}
