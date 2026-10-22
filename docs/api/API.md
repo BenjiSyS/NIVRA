@@ -16,7 +16,7 @@ There are three audiences:
 | Workers | Ed25519 device key → short-lived bearer session | `/enrollment/*`, `/worker/*`, `/artifacts/*` |
 | Administrators (Nivra Studio) | username + password → `nivra_session` cookie (HttpOnly, SameSite=Strict) + `X-Nivra-CSRF` header on every non-GET request | `/auth/*`, `/projects/*`, `/system`, `/users`, `/audit` |
 
-Roles: `viewer` (read) < `operator` (control workers, jobs, training) < `admin` (projects, codes, revocation, users).
+Roles: `viewer` (read everything) · `member` (make videos; sees, cancels, downloads and deletes only their own jobs, videos and generations; no other read access; not a viewer) · `operator` (control workers, jobs, training, datasets, storage; includes everything a member can do on any user's data) · `admin` (projects, codes, revocation, users, invitations, limits, cleanup). A route that says "any" accepts every signed-in role and filters by owner for members. Tokens carry the role of their account.
 
 ## Deviations from the specification's suggested contract
 
@@ -126,7 +126,7 @@ Job statuses: `ready → leased → running → uploading → validating → com
 * `GET /projects/{pid}/training/runs/{rid}/updates` → accepted/applied/invalid/stale updates with worker and metadata
 * `GET /projects/{pid}/checkpoints?run=`, `GET /projects/{pid}/models`
 * `GET /projects/{pid}/artifacts?kind=`; `POST /projects/{pid}/artifacts?kind=vae_weights` (operator; raw body upload); `GET /projects/{pid}/artifacts/{aid}` (download, Range supported)
-* `POST /projects/{pid}/generate` (operator) `{prompt, seed, steps, cfg_scale, fps, upscale, model_version?}` → `{job_id}`; executed by a worker with the AI executor
+* `POST /projects/{pid}/generate` (member) `{prompt, seed, steps, cfg_scale, fps, upscale, model_version?}` → `{job_id}`; executed by a worker with the AI executor. The prompt is counted in characters (HD 1000, small 200). Refused with 400 and a plain message when a limit is hit: video longer than the member limit or 30 minutes, too many long videos or unfinished videos for this user.
 * `GET /projects/{pid}/generations` → `{generations:[{job: JobView, artifacts:{video, video_metadata}}]}`
 * `POST /projects/{pid}/evaluate` `{mode: adherence|reconstruction, num_prompts?, steps?, model_version?}`
 * `POST /projects/{pid}/datasets/shards` `{seed, start, count, jobs, frames?, size?}`
@@ -146,3 +146,24 @@ Used by the Worker website. Non-GET requests require header `X-Nivra-Local: 1`; 
 * `POST /local/api/connect` `{controller_url, code, device_name?, contributor_name?}`
 * `POST /local/api/start | pause | resume | stop | stop-task | hardware/refresh`
 * `PUT /local/api/settings` `{cpu_threads, gpu_index (-1 = none), ram_budget_mb, vram_budget_mb, disk_cache_mb, bandwidth_kbps, schedule{enabled, start "HH:MM", end "HH:MM"}, auto_start, contributor_name}`
+
+### Members, invitations, limits, storage (added with migration 10)
+
+Public (no sign-in, rate limited):
+
+* `POST /public/join/check` `{code}` → `{valid, role}` · `POST /public/join` `{code, username, display_name?, password}` → `201 {user}`.
+  A code works once; a rejected attempt (weak password, taken username) does not use it up.
+
+Administrator:
+
+* `GET /invites` · `POST /invites` `{role: member|viewer|operator, note?, expires_in_hours?}` → `{invite, code, join_path}` (the code is shown once) · `DELETE /invites/{id}`
+* `POST /users/{id}/status` `{active}` (turn an account off or on; off ends its sessions and tokens at once)
+* `GET /projects/{pid}/settings` (operator) · `PUT /projects/{pid}/settings` (admin) `{member_max_video_seconds, max_concurrent_long_videos, max_queued_jobs, intermediate_retention_hours}`
+* `GET /projects/{pid}/storage` (operator) → disk, usage by kind, reclaimable temporary files · `POST /projects/{pid}/storage/cleanup` (admin) `{intermediates?, failed_generations?}`
+
+Member and above:
+
+* `GET /projects/{pid}/limits` → the caller's limits and current usage
+* `GET /projects/{pid}/long-videos`, `GET /generations`, `GET /generations/{gid}` (any role; members see their own), `POST /generations/{gid}/cancel`, `POST /generations/{gid}/regenerate` `{stage?, index?}` (revive failed parts), `DELETE /generations/{gid}`
+* `GET /projects/{pid}/jobs/{jid}` (any role; members: own jobs only; includes `waiting_reason` while a ready job cannot start), `POST /projects/{pid}/jobs/{jid}/cancel`, `GET /projects/{pid}/artifacts/{aid}` (members: videos of their own jobs)
+* A long video whose part used up its attempts stays `running` with `needs_attention: true` and `failed_parts`; it fails by itself after 3 days if nobody regenerates the part.

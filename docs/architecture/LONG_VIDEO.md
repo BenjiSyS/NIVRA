@@ -20,7 +20,7 @@ sequential: extra computers would not make one video faster. Nivra therefore use
 3. **Stitch** (`ai.stitch`, CPU): segments are joined (the duplicate boundary frame dropped, a 4-frame
    crossfade across each seam) into the final MP4.
 
-Videos up to `default_seconds` keep using a single `ai.generate` job (unchanged). Length limit: 3 hours.
+Videos up to `default_seconds` keep using a single `ai.generate` job (unchanged). Length limit: 30 minutes on the network (the draft is one job that cannot resume yet); 3 hours on a single local GPU.
 Quality caveat: coherence over minutes/hours depends on the draft; a weakly trained model drifts.
 
 Cost (*estimate*, RTX 2060-class, Medium): 720p 8 s ≈ 20–40 min per segment; 1 h at 720p ≈ 450 segments
@@ -62,7 +62,7 @@ Inputs (roles) are the model files as for `ai.generate`: `weights`, `manifest`, 
   stage (draft|refine|stitch|done), progress 0..1, segments_total, segments_done, workers:[names],
   artifact_id?, failure_reason?, created_at}`; progress = 0.1·draft + 0.85·mean(segment progress) +
   0.05·stitch. `POST .../generations/{gid}/cancel`.
-* Width/height limits for HD: up to 2560×1440. `seconds` up to 10800.
+* Width/height limits for HD: up to 2560×1440. `seconds` up to 1800 on the network (3 hours locally).
 
 ## Workers with several GPUs
 

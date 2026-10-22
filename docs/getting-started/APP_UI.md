@@ -8,7 +8,7 @@ uses is described in `docs/architecture/APP.md`.
 Open the app. If no controller or API token is stored, or the controller cannot be reached, the
 connection screen opens:
 
-1. Enter the **Controller URL** (for example `https://studio.benjiserver.com`).
+1. Enter the **Controller URL** (for example `https://studio.example.com`).
 2. Paste an **API token**. Create one in Nivra Studio, Settings, API tokens. The token is verified, stored
    only on this computer, and never shown again. Leave the field empty later to keep the stored token.
 3. **Save and verify** shows the user, role and project, or the error.

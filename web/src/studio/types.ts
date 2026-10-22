@@ -1,6 +1,6 @@
 // Shapes returned by the controller (docs/api/API.md section 3).
 
-export type Role = 'viewer' | 'operator' | 'admin'
+export type Role = 'viewer' | 'member' | 'operator' | 'admin'
 
 export interface User {
   id: string

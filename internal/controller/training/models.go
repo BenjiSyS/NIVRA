@@ -115,6 +115,15 @@ func (s *Service) ImportBundle(ctx context.Context, actor core.Actor, projectID,
 func (s *Service) ImportBundleDir(ctx context.Context, actor core.Actor, projectID, name, dir string, activate bool) (string, error) {
 	files := map[string]string{"model_weights": "weights.safetensors", "model_version": "model_version.json", "vae_weights": "vae.safetensors"}
 	ids := map[string]string{}
+	var total int64
+	for _, f := range files {
+		if st, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			total += st.Size()
+		}
+	}
+	if err := s.store.EnsureFree(total); err != nil {
+		return "", err
+	}
 	for kind, f := range files {
 		info, err := s.store.Import(ctx, projectID, kind, filepath.Join(dir, f), "")
 		if err != nil {

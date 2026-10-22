@@ -17,6 +17,7 @@ import (
 	"nivra/internal/shared/secure"
 	"nivra/internal/worker/client"
 	"nivra/internal/worker/executor"
+	"nivra/internal/worker/keepawake"
 )
 
 type stopReason int
@@ -142,6 +143,11 @@ func (a *Agent) workLoop(ctx context.Context, cl *client.Client) error {
 }
 
 func (a *Agent) startTask(cl *client.Client, job *protocol.JobAssignment) {
+	if err := a.validateAssignment(job); err != nil {
+		go a.rejectAssignment(cl, job, err)
+		return
+	}
+	a.gate.mu.Lock() // released below, after a.task is set
 	a.mu.Lock()
 	loopCtx := context.Background()
 	if a.loopCancel != nil {
@@ -150,9 +156,34 @@ func (a *Agent) startTask(cl *client.Client, job *protocol.JobAssignment) {
 	ctx, cancel := context.WithCancel(loopCtx)
 	t := &activeTask{a: *job, cancel: cancel, done: make(chan struct{}), phase: "starting", started: time.Now()}
 	a.task = t
+	conflict := a.gate.LocalActive()
 	a.mu.Unlock()
+	a.gate.mu.Unlock()
+	if conflict {
+		// A local generation started while this lease was in flight: hand it back.
+		t.stop(stopRequeue)
+	}
 	a.logf("info", "jobs", "leased %s attempt %s (job %s, attempt #%d)", job.JobType, job.AttemptID, job.JobID, job.AttemptNumber)
 	go a.runTask(ctx, cl, t)
+}
+
+// rejectAssignment reports a malformed assignment as a non-retryable failure. If
+// even the attempt id is unusable nothing can be reported; the lease just expires.
+func (a *Agent) rejectAssignment(cl *client.Client, job *protocol.JobAssignment, why error) {
+	a.logf("error", "jobs", "rejected assignment: %v", why)
+	a.mu.Lock()
+	a.failed++
+	a.mu.Unlock()
+	if !isUUID(job.AttemptID) || !isUUID(cl.Identity().ProjectID) {
+		return
+	}
+	entry := outboxEntry{ProjectID: cl.Identity().ProjectID, AttemptID: job.AttemptID, JobType: "", Created: time.Now(),
+		Fail: &protocol.JobFailRequest{FencingToken: job.FencingToken, Code: "INVALID_SPEC",
+			Message: "the worker rejected this job: " + why.Error(), Retryable: false}}
+	if err := a.writeOutbox(entry); err != nil {
+		a.logf("error", "jobs", "cannot persist rejection for %s: %v", job.AttemptID, err)
+	}
+	a.submitOutbox(context.Background(), cl, entry)
 }
 
 // runTask executes one attempt end to end.
@@ -167,6 +198,10 @@ func (a *Agent) runTask(ctx context.Context, cl *client.Client, t *activeTask) {
 		close(t.done)
 		a.refreshState()
 	}()
+	a.mu.Lock()
+	sleepOK := a.settings.AllowSleepOnBattery
+	a.mu.Unlock()
+	defer keepawake.Acquire(sleepOK)() // no sleeping mid-task
 	job := t.a
 	bg := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), 30*time.Second)
@@ -297,30 +332,25 @@ func (a *Agent) execute(ctx context.Context, cl *client.Client, t *activeTask) (
 	if !ok {
 		return nil, &executor.Failure{Code: "UNSUPPORTED", Message: "this worker has no executor for " + job.JobType, Retryable: true}
 	}
-	cacheDir := filepath.Join(a.cfg.DataDir, "cache", cl.Identity().ProjectID)
+	if ctx.Err() != nil {
+		return nil, executor.ErrStopped
+	}
+	project := cl.Identity().ProjectID
+	cacheDir, err := a.safeJoin("cache", project)
+	if err != nil || !isUUID(project) {
+		return nil, &executor.Failure{Code: "INVALID_SPEC", Message: "unsafe project id", Retryable: false}
+	}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, err
 	}
-	inputs := map[string]string{}
-	for i, in := range job.Inputs {
-		t.set("downloading", fmt.Sprintf("downloading input %d/%d", i+1, len(job.Inputs)), 0)
-		dst := filepath.Join(cacheDir, in.SHA256)
-		if err := cl.Download(ctx, in, dst); err != nil {
-			if ctx.Err() != nil {
-				return nil, executor.ErrStopped
-			}
-			return nil, &executor.Failure{Code: "DOWNLOAD_FAILED", Message: err.Error(), Retryable: true}
-		}
-		now := time.Now()
-		_ = os.Chtimes(dst, now, now) // LRU timestamp
-		key := in.Role
-		if key == "" {
-			key = in.ID
-		}
-		inputs[key] = dst
+	inputs, err := a.fetchInputs(ctx, t, job.Inputs, cacheDir, s.DiskCacheMB<<20, cl.Download)
+	if err != nil {
+		return nil, err
 	}
-	a.evictCache(cacheDir, s.DiskCacheMB<<20)
-	work := filepath.Join(a.cfg.DataDir, "work", job.AttemptID)
+	work, err := a.safeJoin("work", job.AttemptID)
+	if err != nil {
+		return nil, &executor.Failure{Code: "INVALID_SPEC", Message: "unsafe attempt id", Retryable: false}
+	}
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return nil, err
 	}
@@ -347,7 +377,11 @@ func (r taskReporter) Log(level, msg string) {
 }
 
 func (a *Agent) cleanupWork(attemptID string, keep bool) {
-	dir := filepath.Join(a.cfg.DataDir, "work", attemptID)
+	dir, err := a.safeJoin("work", attemptID)
+	if err != nil || !isUUID(attemptID) {
+		a.logf("warn", "jobs", "not removing work directory for unsafe attempt id %q", short(attemptID))
+		return
+	}
 	if keep {
 		a.logf("info", "jobs", "kept failed work directory for diagnostics: %s", dir)
 		a.pruneWork(5)
@@ -379,43 +413,6 @@ func (a *Agent) pruneWork(n int) {
 	}
 }
 
-// evictCache removes least-recently-used files until the cache fits budget.
-func (a *Agent) evictCache(dir string, budget int64) {
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	type f struct {
-		path string
-		size int64
-		mod  time.Time
-	}
-	var fs []f
-	var total int64
-	for _, e := range ents {
-		if e.IsDir() || strings.HasSuffix(e.Name(), ".part") {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			fs = append(fs, f{filepath.Join(dir, e.Name()), info.Size(), info.ModTime()})
-			total += info.Size()
-		}
-	}
-	if total <= budget {
-		return
-	}
-	sort.Slice(fs, func(i, j int) bool { return fs[i].mod.Before(fs[j].mod) })
-	for _, x := range fs[:len(fs)-1] { // never evict the newest (just downloaded)
-		if total <= budget {
-			break
-		}
-		if os.Remove(x.path) == nil {
-			total -= x.size
-			a.logf("info", "cache", "evicted %s from cache", filepath.Base(x.path))
-		}
-	}
-}
-
 // ---- outbox: results survive crashes and network outages ----
 
 type outboxEntry struct {
@@ -428,11 +425,31 @@ type outboxEntry struct {
 }
 
 func (a *Agent) outboxDir(project string) string {
+	if !isUUID(project) {
+		return filepath.Join(a.cfg.DataDir, "outbox", "invalid")
+	}
 	return filepath.Join(a.cfg.DataDir, "outbox", project)
 }
 
+func (a *Agent) outboxFile(project, attemptID string) (string, error) {
+	if !isUUID(project) || !isUUID(attemptID) {
+		return "", fmt.Errorf("unsafe outbox id")
+	}
+	return a.safeJoin("outbox", project, attemptID+".json")
+}
+
 func (a *Agent) writeOutbox(e outboxEntry) error {
-	return config.Save(filepath.Join(a.outboxDir(e.ProjectID), e.AttemptID+".json"), e)
+	p, err := a.outboxFile(e.ProjectID, e.AttemptID)
+	if err != nil {
+		return err
+	}
+	return config.Save(p, e)
+}
+
+func (a *Agent) removeOutbox(project, attemptID string) {
+	if p, err := a.outboxFile(project, attemptID); err == nil {
+		_ = os.Remove(p)
+	}
 }
 
 func (a *Agent) readOutbox(project string) []outboxEntry {
@@ -447,7 +464,7 @@ func (a *Agent) readOutbox(project string) []outboxEntry {
 			continue
 		}
 		var e outboxEntry
-		if json.Unmarshal(b, &e) == nil && e.AttemptID != "" {
+		if json.Unmarshal(b, &e) == nil && isUUID(e.AttemptID) {
 			out = append(out, e)
 		}
 	}
@@ -461,7 +478,7 @@ func (a *Agent) dropOutbox(attemptID string) {
 	if id == nil {
 		return
 	}
-	_ = os.Remove(filepath.Join(a.outboxDir(id.ProjectID), attemptID+".json"))
+	a.removeOutbox(id.ProjectID, attemptID)
 }
 
 // outboxAttempts reports pending results so their leases stay alive.
@@ -513,11 +530,11 @@ func (a *Agent) submitOutbox(ctx context.Context, cl *client.Client, e outboxEnt
 	}
 	switch {
 	case err == nil:
-		_ = os.Remove(filepath.Join(a.outboxDir(e.ProjectID), e.AttemptID+".json"))
+		a.removeOutbox(e.ProjectID, e.AttemptID)
 	case protocol.IsCode(err, protocol.ErrStaleLease), protocol.IsCode(err, protocol.ErrNotFound),
 		protocol.IsCode(err, protocol.ErrForbidden), protocol.IsCode(err, protocol.ErrValidation):
 		a.logf("warn", "jobs", "controller rejected result for %s: %v (dropping)", e.AttemptID, err)
-		_ = os.Remove(filepath.Join(a.outboxDir(e.ProjectID), e.AttemptID+".json"))
+		a.removeOutbox(e.ProjectID, e.AttemptID)
 	default:
 		a.logf("warn", "jobs", "could not submit result for %s yet: %v (kept in outbox)", e.AttemptID, err)
 	}

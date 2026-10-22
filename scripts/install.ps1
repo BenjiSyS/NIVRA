@@ -8,6 +8,8 @@ param(
   [switch]$WithAI,
   [switch]$Yes,
   [switch]$NoShortcuts,
+  [switch]$Prebuilt,   # files in this folder come from a release package: no Go/Node/build
+  [switch]$DryRun,     # -Role app: only report what would be done (changes nothing)
   [string]$DatabaseUrl = $env:NIVRA_DATABASE_URL
 )
 $ErrorActionPreference = 'Stop'
@@ -30,7 +32,7 @@ function Preflight {
   $drive = (Get-Item $NivraHome).PSDrive
   $free = [math]::Round($drive.Free / 1GB, 1)
   Write-Host "    free disk on ${drive}: $free GB"
-  if ($free -lt 5) { Warn 'less than 5 GB free disk space' }
+  if ($free -lt 30) { Warn "only $free GB free; PyTorch, models and the job cache need about 30 GB. Free some space or set NIVRA_HOME to a bigger drive." }
   $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
   if ($gpu) { Write-Host "    NVIDIA GPU: $($gpu.Name) (driver $($gpu.DriverVersion))" } else {
     $other = Get-CimInstance Win32_VideoController | Select-Object -First 1
@@ -51,6 +53,89 @@ function Ensure-Tool($cmd, $wingetId, $label) {
   & winget install --id $wingetId -e --source winget
   Refresh-Path
   if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { throw "$label was installed but is not usable yet. Close this window and run setup again." }
+}
+
+# Test-NivraRunning: true when Nivra.exe / nivra.exe runs from this folder.
+function Test-NivraRunning {
+  $r = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -ieq 'nivra' -and $_.Path -and $_.Path.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase) })
+  return ($r.Count -gt 0)
+}
+
+# Find-FfmpegDir returns the folder holding a working ffmpeg.exe (PATH first, then the
+# winget package folders), or $null. It never depends on the PATH of a later session.
+function Find-FfmpegDir {
+  $dirs = @()
+  $cmd = Get-Command ffmpeg -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($cmd) { $dirs += (Split-Path $cmd.Source) }
+  $pk = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path $pk) {
+    Get-ChildItem $pk -Directory -Filter 'Gyan.FFmpeg*' -ErrorAction SilentlyContinue | ForEach-Object {
+      Get-ChildItem $_.FullName -Directory -Filter 'ffmpeg-*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | ForEach-Object { $dirs += (Join-Path $_.FullName 'bin') }
+    }
+  }
+  $dirs += (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links')
+  foreach ($d in $dirs) {
+    $exe = Join-Path $d 'ffmpeg.exe'
+    if ((Test-Path $exe) -and (Test-Native { & $exe -version })) { return $d }
+  }
+  return $null
+}
+
+# Ensure-Ffmpeg makes sure ffmpeg (and ffprobe) exist and returns the absolute path to
+# store as "ffmpeg_path" in the worker config: the folder when it holds ffmpeg.exe, else
+# the exe. Order: existing install, winget Gyan.FFmpeg, imageio-ffmpeg wheel in the venv.
+function Ensure-Ffmpeg($vpy) {
+  $d = Find-FfmpegDir
+  if (-not $d -and -not $DryRun) {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+      Say 'Installing ffmpeg (winget Gyan.FFmpeg); videos cannot be saved without it'
+      $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+      try { & winget install --id Gyan.FFmpeg -e --source winget --accept-source-agreements --accept-package-agreements | Out-Host } finally { $ErrorActionPreference = $old }
+      Refresh-Path
+      $d = Find-FfmpegDir
+    } else {
+      Warn 'winget is not available; trying the Python ffmpeg package instead.'
+    }
+  }
+  if ($d) {
+    if (-not (Test-Path (Join-Path $d 'ffprobe.exe'))) { Warn "ffprobe.exe not found next to ffmpeg in $d" }
+    Write-Host "    ffmpeg: $d"
+    return $d
+  }
+  if ($DryRun) { Write-Host '    ffmpeg: not found (setup would install it with winget, or the imageio-ffmpeg wheel)'; return '' }
+  if ($vpy) {
+    Say 'Installing the bundled ffmpeg from the Python package imageio-ffmpeg'
+    & $vpy -m pip install --quiet imageio-ffmpeg | Out-Host
+    $exe = $null
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $exe = (& $vpy -c 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())' 2>$null | Select-Object -Last 1) } finally { $ErrorActionPreference = $old }
+    if ($exe -and (Test-Path $exe) -and (Test-Native { & $exe -version })) {
+      Warn 'Using the bundled ffmpeg only; ffprobe is not included, so some features (such as training on your own videos) stay limited.'
+      Write-Host "    ffmpeg: $exe"
+      return $exe
+    }
+  }
+  Write-Host ''
+  Write-Host '!! ffmpeg could not be installed. Nivra cannot save videos without it.' -ForegroundColor Red
+  Write-Host '   Install it yourself:  winget install --id Gyan.FFmpeg -e   (then run setup again),'
+  Write-Host '   or see https://ffmpeg.org/download.html. Behind a proxy or antivirus, allow the download first.'
+  return ''
+}
+
+# Update-WorkerConfig sets keys in config\worker.json, keeping every other key.
+function Update-WorkerConfig([hashtable]$Set, [switch]$OnlyIfMissing) {
+  $cfgPath = Join-Path $Root 'config\worker.json'
+  if (-not (Test-Path $cfgPath)) { return }
+  $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+  $changed = $false
+  foreach ($k in $Set.Keys) {
+    if (-not $Set[$k]) { continue }
+    $has = $cfg.PSObject.Properties.Name -contains $k
+    if ($has -and (($OnlyIfMissing -and $cfg.$k) -or $cfg.$k -eq $Set[$k])) { continue }
+    $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $Set[$k] -Force
+    $changed = $true
+  }
+  if ($changed) { [System.IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 10) + "`n", (New-Object System.Text.UTF8Encoding $false)); Write-Host "    updated $cfgPath" }
 }
 
 # Find-Python returns a command (array) for Python 3.11-3.14, skipping the
@@ -112,7 +197,7 @@ function Setup-Python {
       Say 'Installing CPU PyTorch (large download)'
       & $vpy -m pip install torch --index-url https://download.pytorch.org/whl/cpu | Out-Host
     }
-    if ($LASTEXITCODE -ne 0) { Warn 'PyTorch installation failed; AI jobs stay disabled until setup is run again.'; return '' }
+    if ($LASTEXITCODE -ne 0) { Warn 'PyTorch installation failed; AI jobs stay disabled until setup is run again. Behind a proxy set HTTPS_PROXY; antivirus or a firewall can also block download.pytorch.org.'; return '' }
   }
   & $vpy -m pip install --quiet -r (Join-Path $Root 'ai\requirements.txt') | Out-Host
   # Captioning tools for `nivra caption` (describing and transcribing training videos).
@@ -152,14 +237,16 @@ function Install-Worker {
       python_path    = $py
       ai_package_dir = (Join-Path $Root 'ai')
     })
+  if ($py) {
+    $ffmpeg = Ensure-Ffmpeg $py
+    if ($ffmpeg) { Update-WorkerConfig @{ ffmpeg_path = $ffmpeg } }
+  }
   Say 'Worker installed.'
   Write-Host '    Start it with start.bat, then enter your project code in the page that opens (http://127.0.0.1:8741/).'
 }
 
 function Build-App {
   Say 'Building Nivra (web interface, nivra.exe, Nivra.exe)'
-  $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Root, [System.StringComparison]::OrdinalIgnoreCase) }
-  if ($running) { throw 'Nivra is running from this folder. Quit it (Nivra -> This computer as a worker -> Quit Nivra), then run setup again.' }
   Push-Location web
   try {
     & npm ci --no-audit --no-fund
@@ -194,37 +281,56 @@ function Add-Shortcuts {
 
 # Install-App sets up everything Nivra.exe needs on this computer.
 function Install-App {
+  # Check this before anything is pulled, built or replaced.
+  if (Test-NivraRunning) { throw 'Nivra is running from this folder. Quit it (Nivra -> This computer as a worker -> Quit Nivra), then run setup again. Nothing was changed.' }
+  $prebuilt = $Prebuilt -or ((Test-Path (Join-Path $Root 'Nivra.exe')) -and (Test-Path (Join-Path $Root 'bin\nivra.exe')) -and -not (Test-Path (Join-Path $Root 'web\package.json')))
   Preflight
   Write-Host ''
-  Write-Host '    Missing tools are installed with winget: Go and Node.js LTS (to build Nivra), Python 3.12 + PyTorch (to run the model).'
+  if ($prebuilt) {
+    Write-Host '    Release package: only Python 3.12, PyTorch and ffmpeg are installed (with winget when missing). No Go, Node.js or Git needed.'
+  } else {
+    Write-Host '    Source build: missing tools are installed with winget: Go and Node.js LTS (to build Nivra), Python 3.12 + PyTorch + ffmpeg.'
+  }
+  if ($DryRun) {
+    Say 'Dry run (nothing is changed)'
+    Write-Host "    mode: $(if ($prebuilt) { 'prebuilt release' } else { 'build from source' })"
+    foreach ($t in @('go', 'npm', 'winget')) { Write-Host ("    {0}: {1}" -f $t, $(if (Get-Command $t -ErrorAction SilentlyContinue) { 'found' } else { 'missing' })) }
+    Write-Host "    python 3.11-3.14: $(if (Find-Python) { 'found' } else { 'missing (would be installed)' })"
+    $d = Ensure-Ffmpeg ''
+    Write-Host "    ffmpeg_path would be: $d"
+    return
+  }
   if ((Ask 'Continue? (y/n)' 'y') -ne 'y') { exit 1 }
   Refresh-Path
-  Ensure-Tool go 'GoLang.Go' 'Go'
-  Ensure-Tool npm 'OpenJS.NodeJS.LTS' 'Node.js'
+  if (-not $prebuilt) {
+    Ensure-Tool go 'GoLang.Go' 'Go'
+    Ensure-Tool npm 'OpenJS.NodeJS.LTS' 'Node.js'
+    $need = (Select-String -Path (Join-Path $Root 'go.mod') -Pattern '^go\s+(\S+)' -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($need) {
+      $want = [version]($need.Matches[0].Groups[1].Value)
+      $gv = (& go version) -replace '.*go(\d+\.\d+(\.\d+)?).*', '$1'
+      if ([version]$gv -lt $want) { Warn "Go $gv is older than the required $want (go.mod); the build may fail. Update Go: winget upgrade GoLang.Go" }
+    }
+  }
   if (-not (Find-Python)) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw 'Python 3.12 is required. Install it, then run setup again.' }
     Say 'Installing Python 3.12 (winget)'
     & winget install --id Python.Python.3.12 -e --source winget
     Refresh-Path
   }
-  Build-App
+  if (-not $prebuilt) { Build-App }
   $py = Setup-Python
   if (-not $py) { Warn 'Python is not usable yet; Nivra.exe still works for generating on other computers. Run setup again to let this computer run AI jobs.' }
+  $ffmpeg = Ensure-Ffmpeg $py
   Write-Config 'config\worker.json' ([ordered]@{
       ui_listen_addr = '127.0.0.1:8741'
       data_dir       = (Join-Path $NivraHome 'worker')
       python_path    = $py
       ai_package_dir = (Join-Path $Root 'ai')
     })
-  if ($py) {
-    # A config from an older install may lack the Python path.
-    $cfgPath = Join-Path $Root 'config\worker.json'
-    $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-    if (-not $cfg.python_path) {
-      $cfg | Add-Member -NotePropertyName python_path -NotePropertyValue $py -Force
-      [System.IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json) + "`n", (New-Object System.Text.UTF8Encoding $false))
-    }
-  }
+  # A config from an older install may lack these; the ffmpeg path is always refreshed so no shortcut depends on PATH.
+  if ($py) { Update-WorkerConfig @{ python_path = $py } -OnlyIfMissing }
+  if ($ffmpeg) { Update-WorkerConfig @{ ffmpeg_path = $ffmpeg } }
   if (-not $NoShortcuts) { Add-Shortcuts }
   & (Join-Path $Root 'bin\nivra.exe') doctor --role worker
   Say "Nivra is installed: $(Join-Path $Root 'Nivra.exe') (shortcuts on the Desktop and in the Start menu)."

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -27,6 +28,11 @@ class SpecError(Exception):
 
 class InputInvalid(Exception):
     code, exit = "INPUT_INVALID", EXIT_INPUT
+
+
+class ToolMissing(Exception):
+    """A required external tool (ffmpeg) is not installed. Not retryable: the same machine will fail again."""
+    code, exit = "FFMPEG_MISSING", EXIT_INPUT
 
 
 class JobStopped(Exception):
@@ -132,6 +138,8 @@ def _validate(params: Any, schema: dict, where: str = "params") -> dict:
             raise SpecError(f"{where}.{k} longer than {s['maxlen']}")
         if t == "str" and s.get("minlen", 0) > len(v):
             raise SpecError(f"{where}.{k} too short")
+        if t == "str" and "pattern" in s and not re.fullmatch(s["pattern"], v):
+            raise SpecError(f"{where}.{k} has invalid characters (letters, digits, _ . - only, max 64, no leading dot)")
         out[k] = v
     return out
 
@@ -151,6 +159,14 @@ def S(default=None, req=False, **kw):
 def B(default=None, **kw):
     return {"type": "bool", "default": default, **kw}
 
+
+# Prompt limits. The schema cannot tell a small model from an HD one, so it allows the HD limit
+# (1000 characters, the same as the controller and the app); h_generate re-checks SMALL_PROMPT_MAX
+# for small (non-HD) bundles, so small models still enforce 200.
+HD_PROMPT_MAX = 1000
+SMALL_PROMPT_MAX = 200
+# Output file base name: no path separators, no leading dot (it is used as a file name in the output dir).
+NAME_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}"
 
 STAGE_SPEC = {"type": "obj", "req": True, "schema": {"h": I(req=True, min=32, max=4096), "w": I(req=True, min=32, max=4096),
                                                 "frames": I(req=True, min=1, max=1025), "fps": I(8, min=1, max=120)}}
@@ -188,9 +204,9 @@ SCHEMAS = {
                 "num_clips": I(64, min=1, max=512), "eval_seed": I(777), "prompts_file": S(None)},
         inputs={"weights": False, "manifest": False, "vae_weights": False, "text_encoder_archive": False}),
     "ai.generate": dict(
-        params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "steps": I(30, min=1, max=200),
+        params={"prompt": S(req=True, minlen=1, maxlen=HD_PROMPT_MAX), "seed": I(0, min=0), "steps": I(30, min=1, max=200),
                 "cfg_scale": F(3.0, min=0.0, max=20.0), "fps": I(8, min=1, max=60), "upscale": I(4, min=1, max=8),
-                "tile": I(0, min=0, max=16), "name": S("video", maxlen=64),
+                "tile": I(0, min=0, max=16), "name": S("video", pattern=NAME_PATTERN),
                 # HD models only (rejected for small bundles); None = the bundle's own default
                 "width": I(None, min=16, max=4096), "height": I(None, min=16, max=4096),
                 "seconds": F(None, exclusive_min=0.0, max=60.0), "sampler": S(None, choices=["euler", "ab2"]),
@@ -200,25 +216,25 @@ SCHEMAS = {
         inputs={"weights": True, "manifest": True, "vae_weights": True, "text_encoder_archive": False}),
     # long videos (docs/architecture/LONG_VIDEO.md)
     "ai.draft": dict(
-        params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "style": S(None, maxlen=64),
+        params={"prompt": S(req=True, minlen=1, maxlen=HD_PROMPT_MAX), "seed": I(0, min=0), "style": S(None, maxlen=64),
                 "sampler": S(None, choices=["euler", "ab2"]), "seconds": F(req=True, exclusive_min=0.0, max=10800.0),
                 "fps": I(30, min=1, max=60), "draft_width": I(256, min=32, max=1024), "draft_height": I(144, min=32, max=1024),
                 "segment_frames": I(241, min=9, max=4097), "steps": I(None, min=1, max=200),
-                "cfg_scale": F(None, min=0.0, max=20.0), "name": S("draft", maxlen=64), "fp16": B(None),
+                "cfg_scale": F(None, min=0.0, max=20.0), "name": S("draft", pattern=NAME_PATTERN), "fp16": B(None),
                 "offload": S(None, choices=["none", "blocks"])},
         inputs={"weights": True, "manifest": True, "vae_weights": True, "text_encoder_archive": False}),
     "ai.refine_segment": dict(
-        params={"prompt": S(req=True, minlen=1, maxlen=200), "seed": I(0, min=0), "style": S(None, maxlen=64),
+        params={"prompt": S(req=True, minlen=1, maxlen=HD_PROMPT_MAX), "seed": I(0, min=0), "style": S(None, maxlen=64),
                 "sampler": S(None, choices=["euler", "ab2"]), "width": I(req=True, min=32, max=2560),
                 "height": I(req=True, min=32, max=1440), "fps": I(30, min=1, max=60), "index": I(0, min=0),
                 "start": I(req=True, min=0), "end": I(req=True, min=0), "strength": F(0.55, exclusive_min=0.0, max=1.0),
                 "steps": I(None, min=1, max=200), "cfg_scale": F(None, min=0.0, max=20.0),
-                "name": S("segment", maxlen=64), "fp16": B(None), "offload": S(None, choices=["none", "blocks"])},
+                "name": S("segment", pattern=NAME_PATTERN), "fp16": B(None), "offload": S(None, choices=["none", "blocks"])},
         inputs={"weights": True, "manifest": True, "vae_weights": True, "draft_video": True,
                 "text_encoder_archive": False}),
     "ai.stitch": dict(
         params={"fps": I(30, min=1, max=60), "crossfade_frames": I(4, min=0, max=16), "count": I(req=True, min=1, max=4096),
-                "name": S("video", maxlen=64)},
+                "name": S("video", pattern=NAME_PATTERN)},
         inputs={}, input_regex=r"segment_\d{3,}"),
     # HD distributed training (docs/architecture/HD_TRAINING.md)
     "ai.hd_encode": dict(
@@ -684,6 +700,8 @@ def h_generate(ctx: Ctx, p: dict) -> dict:
     bad = [k for k in HD_ONLY_PARAMS if k in given]
     if bad:
         raise SpecError(f"params {bad} are only valid for HD models")
+    if len(p["prompt"]) > SMALL_PROMPT_MAX:
+        raise SpecError(f"params.prompt longer than {SMALL_PROMPT_MAX} (small models)")
     b = _bundle(ctx)
     ctx.check_stop()
     try:
@@ -906,6 +924,31 @@ def _check_job(job: Any) -> None:
             raise SpecError(f"{k} must be a string")
 
 
+# Job types that encode or decode video with ffmpeg.
+VIDEO_JOB_TYPES = {"ai.generate", "ai.draft", "ai.refine_segment", "ai.stitch"}
+
+
+def prepare_ffmpeg_env() -> None:
+    """Put the directories of NIVRA_FFMPEG / NIVRA_FFPROBE (set by the worker) first on PATH, so every
+    ffmpeg user in the package (video_io, ingest, captioning) finds them even when PATH is stale."""
+    dirs = []
+    for var in ("NIVRA_FFMPEG", "NIVRA_FFPROBE"):
+        v = os.environ.get(var)
+        if v:
+            d = os.path.dirname(os.path.abspath(v))
+            if d and d not in dirs:
+                dirs.append(d)
+    if dirs:
+        os.environ["PATH"] = os.pathsep.join(dirs + [os.environ.get("PATH", "")])
+
+
+def require_ffmpeg(job_type: str) -> None:
+    """Fail fast (before any model is loaded) when a video job runs without ffmpeg."""
+    if job_type in VIDEO_JOB_TYPES and shutil.which("ffmpeg") is None:
+        raise ToolMissing("ffmpeg is not installed on this computer, so videos cannot be encoded here "
+                          "(set up ffmpeg, or set ffmpeg_path in the worker settings)")
+
+
 def run_job(job_path: Path, em: Emitter) -> int:
     try:
         job = json.loads(job_path.read_text(encoding="utf-8"))
@@ -924,6 +967,8 @@ def run_job(job_path: Path, em: Emitter) -> int:
         for k, req in schema["inputs"].items():
             if req and k not in inputs:
                 raise SpecError(f"inputs.{k} is required")
+        prepare_ffmpeg_env()
+        require_ffmpeg(job["job_type"])
         ctx = Ctx(job, job_path.resolve().parent, em)
         ctx.inputs = inputs
         em.log(f"job {job.get('job_id')} type {job['job_type']} started")
@@ -933,7 +978,7 @@ def run_job(job_path: Path, em: Emitter) -> int:
         summary = HANDLERS[job["job_type"]](ctx, params)
         em.result(summary)
         return EXIT_OK
-    except (SpecError, InputInvalid, JobStopped) as e:
+    except (SpecError, InputInvalid, ToolMissing, JobStopped) as e:
         em.error(e.code, str(e))
         return e.exit
     except MemoryError as e:

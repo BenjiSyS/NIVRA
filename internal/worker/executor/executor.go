@@ -120,3 +120,21 @@ func (Builtin) Run(ctx context.Context, t *Task, r Reporter) (*Output, error) {
 	}
 	return nil, &Failure{Code: "INVALID_SPEC", Message: "unsupported job type " + t.Assignment.JobType}
 }
+
+// PythonJobTypes are the AI job types a worker may run through the Python executor
+// (ai/nivra/cli.py WORKER_JOB_TYPES).
+var PythonJobTypes = []string{"ai.dataset_shard", "ai.local_train", "ai.evaluate", "ai.generate", "ai.draft",
+	"ai.refine_segment", "ai.stitch", "ai.hd_encode", "ai.hd_train", "ai.hd_eval"}
+
+// VideoJobTypes encode video with ffmpeg; a worker without ffmpeg must not lease them.
+var VideoJobTypes = []string{"ai.generate", "ai.draft", "ai.refine_segment", "ai.stitch"}
+
+// IsVideoJobType reports whether t needs ffmpeg.
+func IsVideoJobType(t string) bool {
+	for _, v := range VideoJobTypes {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}

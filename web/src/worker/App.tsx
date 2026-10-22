@@ -234,6 +234,7 @@ function Enrolled(props: { status: Status; apply: (s: Status) => void; stale: bo
           <Pill tone={p.tone}>{s.state.replace(/_/g, ' ')}</Pill>
         </div>
         {props.stale && <div className="notice warn" style={{ marginTop: 10 }}>Showing the last known state; the worker is not responding right now.</div>}
+        {s.video_disabled_reason && <div className="notice warn" role="status" style={{ marginTop: 10 }}>{s.video_disabled_reason}</div>}
         {s.state === 'revoked' && <div className="notice err" style={{ marginTop: 10 }}>The project administrator revoked this device. Use “Change project” to join another project.</div>}
         <div className="controls" role="group" aria-label="Worker controls">
           <button className="btn primary" disabled={busy || s.running} onClick={() => void act('start', 'Started')}>Start</button>
@@ -317,6 +318,7 @@ function OverviewTab({ s }: { s: Status }) {
             ['Memory', `${fmtBytes(h.host.mem_total - h.host.mem_available)} used of ${fmtBytes(h.host.mem_total)}`],
             ['GPU', gpus.length ? gpus.map((g) => `${g.name} (${fmtMB(g.vram_mb)})`).join(', ') : 'none detected'],
             ['AI runtime', h.ai.ok ? `ready (torch ${h.ai.torch}${h.ai.cuda ? ', CUDA' : ', CPU only'})` : (h.ai.error ? `unavailable: ${h.ai.error}` : 'unavailable')],
+            ['Video encoder (ffmpeg)', h.ffmpeg?.ok ? `ready (${h.ffmpeg.version || 'found'})` : (h.ffmpeg?.error ?? 'not checked')],
           ]} />
         </div>
       </div>
@@ -394,6 +396,19 @@ function HardwareTab({ s, onRefresh, busy }: { s: Status; onRefresh: () => Promi
             </div>
           ))}
         </div>
+      </div>
+      <div className="card">
+        <h3 style={{ marginBottom: 8 }}>Video encoder (ffmpeg)</h3>
+        {h.ffmpeg?.ok ? (
+          <KV rows={[
+            ['Status', <Pill key="f" tone="ok">ready</Pill>],
+            ['Version', h.ffmpeg.version || '–'],
+            ['ffmpeg', h.ffmpeg.ffmpeg_path || '–'],
+            ['ffprobe', h.ffmpeg.ffprobe_path || '–'],
+          ]} />
+        ) : (
+          <div className="notice warn">{s.video_disabled_reason || h.ffmpeg?.error || 'ffmpeg was not checked.'}</div>
+        )}
       </div>
       <div className="card">
         <h3 style={{ marginBottom: 8 }}>AI runtime</h3>
@@ -476,6 +491,8 @@ function ResourcesTab({ s, apply }: { s: Status; apply: (s: Status) => void }) {
         <p className="hint faint" style={{ margin: '6px 0 0' }}>Uses this computer’s local time. If “until” is earlier than “from”, the window runs past midnight.</p>
       </div>
       <label className="check"><input type="checkbox" checked={form.auto_start} onChange={(e) => set({ auto_start: e.target.checked })} /> Start working automatically when Nivra Worker launches</label>
+      <label className="check"><input type="checkbox" checked={!!form.allow_sleep_on_battery} onChange={(e) => set({ allow_sleep_on_battery: e.target.checked })} /> Let this computer go to sleep when it runs on battery</label>
+      <p className="hint faint" style={{ margin: '0 0 6px' }}>While a task runs, Nivra keeps the computer awake so the task is not lost. Turn this on to let a laptop sleep on battery instead (the task is then returned to the queue).</p>
       <Field label="Contributor name">{(id) => <input id={id} className="input" maxLength={64} value={form.contributor_name} onChange={(e) => set({ contributor_name: e.target.value })} />}</Field>
       <div className="row">
         <button className="btn primary" disabled={busy || !dirty}>Save settings</button>

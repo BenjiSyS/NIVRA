@@ -81,6 +81,9 @@ function Turn(props: {
               {item.stage || (item.status === 'queued' ? 'Waiting for a worker' : item.status)} · {pct}%
               {item.worker ? ` · on ${item.worker}` : ''}
             </div>
+            {item.status === 'queued' && item.waiting_reason && (
+              <div className="waiting-reason" role="status">{item.waiting_reason}</div>
+            )}
             <div className="eta">
               {item.status === 'queued'
                 ? 'Waiting to start…'
@@ -284,11 +287,11 @@ export function App() {
   const disabledReason = !config
     ? cfgErr || 'Loading…'
     : models.length === 0
-      ? 'No model yet: load a model folder (Models) or connect to a controller (Connection).'
+      ? 'No model yet: load a model folder (Models) or connect to a Nivra server (Connection).'
       : !config.controller_url || !config.has_token
-        ? 'This model runs on the network: connect to a controller first (Connection).'
+        ? 'This model runs on the Nivra network: connect to a Nivra server first (Connection).'
         : !config.connected
-          ? config.error || 'Cannot reach the controller right now.'
+          ? config.error || 'Cannot reach the Nivra server right now.'
           : ''
 
   const title = { chat: 'Nivra', worker: 'This computer as a worker', settings: 'Connection', models: 'Models' }[view]
@@ -365,7 +368,7 @@ export function App() {
                   {models.length === 0 && config && (
                     <p className="row" style={{ justifyContent: 'center' }}>
                       <button className="btn primary" onClick={() => go('models')}>Load a model</button>
-                      <button className="btn" onClick={() => go('settings')}>Connect to a controller</button>
+                      <button className="btn" onClick={() => go('settings')}>Connect to a Nivra server</button>
                     </p>
                   )}
                 </div>

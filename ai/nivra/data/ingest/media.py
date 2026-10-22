@@ -134,3 +134,21 @@ def read_clip(path: Path, start: float, n_frames: int, fps: float, width: int, h
     if err.strip():
         raise MediaError(f"decode warnings while reading clip: {err.decode(errors='replace').strip()[:200]}")
     return out
+
+
+def read_gray_window(path: Path, start: float, seconds: float, fps: float, src_width: int, src_height: int,
+                     width: int = 96) -> np.ndarray | None:
+    """Decode `seconds` of video from `start` at constant `fps` (the SOURCE frame rate: nothing is resampled away)
+    as small gray frames uint8 [n,h,w] -- used for animation hold detection. None if fewer than 2 frames decode."""
+    n = max(2, int(round(seconds * fps)))
+    h = max(2, int(round(width * src_height / src_width / 2.0)) * 2)
+    vf = f"fps={fps:.6f},scale={width}:{h}:flags=area,format=gray"
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{start:.4f}", "-i", str(path), "-an", "-sn",
+           "-vf", vf, "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    r = subprocess.run(cmd, capture_output=True, timeout=300)
+    if r.returncode != 0:
+        raise MediaError(f"gray decode failed: {r.stderr.decode(errors='replace').strip()[:200]}")
+    cnt = len(r.stdout) // (width * h)
+    if cnt < 2:
+        return None
+    return np.frombuffer(r.stdout[: cnt * width * h], dtype=np.uint8).reshape(cnt, h, width)

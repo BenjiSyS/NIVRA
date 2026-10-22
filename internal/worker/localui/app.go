@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,8 +17,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"nivra/internal/shared/config"
+	"nivra/internal/worker/agent"
 )
 
 // App backs the Nivra App (chat-style generation) on the local UI server. It
@@ -37,6 +40,11 @@ type App struct {
 	ModelDirs []string
 	// ScanRoots are searched a few levels deep, in the background, for models.
 	ScanRoots []string
+	// Gate, when set, keeps local generations and network tasks off the GPU at the
+	// same time (shared with the worker agents).
+	Gate *agent.Gate
+	// KeepAwake, when set, blocks computer sleep until the returned function is called.
+	KeepAwake func() func()
 
 	mu        sync.Mutex
 	cfg       appConfig
@@ -88,11 +96,13 @@ type histItem struct {
 	// Local generations run on this computer from a loaded model folder.
 	Local bool `json:"local,omitempty"`
 	// GenerationID is set for long videos built from segments on the network.
-	GenerationID string     `json:"generation_id,omitempty"`
-	ModelID      string     `json:"model_id,omitempty"`
-	StartedAt    *time.Time `json:"started_at,omitempty"`
-	pollFailures int
-	samples      []progSample
+	GenerationID string `json:"generation_id,omitempty"`
+	// WaitingReason says why nothing can run the job yet (from the controller; may be empty).
+	WaitingReason string     `json:"waiting_reason,omitempty"`
+	ModelID       string     `json:"model_id,omitempty"`
+	StartedAt     *time.Time `json:"started_at,omitempty"`
+	pollFailures  int
+	samples       []progSample
 }
 
 // progSample is one (time, progress) observation for the time-left estimate.
@@ -120,6 +130,15 @@ func (h *histItem) eta(now time.Time) int {
 	}
 	return int(left + 0.5)
 }
+
+// internalParams are history params that are not generation parameters.
+var internalParams = map[string]bool{"segments": true}
+
+// maxPromptRunes is the longest prompt the app accepts (HD models); small models take 200.
+const (
+	maxPromptRunes      = 1000
+	maxSmallPromptRunes = 200
+)
 
 var jobIDRe = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
@@ -190,7 +209,35 @@ type ctlErr struct {
 	Msg    string
 }
 
-func (e *ctlErr) Error() string { return fmt.Sprintf("controller: HTTP %d: %s", e.Status, e.Msg) }
+func (e *ctlErr) Error() string { return fmt.Sprintf("Nivra server: HTTP %d: %s", e.Status, e.Msg) }
+
+// friendlyErr turns a raw network or server error into a short sentence for people.
+func friendlyErr(err error) string {
+	var ce *ctlErr
+	if errors.As(err, &ce) {
+		switch {
+		case ce.Status == 401:
+			return "That username or password is not right."
+		case ce.Status == 403:
+			return "The Nivra server says you are not allowed to do that: " + ce.Msg
+		case ce.Status == 429:
+			return "Too many tries. Wait a minute and try again."
+		case ce.Status >= 500:
+			return "The Nivra server had a problem. Try again in a minute."
+		}
+		return ce.Msg
+	}
+	var ne net.Error
+	msg := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "The Nivra server did not answer in time. Check the address and your internet connection."
+	case strings.Contains(msg, "no such host"), strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "dial tcp"), strings.Contains(msg, "tls:"), strings.Contains(msg, "certificate"):
+		return "Cannot reach the Nivra server at that address. Check the address and your internet connection."
+	}
+	return "Could not talk to the Nivra server: " + err.Error()
+}
 
 func (a *App) call(ctx context.Context, base, token, method, path string, body, out any) error {
 	var rd io.Reader
@@ -234,9 +281,9 @@ func (a *App) verify(ctx context.Context, base, token, project string) (*appUser
 	if err := a.call(ctx, base, token, "GET", "/auth/me", nil, &me); err != nil {
 		var ce *ctlErr
 		if errors.As(err, &ce) && ce.Status == 401 {
-			return nil, nil, errors.New("the controller did not accept this API token (expired or revoked?)")
+			return nil, nil, errors.New("the Nivra server did not accept this access key (it may have expired or been removed)")
 		}
-		return nil, nil, fmt.Errorf("could not reach the controller: %w", err)
+		return nil, nil, errors.New(friendlyErr(err))
 	}
 	var ps struct {
 		Projects []appProject `json:"projects"`
@@ -250,9 +297,9 @@ func (a *App) verify(ctx context.Context, base, token, project string) (*appUser
 		}
 	}
 	if project == "" {
-		return &me.User, nil, errors.New("there are no projects on this controller yet")
+		return &me.User, nil, errors.New("there are no projects on this Nivra server yet")
 	}
-	return &me.User, nil, fmt.Errorf("project %q not found", project)
+	return &me.User, nil, fmt.Errorf("project %q not found on the Nivra server", project)
 }
 
 // snapshot returns the base URL, token and project for a controller call.
@@ -261,10 +308,10 @@ func (a *App) snapshot() (base, token, pid string, err error) {
 	defer a.mu.Unlock()
 	base, token = a.controllerURL(), a.cfg.Token
 	if base == "" || token == "" {
-		return "", "", "", errors.New("set the controller URL and an API token first (Settings)")
+		return "", "", "", errors.New("connect to a Nivra server first (Connection)")
 	}
 	if a.project == nil {
-		return base, token, "", errors.New("not connected to the controller: " + a.lastErr)
+		return base, token, "", errors.New("not connected to the Nivra server: " + a.lastErr)
 	}
 	return base, token, a.project.ID, nil
 }
@@ -344,6 +391,7 @@ func unfinished(s string) bool { return s == "queued" || s == "running" || s == 
 type ctlJob struct {
 	Status        string `json:"status"`
 	FailureReason string `json:"failure_reason"`
+	WaitingReason string `json:"waiting_reason"`
 	Current       *struct {
 		DeviceName string  `json:"device_name"`
 		Progress   float64 `json:"progress"`
@@ -403,11 +451,13 @@ func (a *App) pollOnce(ctx context.Context) bool {
 				h.Status, h.Error = j.Status, j.FailureReason
 			case "created", "ready":
 				h.Status = "queued"
+				h.WaitingReason = j.WaitingReason
 				if h.Stage == "" {
 					h.Stage = "waiting for a free worker"
 				}
 			default:
 				h.Status = "running"
+				h.WaitingReason = ""
 			}
 		})
 	}
@@ -514,7 +564,9 @@ func (a *App) configView() map[string]any {
 func (a *App) itemView(h *histItem) map[string]any {
 	params := map[string]any{}
 	for k, v := range h.Params {
-		if !strings.HasPrefix(k, "_") {
+		// "_..." keys and "segments" are the app's own bookkeeping; the controller
+		// rejects them as unknown fields when Retry posts the params back.
+		if !strings.HasPrefix(k, "_") && !internalParams[k] {
 			params[k] = v
 		}
 	}
@@ -532,7 +584,8 @@ func (a *App) itemView(h *histItem) map[string]any {
 	}
 	return map[string]any{"id": h.ID, "prompt": h.Prompt, "params": params, "created_at": h.CreatedAt, "status": h.Status,
 		"progress": h.Progress, "stage": h.Stage, "worker": h.Worker, "error": h.Error, "video_url": video,
-		"seconds_total": int(end.Sub(h.CreatedAt).Seconds()), "eta_seconds": eta, "local": h.Local}
+		"seconds_total": int(end.Sub(h.CreatedAt).Seconds()), "eta_seconds": eta, "local": h.Local,
+		"waiting_reason": h.WaitingReason}
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -583,7 +636,7 @@ func (a *App) Register(mux *http.ServeMux) {
 			}
 		}
 		a.mu.Lock()
-		a.cfg = appConfig{ControllerURL: base, Token: token, Project: project}
+		a.cfg.ControllerURL, a.cfg.Token, a.cfg.Project = base, token, project
 		err = a.saveCfgLocked()
 		a.mu.Unlock()
 		if err != nil {
@@ -594,13 +647,15 @@ func (a *App) Register(mux *http.ServeMux) {
 		a.poke()
 		writeJSON(w, 200, a.configView())
 	})
+	a.registerLogin(mux)
 	a.registerLocal(mux)
 	a.registerDiscovery(mux)
 	mux.HandleFunc("GET /local/api/app/models", func(w http.ResponseWriter, r *http.Request) {
 		out := []map[string]any{}
 		for _, m := range a.localModels() {
 			out = append(out, map[string]any{"id": m.ID, "name": m.Name, "architecture": "", "family": m.Family, "active": false,
-				"parameter_count": m.Params, "styles": m.Styles, "default_style": m.DefaultStyle, "source": "local", "path": m.Path})
+				"parameter_count": m.Params, "styles": m.Styles, "default_style": m.DefaultStyle, "source": "local", "path": m.Path,
+				"default_seconds": m.DefaultSeconds, "default_fps": m.DefaultFPS})
 		}
 		base, token, pid, err := a.snapshot()
 		if err != nil {
@@ -667,7 +722,7 @@ func (a *App) Register(mux *http.ServeMux) {
 			return
 		}
 		req.Prompt = strings.TrimSpace(req.Prompt)
-		if req.Prompt == "" || len(req.Prompt) > 1000 {
+		if n := utf8.RuneCountInString(req.Prompt); n == 0 || n > maxPromptRunes {
 			writeErr(w, 400, "the prompt must be 1-1000 characters")
 			return
 		}
@@ -678,8 +733,17 @@ func (a *App) Register(mux *http.ServeMux) {
 				writeErr(w, 400, "this app cannot run models locally")
 				return
 			}
-			if _, ok := a.findLocal(req.ModelVersion); !ok {
+			lm, ok := a.findLocal(req.ModelVersion)
+			if !ok {
 				writeErr(w, 400, "that model folder is no longer available; load it again")
+				return
+			}
+			if lm.Family != "hd" && utf8.RuneCountInString(req.Prompt) > maxSmallPromptRunes {
+				writeErr(w, 400, "this model takes prompts of 1-200 characters")
+				return
+			}
+			if err := a.Gate.NetworkBusy(); err != nil {
+				writeErr(w, 409, err.Error())
 				return
 			}
 		} else {
@@ -905,6 +969,7 @@ func (a *App) pollGeneration(ctx context.Context, base, token string, it histIte
 		Workers       []string `json:"workers"`
 		ArtifactID    *string  `json:"artifact_id"`
 		Failure       string   `json:"failure_reason"`
+		WaitingReason string   `json:"waiting_reason"`
 	}
 	err := a.call(ctx, base, token, "GET", "/projects/"+it.ProjectID+"/generations/"+it.GenerationID, nil, &g)
 	a.update(it.ID, func(h *histItem) {
@@ -919,6 +984,10 @@ func (a *App) pollGeneration(ctx context.Context, base, token string, it histIte
 		h.pollFailures = 0
 		h.Progress = g.Progress
 		h.Worker = strings.Join(g.Workers, ", ")
+		h.WaitingReason = ""
+		if g.Progress == 0 && len(g.Workers) == 0 {
+			h.WaitingReason = g.WaitingReason
+		}
 		switch g.Stage {
 		case "draft":
 			h.Stage = "drawing the whole video at low resolution"

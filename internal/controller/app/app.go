@@ -19,6 +19,7 @@ import (
 	"nivra/internal/controller/api"
 	"nivra/internal/controller/artifacts"
 	"nivra/internal/controller/auth"
+	"nivra/internal/controller/backup"
 	"nivra/internal/controller/core"
 	"nivra/internal/controller/enrollment"
 	"nivra/internal/controller/events"
@@ -29,6 +30,7 @@ import (
 	"nivra/internal/controller/workers"
 	"nivra/internal/shared/config"
 	"nivra/internal/shared/lockfile"
+	"nivra/internal/shared/logrotate"
 	"nivra/internal/shared/versioning"
 	"nivra/internal/webui"
 )
@@ -124,11 +126,9 @@ func EnsureDirs(dataDir string) error {
 
 // NewLogger writes JSON logs to the console and <data_dir>/logs/controller.log.
 func NewLogger(dataDir string, console io.Writer) (*slog.Logger, io.Closer, error) {
-	path := filepath.Join(dataDir, "logs", "controller.log")
-	if st, err := os.Stat(path); err == nil && st.Size() > 50<<20 {
-		_ = os.Rename(path, path+".1")
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	// Size-based rotation while running (a Pi that stays up for months must not
+	// fill its SD card): 20 MB per file, five old files kept.
+	f, err := logrotate.New(filepath.Join(dataDir, "logs", "controller.log"), 20<<20, 5)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -294,6 +294,15 @@ func (rt *Runtime) Serve(ctx context.Context, opts Options) error {
 			}
 		}
 	})
+
+	if cfg.BackupEnabled {
+		start(func(c context.Context) {
+			backup.RunScheduler(c, log, backup.Options{DataDir: cfg.DataDir, DatabaseURL: cfg.DatabaseURL, PgDump: cfg.PgDumpPath,
+				Dir: cfg.BackupDir, Retain: cfg.BackupRetain, DockerContainer: cfg.BackupDockerContainer}, cfg.BackupHour)
+		})
+	} else {
+		log.Warn("nightly backups are switched off (backup_enabled=false); back up the database yourself, see docs/installation/BACKUP.md")
+	}
 
 	err = rt.Server.ListenAndServe(ctx, cfg.ListenAddr, func(a net.Addr) {
 		log.Info("Nivra Studio ready", "url", "http://"+a.String()+"/", "api", "http://"+a.String()+"/api/v1/health",

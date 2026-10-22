@@ -60,14 +60,14 @@ See `docs/research/EXPERIMENTS.md` (pytest summary, training runs, benchmarks).
 
 ## Using the model across computers (generation, not training)
 
-Pi controller (`nivra-pg`, migrations 1–6), workers `benji-laptop` (Windows) and `benjipi-worker` (Pi).
+Pi controller (`nivra-pg`, migrations 1–6), workers `laptop-worker` (Windows) and `pi-worker` (Pi).
 Trained bundle `runs/release/nivra-small-6000` imported through the admin API (same calls as Studio
 → Models → Import bundle) and set as the default model.
 
 | Test | Result |
 |------|--------|
 | `nivra generate --bundle runs/release/nivra-small-6000 ...` (local, no controller) | PASS — 16 frames 256×256, 2.8 s sampling on the laptop CPU |
-| `nivra generate --url <controller> --user admin ...` from the laptop | PASS — job ran on `benjipi-worker` (model downloaded automatically), MP4 downloaded |
+| `nivra generate --url <controller> --user admin ...` from the laptop | PASS — job ran on `pi-worker` (model downloaded automatically), MP4 downloaded |
 | ComfyUI `Nivra Remote Text-to-Video (network)` with `NIVRA_TOKEN` (ComfyUI `7a28332`) | PASS — frames returned into ComfyUI, MP4 exported |
 | 4 simultaneous users (1 ComfyUI + 3 CLI with a personal API token) | PASS — requests spread over both workers in parallel (Pi took the ComfyUI job, laptop the three CLI jobs back to back), all 4 MP4s valid (16 frames), CLI users finished after 13 s, 23 s, 34 s |
 | API tokens: operator token works without CSRF, viewer token forbidden to create jobs, revoked token refused (`TestAPITokens`) | PASS |

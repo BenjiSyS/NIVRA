@@ -265,11 +265,20 @@ func (s *Service) validateMP4(ctx context.Context, in scheduler.ValidationInput,
 		return scheduler.Verdict{}, err
 	}
 	defer f.Close()
-	head := make([]byte, 12)
-	if _, err := io.ReadFull(f, head); err != nil || string(head[4:8]) != "ftyp" {
-		return scheduler.Verdict{Reason: "artifact is not an MP4 file"}, nil
+	st, err := f.Stat()
+	if err != nil {
+		return scheduler.Verdict{}, err
 	}
-	return scheduler.Verdict{Accept: true, Units: 1, UnitKind: "videos", Credit: 0}, nil
+	// A structural check in Go (the ffprobe equivalent): complete moov, video
+	// track with frames, non-zero duration, index consistent with the data.
+	// A truncated or garbage segment is rejected here and retried, instead of
+	// being stitched into the final video.
+	mi, err := inspectMP4(f, st.Size())
+	if err != nil {
+		return scheduler.Verdict{Reason: "the video is not usable: " + err.Error(), Retry: true}, nil
+	}
+	return scheduler.Verdict{Accept: true, Units: 1, UnitKind: "videos", Credit: 0,
+		Detail: map[string]any{"frames": mi.Frames, "width": mi.Width, "height": mi.Height, "duration_sec": mi.DurationSec}}, nil
 }
 
 func mustPath(s *Service, ctx context.Context, projectID, id string) string {

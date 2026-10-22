@@ -40,6 +40,7 @@ def write_dataset(root, n=2, T=17, H=64, W=64, key="videos", latents=None):
 def cfg_with(stages, **train):
     cfg = load_hd_config("nivra_hd_tiny")
     cfg["train"]["stages"] = stages
+    cfg["train"].pop("vae_stages", None)       # these tests pin one stage list for both VAE and DiT
     cfg["train"].update(train)
     return cfg
 

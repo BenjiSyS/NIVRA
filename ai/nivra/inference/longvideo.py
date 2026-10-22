@@ -69,6 +69,7 @@ def run_draft(pipe: HDPipeline, *, prompt: str, seed: int, seconds: float, fps: 
     state = None
     written = 0
     meta0: dict = {}
+    cond_mode = None
     try:
         for i, (a, b) in enumerate(plan):
             def cb(stage, k, n, _i=i):
@@ -84,6 +85,7 @@ def run_draft(pipe: HDPipeline, *, prompt: str, seed: int, seconds: float, fps: 
                 overlap = vc.frames_for_latent(2)
                 res = pipe.continue_video(state, frames=overlap + tf * math.ceil(need / tf), on_progress=cb,
                                           should_stop=should_stop, **kw)
+                cond_mode = res.meta.get("conditioning")
             if res.frames.shape[0] < need:
                 raise RuntimeError(f"segment {i} produced {res.frames.shape[0]} frames, expected {need}")
             writer.write(res.frames[:need])
@@ -101,7 +103,10 @@ def run_draft(pipe: HDPipeline, *, prompt: str, seed: int, seconds: float, fps: 
     return {"frames": F, "segments": N, "fps": fps, "width": width, "height": height,
             "seconds": F / fps, "seconds_total": time.time() - t0,
             "model_version_id": meta0.get("model_version_id"),
-            "style": meta0.get("style"), "peak_rss_mb": meta0.get("peak_rss_mb")}
+            "style": meta0.get("style"), "peak_rss_mb": meta0.get("peak_rss_mb"),
+            # how the continuation segments were conditioned on their predecessor: "mask" (clean frames + flag
+            # embedding, frame_cond models) or "replace" (noise-path replacement, older models); None = 1 segment
+            "conditioning": cond_mode}
 
 
 # ===================================================================== ai.refine_segment

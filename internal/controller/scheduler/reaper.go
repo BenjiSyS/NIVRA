@@ -45,9 +45,13 @@ func (s *Scheduler) ReapOnce(ctx context.Context) (int, error) {
 		}
 		for _, p := range ps {
 			var project string
+			// An expired lease usually means the computer slept or went offline: refund the
+			// attempt (capped per job) so a laptop that closes does not fail a long video.
 			err := tx.QueryRow(ctx, `UPDATE jobs SET
-					status = CASE WHEN attempt_count < max_attempts THEN 'ready' ELSE 'failed' END,
-					completed_at = CASE WHEN attempt_count < max_attempts THEN NULL ELSE now() END,
+					status = CASE WHEN refund_count < `+maxRefundsSQL+` OR attempt_count < max_attempts THEN 'ready' ELSE 'failed' END,
+					completed_at = CASE WHEN refund_count < `+maxRefundsSQL+` OR attempt_count < max_attempts THEN NULL ELSE now() END,
+					attempt_count = CASE WHEN refund_count < `+maxRefundsSQL+` THEN GREATEST(attempt_count-1, 0) ELSE attempt_count END,
+					refund_count = refund_count + 1,
 					failure_reason = 'lease expired', current_attempt_id = NULL, updated_at = now()
 				WHERE id=$1 AND current_attempt_id=$2 RETURNING project_id`, p.job, p.attempt).Scan(&project)
 			if err == nil {

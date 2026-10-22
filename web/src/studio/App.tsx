@@ -5,6 +5,7 @@ import { href, navigate, useRoute } from '../shared/router'
 import { DialogHost, Empty, ErrorNote, Spinner, ToastHost, loadPref, savePref, toastError, useAction, applyDensity } from '../shared/ui'
 import { api, setCsrf, setUnauthorizedHandler } from './api'
 import { Header } from './Header'
+import { Join } from './Join'
 import { SessionContext, roleAtLeast, useSession } from './session'
 import { LiveStore, StoreContext, useLive } from './store'
 import type { Project, Role, User } from './types'
@@ -21,6 +22,9 @@ const Datasets = lazy(() => import('./pages/Datasets'))
 const Contributions = lazy(() => import('./pages/Contributions'))
 const Logs = lazy(() => import('./pages/Logs'))
 const Settings = lazy(() => import('./pages/Settings'))
+const Users = lazy(() => import('./pages/Users'))
+const Storage = lazy(() => import('./pages/Storage'))
+const MemberHome = lazy(() => import('./pages/MemberHome'))
 
 interface AuthResp {
   user: User
@@ -30,6 +34,20 @@ interface AuthResp {
 type AuthState = { kind: 'loading' } | { kind: 'anon'; notice?: string } | { kind: 'in'; user: User }
 
 export function App() {
+  // The invitation link is public: it must not wait for, or require, a session.
+  if (window.location.pathname.replace(/\/+$/, '') === '/join') {
+    return (
+      <>
+        <Join />
+        <DialogHost />
+        <ToastHost />
+      </>
+    )
+  }
+  return <MainApp />
+}
+
+function MainApp() {
   const [auth, setAuth] = useState<AuthState>({ kind: 'loading' })
 
   useEffect(() => {
@@ -193,7 +211,8 @@ function Authed(props: { user: User; signOut: () => void }) {
       </div>
     )
 
-  const project = projects.find((p) => p.id === pid)
+  // A member with a single project goes straight in.
+  const project = projects.find((p) => p.id === pid) ?? (props.user.role === 'member' && projects.length === 1 ? projects[0] : undefined)
   if (!project) {
     return <ProjectPicker user={props.user} projects={projects} onPick={switchProject} reload={reload} signOut={props.signOut} />
   }
@@ -210,7 +229,7 @@ function Authed(props: { user: User; signOut: () => void }) {
         signOut: props.signOut,
       }}
     >
-      <Shell key={project.id} />
+      {props.user.role === 'member' ? <Suspense fallback={<div className="center-screen"><Spinner /></div>}><MemberHome /></Suspense> : <Shell key={project.id} />}
     </SessionContext.Provider>
   )
 }
@@ -271,7 +290,7 @@ function ProjectPicker(props: { user: User; projects: Project[]; onPick: (id: st
   )
 }
 
-const NAV: { id: string; label: string }[] = [
+const NAV: { id: string; label: string; min?: Role }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'workers', label: 'Workers' },
   { id: 'queue', label: 'Queue' },
@@ -282,12 +301,14 @@ const NAV: { id: string; label: string }[] = [
   { id: 'generate', label: 'Generate' },
   { id: 'datasets', label: 'Datasets' },
   { id: 'contributions', label: 'Contributions' },
+  { id: 'storage', label: 'Storage', min: 'operator' },
+  { id: 'users', label: 'People', min: 'admin' },
   { id: 'logs', label: 'Logs' },
   { id: 'settings', label: 'Settings' },
 ]
 
 function Shell() {
-  const { pid } = useSession()
+  const { pid, can } = useSession()
   const [store, setStore] = useState<LiveStore | null>(null)
   const route = useRoute()
   const page = route.segments[0] ?? 'overview'
@@ -325,6 +346,8 @@ function Shell() {
       case 'contributions': return <Contributions />
       case 'logs': return <Logs />
       case 'settings': return <Settings />
+      case 'storage': return <Storage />
+      case 'users': return <Users />
       default:
         return <Empty title="Page not found">There is no page called “{page}”. Pick one from the menu.</Empty>
     }
@@ -345,7 +368,7 @@ function Shell() {
       <div className="app">
         <Header />
         <nav className="side" aria-label="Main">
-          {NAV.map((n) => (
+          {NAV.filter((n) => !n.min || can(n.min)).map((n) => (
             <a key={n.id} href={href(n.id)} className={'navlink' + (page === n.id ? ' active' : '')} aria-current={page === n.id ? 'page' : undefined}>
               {n.label}
             </a>

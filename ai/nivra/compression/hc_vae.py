@@ -29,6 +29,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HCVAE_VERSION = "nivra-hc-vae/1"
+# v2 = the config uses a v2-only feature (per-channel latent normalisation: latent_shift / latent_scale as
+# [C] vectors). v1 configs, weights and bundles load unchanged; v1 readers reject v2 files explicitly.
+HCVAE_VERSION_2 = "nivra-hc-vae/2"
+HCVAE_VERSIONS = (HCVAE_VERSION, HCVAE_VERSION_2)
+TEMPORAL_DOWN_FOR_FACTOR = {8: (1, 2, 3), 4: (2, 3)}   # `temporal_factor` option -> temporal_down (32x spatial)
 
 
 @dataclass
@@ -43,8 +48,11 @@ class HCVAEConfig:
     n_res_dec: int = 2          # residual blocks per level (decoder)
     logvar_min: float = -30.0
     logvar_max: float = 20.0
-    latent_shift: float = 0.0   # z_scaled = (z - shift) * scale  (calibrated after training)
-    latent_scale: float = 1.0
+    # z_scaled = (z - shift) * scale  (calibrated after training). A float ("scalar" mode, v1) or a list of
+    # latent_channels floats ("channel" mode, v2: every channel gets its own mean / 1/std from encode statistics).
+    latent_shift: object = 0.0
+    latent_scale: object = 1.0
+    latent_norm: str = "scalar"   # "scalar" | "channel"
     version: str = HCVAE_VERSION
 
     @property
@@ -55,25 +63,63 @@ class HCVAEConfig:
     def temporal_factor(self) -> int:
         return 2 ** len(self.temporal_down)
 
+    @property
+    def per_channel(self) -> bool:
+        return self.latent_norm == "channel"
+
     def validate(self) -> None:
-        if self.version != HCVAE_VERSION:
+        if self.version not in HCVAE_VERSIONS:
             raise ValueError(f"unsupported HC-VAE version {self.version!r}")
         if len(self.channels) < 2:
             raise ValueError("need at least two levels")
         n_tr = len(self.channels) - 1
         if any(not 0 <= i < n_tr for i in self.temporal_down) or len(set(self.temporal_down)) != len(self.temporal_down):
             raise ValueError(f"temporal_down must be distinct transition indices in [0,{n_tr})")
+        if self.latent_norm not in ("scalar", "channel"):
+            raise ValueError(f"latent_norm must be 'scalar' or 'channel', got {self.latent_norm!r}")
+        vec = [isinstance(self.latent_shift, (list, tuple)), isinstance(self.latent_scale, (list, tuple))]
+        if self.per_channel != all(vec) or (not self.per_channel and any(vec)):
+            raise ValueError("latent_norm 'channel' needs latent_shift and latent_scale lists of latent_channels "
+                             "floats; 'scalar' needs plain numbers")
+        for name in ("latent_shift", "latent_scale"):
+            v = getattr(self, name)
+            vals = list(v) if isinstance(v, (list, tuple)) else [v]
+            if isinstance(v, (list, tuple)) and len(vals) != self.latent_channels:
+                raise ValueError(f"{name} has {len(vals)} entries, latent_channels is {self.latent_channels}")
+            if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in vals):
+                raise ValueError(f"{name} must be finite numbers")
+        if self.per_channel and self.version == HCVAE_VERSION:
+            raise ValueError("per-channel latent normalisation needs HC-VAE version nivra-hc-vae/2")
+        if any(x <= 0 for x in (self.latent_scale if isinstance(self.latent_scale, (list, tuple)) else [self.latent_scale])):
+            raise ValueError("latent_scale must be > 0")
 
     @staticmethod
     def from_dict(d: dict) -> "HCVAEConfig":
-        known = set(HCVAEConfig.__dataclass_fields__)
+        known = set(HCVAEConfig.__dataclass_fields__) | {"temporal_factor"}
         unknown = set(d) - known
         if unknown:
             raise ValueError(f"unknown HC-VAE config keys {sorted(unknown)}")
         d = dict(d)
+        if "temporal_factor" in d:
+            tf = d.pop("temporal_factor")
+            if isinstance(tf, bool) or tf not in TEMPORAL_DOWN_FOR_FACTOR:
+                raise ValueError(f"temporal_factor must be 4 or 8, got {tf!r}")
+            td = TEMPORAL_DOWN_FOR_FACTOR[tf]
+            if "temporal_down" in d and tuple(d["temporal_down"]) != td:
+                raise ValueError(f"temporal_factor {tf} contradicts temporal_down {list(d['temporal_down'])} "
+                                 f"(expected {list(td)})")
+            if len(d.get("channels", HCVAEConfig.channels)) != 6:
+                raise ValueError("temporal_factor needs the standard 32x spatial layout (6 channel levels); "
+                                 "give temporal_down explicitly for other layouts")
+            d["temporal_down"] = td
         for k in ("channels", "temporal_down"):
             if k in d:
                 d[k] = tuple(d[k])
+        for k in ("latent_shift", "latent_scale"):
+            if isinstance(d.get(k), (list, tuple)):
+                d[k] = [float(x) for x in d[k]]
+        if d.get("latent_norm") == "channel" and "version" not in d:
+            d["version"] = HCVAE_VERSION_2
         c = HCVAEConfig(**d)
         c.validate()
         return c
@@ -82,6 +128,10 @@ class HCVAEConfig:
         d = asdict(self)
         d["channels"] = list(self.channels)
         d["temporal_down"] = list(self.temporal_down)
+        if self.latent_norm == "scalar":
+            d.pop("latent_norm")            # v1 configs serialise exactly as before (stable hd_config_sha)
+        else:
+            d["latent_shift"], d["latent_scale"] = list(self.latent_shift), list(self.latent_scale)
         return d
 
     # ---------------------------------------------------------------- geometry
@@ -143,7 +193,7 @@ class CausalConv3d(nn.Module):
         if self.stream:
             if (x.shape[2] - self.kt) % self.st:
                 raise ValueError("streaming chunk length is not aligned to the temporal stride "
-                                 "(encoder chunks must be 1+8a frames first, then multiples of 8)")
+                                 "(encoder chunks must be 1+f*a frames first, then multiples of f, f = the temporal factor)")
             keep = self.kt - self.st
             # clone: a slice is a view that keeps the whole (cache + chunk) input alive, i.e. up to
             # (kt-1+chunk)/(kt-1) times the memory the cache needs, for every layer of every tile
@@ -411,19 +461,54 @@ class HCVAE(nn.Module):
             raise ValueError(f"expected {self.cfg.in_channels} channels, got {c}")
 
     # ------------------------------------------------------------ scaling
+    def _norm(self, z: torch.Tensor):
+        """(shift, scale) broadcastable against z [B,C,...]: Python floats in scalar mode, [1,C,1,..] tensors in
+        per-channel mode (cast to z's dtype / device)."""
+        sh, sc = self.cfg.latent_shift, self.cfg.latent_scale
+        if self.cfg.per_channel:
+            shape = (1, -1) + (1,) * (z.dim() - 2)
+            sh = torch.tensor(sh, dtype=z.dtype, device=z.device).view(shape)
+            sc = torch.tensor(sc, dtype=z.dtype, device=z.device).view(shape)
+        return sh, sc
+
     def to_scaled(self, z):
-        return (z - self.cfg.latent_shift) * self.cfg.latent_scale
+        sh, sc = self._norm(z)
+        return (z - sh) * sc
 
     def from_scaled(self, zs):
-        return zs / self.cfg.latent_scale + self.cfg.latent_shift
+        sh, sc = self._norm(zs)
+        return zs / sc + sh
 
     @torch.no_grad()
-    def calibrate(self, latents: torch.Tensor) -> dict:
-        """Set latent shift/scale from unscaled latents so scaled latents have mean 0, std 1."""
+    def calibrate(self, latents: torch.Tensor, per_channel: Optional[bool] = None) -> dict:
+        """Set latent shift/scale from unscaled latents [N,C,T,H,W] so scaled latents have mean 0, std 1: one
+        scalar pair, or (per_channel=True, or the config's latent_norm == 'channel') one pair per latent channel
+        computed from the encode statistics of every channel (Wan-style [C] mean / std)."""
         z = latents.float()
-        self.cfg.latent_shift = float(z.mean())
-        self.cfg.latent_scale = float(1.0 / max(z.std().item(), 1e-6))
-        return {"latent_shift": self.cfg.latent_shift, "latent_scale": self.cfg.latent_scale}
+        per = self.cfg.per_channel if per_channel is None else bool(per_channel)
+        if per:
+            if z.dim() < 3 or z.shape[1] != self.cfg.latent_channels:
+                raise ValueError(f"per-channel calibration needs latents [N,{self.cfg.latent_channels},...], "
+                                 f"got {tuple(z.shape)}")
+            dims = [0] + list(range(2, z.dim()))
+            mean = z.mean(dim=dims)
+            std = z.std(dim=dims) if z.numel() // z.shape[1] > 1 else torch.ones_like(mean)
+            self.cfg.latent_norm = "channel"
+            if self.cfg.version == HCVAE_VERSION:
+                self.cfg.version = HCVAE_VERSION_2
+            self.cfg.latent_shift = [float(x) for x in mean]
+            self.cfg.latent_scale = [float(1.0 / max(float(x), 1e-6)) for x in std]
+        else:
+            self.cfg.latent_norm = "scalar"
+            self.cfg.latent_shift = float(z.mean())
+            self.cfg.latent_scale = float(1.0 / max(z.std().item(), 1e-6))
+        self.cfg.validate()
+        return {"latent_shift": self.cfg.latent_shift, "latent_scale": self.cfg.latent_scale,
+                "latent_norm": self.cfg.latent_norm}
+
+    def last_layer_weight(self) -> torch.nn.Parameter:
+        """Weight of the decoder's output convolution (the layer the adaptive GAN weight is computed at)."""
+        return self.decoder.conv_out.conv.weight
 
     # ------------------------------------------------------------ chunked / tiled passes
     def stream_state_bytes_per_tile(self, which: str, win_h: int, win_w: int, dtype=torch.float32, batch: int = 1) -> int:
@@ -535,7 +620,7 @@ class HCVAE(nn.Module):
         return {"version": c.version, "config": c.to_dict(), "spatial_factor": c.spatial_factor,
                 "temporal_factor": c.temporal_factor, "latent_channels": c.latent_channels, "causal": True,
                 "frame_rule": f"1+{c.temporal_factor}k", "pad_multiple": c.spatial_factor,
-                "latent_shift": c.latent_shift, "latent_scale": c.latent_scale,
+                "latent_shift": c.latent_shift, "latent_scale": c.latent_scale, "latent_norm": c.latent_norm,
                 "params": sum(p.numel() for p in self.parameters()),
                 "decoder_radius_latent": self.decoder.radius, "encoder_radius_latent": self.encoder.radius}
 
@@ -602,13 +687,62 @@ def hcvae_loss(x: torch.Tensor, recon: torch.Tensor, mean: torch.Tensor, logvar:
     return {"loss": total, **out}
 
 
+# ===================================================================== adversarial (patch-GAN) loss
+class PatchDiscriminator(nn.Module):
+    """Small 3D patch discriminator (a few strided (3,4,4) convolutions + GroupNorm(1), LeakyReLU) returning a
+    grid of real/fake logits [B,1,T,h',w']. Images are T=1 clips (the temporal kernel just sees zero padding), so
+    one discriminator serves the joint image + video batches of the staged VAE recipe. Trained from scratch: no
+    pretrained network, no licence concern."""
+
+    def __init__(self, in_channels: int = 3, base: int = 32, n_layers: int = 3):
+        super().__init__()
+        if n_layers < 1 or base < 1:
+            raise ValueError("n_layers and base must be >= 1")
+        layers = [nn.Conv3d(in_channels, base, (3, 4, 4), (1, 2, 2), (1, 1, 1)), nn.LeakyReLU(0.2)]
+        c = base
+        for i in range(1, n_layers):
+            c2 = min(base * 2 ** i, 8 * base)
+            layers += [nn.Conv3d(c, c2, (3, 4, 4), (1, 2, 2), (1, 1, 1)), nn.GroupNorm(1, c2), nn.LeakyReLU(0.2)]
+            c = c2
+        layers += [nn.Conv3d(c, 1, (3, 3, 3), (1, 1, 1), (1, 1, 1))]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def hinge_d_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (F.relu(1.0 - real_logits.float()).mean() + F.relu(1.0 + fake_logits.float()).mean())
+
+
+def hinge_g_loss(fake_logits: torch.Tensor) -> torch.Tensor:
+    return -fake_logits.float().mean()
+
+
+def adaptive_gan_weight(rec_loss: torch.Tensor, g_loss: torch.Tensor, last_layer: torch.nn.Parameter,
+                        loss_scale: float = 1.0, max_weight: float = 1e4) -> torch.Tensor:
+    """VQGAN / LTX-style adaptive weight  ||dL_rec/dW|| / (||dL_gan/dW|| + 1e-4)  at the decoder's last layer,
+    clamped to [0, max_weight] and detached. Both losses are multiplied by the same `loss_scale` (the AMP
+    GradScaler scale) so fp16 gradients do not underflow; the ratio does not depend on it. Returns 0 when either
+    gradient is not finite, so a bad step never injects NaN into the objective."""
+    g_rec = torch.autograd.grad(rec_loss * loss_scale, last_layer, retain_graph=True, allow_unused=True)[0]
+    g_gan = torch.autograd.grad(g_loss * loss_scale, last_layer, retain_graph=True, allow_unused=True)[0]
+    if g_rec is None or g_gan is None:
+        return rec_loss.new_zeros(()).detach()
+    w = (g_rec.float().norm() / loss_scale) / (g_gan.float().norm() / loss_scale + 1e-4)
+    if not bool(torch.isfinite(w)):
+        return rec_loss.new_zeros(()).detach()
+    return w.clamp(0.0, max_weight).detach()
+
+
 # ===================================================================== save / load (safetensors + JSON)
 def save_hcvae(vae: HCVAE, directory) -> dict:
     from safetensors.torch import save_file
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
     p = d / "hc_vae.safetensors"
-    save_file({k: v.detach().cpu().contiguous() for k, v in vae.state_dict().items()}, str(p))
+    save_file({k: v.detach().cpu().contiguous() for k, v in vae.state_dict().items()}, str(p),
+              metadata={"kind": "nivra-hcvae", "config": json.dumps(vae.cfg.to_dict(), sort_keys=True)})
     man = vae.manifest()
     man["weights_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
     (d / "hc_vae.json").write_text(json.dumps(man, indent=1))
@@ -619,7 +753,7 @@ def load_hcvae(directory, map_location="cpu") -> HCVAE:
     from safetensors.torch import load_file
     d = Path(directory)
     man = json.loads((d / "hc_vae.json").read_text())
-    if man.get("version") != HCVAE_VERSION:
+    if man.get("version") not in HCVAE_VERSIONS:
         raise ValueError(f"unsupported HC-VAE version {man.get('version')!r}")
     p = d / "hc_vae.safetensors"
     if hashlib.sha256(p.read_bytes()).hexdigest() != man.get("weights_sha256"):

@@ -353,8 +353,20 @@ func (s *Store) Path(ctx context.Context, projectID, id string) (string, Info, e
 	return filepath.Join(s.root, info.storagePath), info, nil
 }
 
-// Import stores a local file as a complete artifact (controller-produced outputs).
+// Import stores a copy of a local file as a complete artifact (controller-produced
+// outputs). The source file is left untouched.
 func (s *Store) Import(ctx context.Context, projectID, kind, path, contentType string) (Info, error) {
+	return s.importFile(ctx, projectID, kind, path, contentType, false)
+}
+
+// ImportMove is like Import but consumes path: it is renamed into the content
+// store when both are on the same filesystem (no second copy of a big upload),
+// and copied only as a fallback.
+func (s *Store) ImportMove(ctx context.Context, projectID, kind, path, contentType string) (Info, error) {
+	return s.importFile(ctx, projectID, kind, path, contentType, true)
+}
+
+func (s *Store) importFile(ctx context.Context, projectID, kind, path, contentType string, move bool) (Info, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return Info{}, err
@@ -372,17 +384,91 @@ func (s *Store) Import(ctx context.Context, projectID, kind, path, contentType s
 		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 			return Info{}, err
 		}
-		if err := copyFile(path, dst+".tmp"); err != nil {
-			return Info{}, err
+		moved := false
+		if move {
+			moved = os.Rename(path, dst) == nil
 		}
-		if err := os.Rename(dst+".tmp", dst); err != nil {
-			return Info{}, err
+		if !moved {
+			if err := copyFile(path, dst+".tmp"); err != nil {
+				_ = os.Remove(dst + ".tmp")
+				return Info{}, err
+			}
+			if err := os.Rename(dst+".tmp", dst); err != nil {
+				return Info{}, err
+			}
 		}
 	}
 	_ = contentType
 	contentType = ContentTypeFor(kind)
 	return scanInfo(s.d.DB.QueryRow(ctx, `INSERT INTO artifacts (project_id, kind, sha256, size_bytes, received_bytes, content_type, state, storage_path, completed_at)
 		VALUES ($1,$2,$3,$4,$4,$5,'complete',$6, now()) RETURNING `+infoCols, projectID, kind, sum, size, contentType, rel))
+}
+
+// MinFreeForUpload is the free space an administrator upload needs at least.
+const MinFreeForUpload = 10 << 30
+
+// RequiredFree is the free space needed to accept an upload of size bytes:
+// the larger of MinFreeForUpload and twice the size (temporary file plus the
+// stored object while both exist, plus headroom).
+func RequiredFree(size int64) uint64 {
+	need := uint64(MinFreeForUpload)
+	if size > 0 && uint64(size)*2 > need {
+		need = uint64(size) * 2
+	}
+	return need
+}
+
+// EnsureFree returns ErrNoSpace when the data disk cannot take an upload of size bytes.
+func (s *Store) EnsureFree(size int64) error {
+	free, err := sysinfo.DiskFree(s.root)
+	if err != nil {
+		return nil // unknown: do not block
+	}
+	if free < RequiredFree(size) {
+		return fmt.Errorf("%w: %.1f GB free, %.1f GB needed", ErrNoSpace, float64(free)/(1<<30), float64(RequiredFree(size))/(1<<30))
+	}
+	return nil
+}
+
+// Delete marks complete, unprotected artifacts of the project as deleted and
+// removes stored files that no other complete artifact still uses. It
+// returns how many artifacts were deleted and how many bytes were freed.
+func (s *Store) Delete(ctx context.Context, projectID string, ids []string) (int, int64, error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	rows, err := s.d.DB.Query(ctx, `UPDATE artifacts SET state='deleted' WHERE project_id::text=$1 AND id::text = ANY($2)
+		AND state='complete' AND NOT protected RETURNING storage_path, size_bytes`, projectID, ids)
+	if err != nil {
+		return 0, 0, err
+	}
+	type gone struct {
+		path string
+		size int64
+	}
+	var list []gone
+	for rows.Next() {
+		var g gone
+		if err := rows.Scan(&g.path, &g.size); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		list = append(list, g)
+	}
+	rows.Close()
+	var freed int64
+	for _, g := range list {
+		if g.path == "" {
+			continue
+		}
+		var used bool
+		if err := s.d.DB.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE storage_path=$1 AND state='complete')`, g.path).Scan(&used); err == nil && !used {
+			if os.Remove(filepath.Join(s.root, g.path)) == nil {
+				freed += g.size
+			}
+		}
+	}
+	return len(list), freed, nil
 }
 
 // ImportBytes stores an in-memory blob.

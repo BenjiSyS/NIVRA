@@ -2,21 +2,28 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"nivra/internal/shared/config"
 	"nivra/internal/shared/lockfile"
+	"nivra/internal/shared/logrotate"
 	"nivra/internal/webui"
 	"nivra/internal/worker/agent"
+	"nivra/internal/worker/keepawake"
 	"nivra/internal/worker/localui"
 )
 
@@ -25,9 +32,15 @@ import (
 // the exe opens the app without any arguments or console window.
 var defaultCommand string
 
+const (
+	appLogMaxBytes = 10 << 20
+	appLogKeep     = 3
+)
+
 // prepareGUI makes a console-less Nivra.exe usable: it runs from the folder
 // the exe lives in (config/, ai/ and bin/ are found relative to it) and writes
-// its output to a log file instead of a console that does not exist.
+// its output to logs/app.log (rotated at 10 MB, 3 old files kept) instead of a
+// console that does not exist.
 func prepareGUI() {
 	exe, err := os.Executable()
 	if err != nil {
@@ -35,57 +48,124 @@ func prepareGUI() {
 	}
 	_ = os.Chdir(filepath.Dir(exe))
 	_ = os.MkdirAll("logs", 0o700)
-	f, err := os.OpenFile(filepath.Join("logs", "app.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	rot, err := logrotate.New(filepath.Join("logs", "app.log"), appLogMaxBytes, appLogKeep)
 	if err != nil {
 		return
 	}
-	os.Stdout, os.Stderr = f, f
-	log.SetOutput(f)
+	// os.Stdout/os.Stderr must be files, so feed the rotating writer through a pipe.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		log.SetOutput(rot)
+		return
+	}
+	go func() { _, _ = io.Copy(rot, pr) }()
+	os.Stdout, os.Stderr = pw, pw
+	log.SetOutput(rot)
+}
+
+// workerConfigPath is defaultConfig without the os.Exit, so a bad NIVRA_CONFIG
+// becomes a message the user can see.
+func workerConfigPath() (string, error) {
+	if v := os.Getenv("NIVRA_CONFIG"); v != "" {
+		if _, err := os.Stat(v); err != nil {
+			return "", fmt.Errorf("the settings file %s (NIVRA_CONFIG) does not exist", v)
+		}
+		return v, nil
+	}
+	return filepath.Join("config", "worker.json"), nil
 }
 
 // cmdApp runs the local worker plus the Nivra App and shows it in an app
 // window. Closing the window stops the app (and this computer's worker).
+// Nivra.exe has no console, so a fatal start-up error is also shown in a
+// message box with the log path.
 func cmdApp(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("app", flag.ExitOnError)
-	cfgPath := fs.String("config", defaultConfig("worker"), "worker config file")
+	err := runApp(ctx, args)
+	if err != nil && defaultCommand != "" {
+		logPath, _ := filepath.Abs(filepath.Join("logs", "app.log"))
+		showMessageBox("Nivra could not start", oneLine(err.Error())+"\n\nMore details: "+logPath)
+	}
+	return err
+}
+
+func oneLine(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
+	if len(s) > 300 {
+		s = s[:300] + "..."
+	}
+	return s
+}
+
+func runApp(ctx context.Context, args []string) error {
+	cfgDefault, cerr := workerConfigPath()
+	fs := flag.NewFlagSet("app", flag.ContinueOnError)
+	cfgPath := fs.String("config", cfgDefault, "worker config file")
 	noWindow := fs.Bool("no-window", false, "do not open a window (open http://127.0.0.1:8741/app yourself)")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if cerr != nil && *cfgPath == "" {
+		return cerr
+	}
 	cfg, err := config.LoadWorker(*cfgPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("the settings file could not be read: %w", err)
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return fmt.Errorf("cannot create the data folder %s: %w", cfg.DataDir, err)
+	}
+	addr, existing, err := chooseUIAddr(cfg.UIListenAddr)
+	if err != nil {
 		return err
 	}
-	appURL := "http://" + cfg.UIListenAddr + "/app"
-	lk, err := lockfile.Acquire(filepath.Join(cfg.DataDir, "worker.lock"))
-	if err != nil {
-		// Already running (the app or `nivra worker run`): just show it.
+	if existing != "" {
+		// Nivra is already open on this computer: just show it.
 		fmt.Println("Nivra is already running on this computer; opening it.")
 		if !*noWindow {
-			showAppWindow(appURL, cfg.DataDir)
+			showAppWindow(existing, cfg.DataDir)
 		}
 		return nil
+	}
+	lk, err := lockfile.Acquire(filepath.Join(cfg.DataDir, "worker.lock"))
+	if err != nil {
+		if errors.Is(err, lockfile.ErrLocked) {
+			// Already running (the app or `nivra worker run`): just show it.
+			fmt.Println("Nivra is already running on this computer; opening it.")
+			if !*noWindow {
+				showAppWindow("http://"+addr+"/app", cfg.DataDir)
+			}
+			return nil
+		}
+		return fmt.Errorf("cannot lock the data folder %s: %w", cfg.DataDir, err)
 	}
 	defer lk.Release()
 	ctx, quit := context.WithCancel(ctx)
 	defer quit()
 	slots, err := agent.NewSlots(ctx, cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot start the worker: %w", err)
 	}
 	a := slots[0]
 	for _, sl := range slots {
 		sl.AutoStart()
 	}
 	app := &localui.App{Dir: cfg.DataDir, AllowInsecure: cfg.AllowInsecureHTTP, Quit: quit,
-		DefaultController: func() string { return a.Status().ControllerURL },
-		ModelDirs:         []string{filepath.Join(".", "models"), filepath.Join(cfg.DataDir, "models")},
-		ScanRoots:         localui.DefaultScanRoots(),
+		Gate: a.Gate(),
+		KeepAwake: func() func() {
+			return keepawake.Acquire(a.Status().Settings.AllowSleepOnBattery)
+		},
+		DefaultController: func() string {
+			if u := a.Status().ControllerURL; u != "" {
+				return u
+			}
+			return os.Getenv("NIVRA_DEFAULT_CONTROLLER")
+		},
+		ModelDirs: []string{filepath.Join(".", "models"), filepath.Join(cfg.DataDir, "models")},
+		ScanRoots: localui.DefaultScanRoots(),
 		Runtime: func() localui.LocalRuntime {
 			// Same hardware choice as worker jobs: the selected CUDA GPU, else CPU.
 			st := a.Status()
-			rt := localui.LocalRuntime{Python: cfg.PythonPath, AIDir: cfg.AIPackageDir, Device: "cpu", Threads: st.Settings.CPUThreads}
+			rt := localui.LocalRuntime{Python: cfg.PythonPath, AIDir: cfg.AIPackageDir, FFmpeg: cfg.FFmpegPath, Device: "cpu", Threads: st.Settings.CPUThreads}
 			if gi := st.Settings.GPUIndex; gi >= 0 && st.Hardware.AI.CUDA {
 				rt.Device = "cuda:" + strconv.Itoa(gi)
 			}
@@ -107,7 +187,7 @@ func cmdApp(ctx context.Context, args []string) error {
 	app.Init()
 	go app.Run(ctx)
 	srv := &localui.Server{A: a, UI: webui.FS(), App: app, Slots: slots[1:]}
-	err = srv.ListenAndServe(ctx, cfg.UIListenAddr, func(addr net.Addr) {
+	err = srv.ListenAndServe(ctx, addr, func(addr net.Addr) {
 		u := "http://" + addr.String() + "/app"
 		fmt.Printf("Nivra App: %s\n", u)
 		if *noWindow {
@@ -130,7 +210,59 @@ func cmdApp(ctx context.Context, args []string) error {
 	for _, sl := range slots {
 		sl.Shutdown()
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("the Nivra window could not be served: %w", err)
+	}
+	return nil
+}
+
+// chooseUIAddr decides where the app's web page is served. If addr is free it is
+// used. If something answers like Nivra there, existingURL is that instance's
+// app URL (open it instead of starting a second one). Otherwise another free
+// loopback port is used.
+func chooseUIAddr(addr string) (use string, existingURL string, err error) {
+	ln, lerr := net.Listen("tcp", addr)
+	if lerr == nil {
+		ln.Close()
+		return addr, "", nil
+	}
+	if isNivra(addr) {
+		return addr, "http://" + addr + "/app", nil
+	}
+	host, _, serr := net.SplitHostPort(addr)
+	if serr != nil {
+		return "", "", fmt.Errorf("the app address %q is not valid: %w", addr, serr)
+	}
+	ln, lerr = net.Listen("tcp", net.JoinHostPort(host, "0"))
+	if lerr != nil {
+		return "", "", fmt.Errorf("port %s is used by another program and no other port is free: %w", addr, lerr)
+	}
+	picked := ln.Addr().String()
+	ln.Close()
+	log.Printf("port %s is busy (another program); using %s instead", addr, picked)
+	return picked, "", nil
+}
+
+// isNivra asks addr's local status route whether a Nivra worker/app answers there.
+func isNivra(addr string) bool {
+	hc := &http.Client{Timeout: 2 * time.Second}
+	resp, err := hc.Get("http://" + addr + "/local/api/status")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false
+	}
+	var st struct {
+		State    *string         `json:"state"`
+		Version  *string         `json:"version"`
+		Hardware json.RawMessage `json:"hardware"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&st) != nil {
+		return false
+	}
+	return st.State != nil && st.Version != nil && len(st.Hardware) > 0
 }
 
 // showAppWindow opens url in a chromeless browser window (Edge or Chrome

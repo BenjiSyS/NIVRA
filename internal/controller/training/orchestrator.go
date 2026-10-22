@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -47,21 +48,43 @@ func (s *Service) version(ctx context.Context, id string) (*version, error) {
 
 func roundKeyPrefix(runID string, round int) string { return fmt.Sprintf("run:%s:r%d:", runID, round) }
 
-// RunLoop drives all active runs until ctx is cancelled.
+// RunLoop drives the background work until ctx is cancelled. Training runs,
+// long-video generations and dataset encoding each get their own goroutine,
+// so a training aggregation or evaluation that takes minutes (controller-side
+// Python) cannot stall the draft -> refine -> stitch progression of videos.
 func (s *Service) RunLoop(ctx context.Context) {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for {
-		s.tick(ctx)
-		s.tickGenerations(ctx)
-		s.tickDatasets(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		case <-s.kick:
-		}
+	var wg sync.WaitGroup
+	loop := func(every time.Duration, kick <-chan struct{}, f func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(every)
+			defer t.Stop()
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				f(ctx)
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				case <-kick:
+				}
+			}
+		}()
 	}
+	loop(5*time.Second, s.kick, s.tick)
+	loop(3*time.Second, s.kickGen, s.tickGenerations)
+	loop(5*time.Second, s.kickData, s.tickDatasets)
+	lastRetention := time.Time{}
+	loop(time.Minute, nil, func(c context.Context) {
+		if time.Since(lastRetention) >= time.Hour {
+			lastRetention = time.Now()
+			s.tickRetention(c)
+		}
+	})
+	wg.Wait()
 }
 
 func (s *Service) tick(ctx context.Context) {

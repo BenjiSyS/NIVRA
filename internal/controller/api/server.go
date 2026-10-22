@@ -329,15 +329,22 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	// Administrator routes (cookie session + CSRF).
 	mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	mux.Handle("POST /api/v1/auth/logout", s.admin(auth.RoleViewer, false, s.handleLogout))
-	mux.Handle("GET /api/v1/auth/me", s.admin(auth.RoleViewer, false, s.handleMe))
-	mux.Handle("GET /api/v1/projects", s.admin(auth.RoleViewer, false, s.handleProjects))
+	mux.Handle("POST /api/v1/auth/logout", s.admin(auth.RoleAny, false, s.handleLogout))
+	mux.Handle("GET /api/v1/auth/me", s.admin(auth.RoleAny, false, s.handleMe))
+	mux.Handle("GET /api/v1/projects", s.admin(auth.RoleAny, false, s.handleProjects))
 	mux.Handle("POST /api/v1/projects", s.admin(auth.RoleAdmin, false, s.handleCreateProject))
 	mux.Handle("GET /api/v1/system", s.admin(auth.RoleViewer, false, s.handleSystem))
 	mux.Handle("GET /api/v1/users", s.admin(auth.RoleAdmin, false, s.handleUsers))
-	mux.Handle("GET /api/v1/tokens", s.admin(auth.RoleViewer, false, s.handleTokens))
-	mux.Handle("POST /api/v1/tokens", s.admin(auth.RoleViewer, false, s.handleCreateToken))
-	mux.Handle("DELETE /api/v1/tokens/{id}", s.admin(auth.RoleViewer, false, s.handleRevokeToken))
+	mux.Handle("POST /api/v1/users/{uid}/status", s.admin(auth.RoleAdmin, false, s.handleUserStatus))
+	mux.Handle("GET /api/v1/invites", s.admin(auth.RoleAdmin, false, s.handleInvites))
+	mux.Handle("POST /api/v1/invites", s.admin(auth.RoleAdmin, false, s.handleCreateInvite))
+	mux.Handle("DELETE /api/v1/invites/{iid}", s.admin(auth.RoleAdmin, false, s.handleRevokeInvite))
+	mux.Handle("GET /api/v1/tokens", s.admin(auth.RoleAny, false, s.handleTokens))
+	mux.Handle("POST /api/v1/tokens", s.admin(auth.RoleAny, false, s.handleCreateToken))
+	mux.Handle("DELETE /api/v1/tokens/{id}", s.admin(auth.RoleAny, false, s.handleRevokeToken))
+	// Friends redeem an invitation here (public, rate limited like sign-in).
+	mux.HandleFunc("POST /api/v1/public/join/check", s.handleJoinCheck)
+	mux.HandleFunc("POST /api/v1/public/join", s.handleJoin)
 	mux.Handle("GET /api/v1/audit", s.admin(auth.RoleAdmin, false, s.handleAudit))
 
 	p := func(method, pattern, role string, h func(http.ResponseWriter, *http.Request, *AdminCtx)) {
@@ -359,12 +366,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	p("GET", "/commands", auth.RoleViewer, s.handleAllCommands)
 	p("GET", "/jobs", auth.RoleViewer, s.handleJobs)
 	p("POST", "/jobs", auth.RoleOperator, s.handleCreateJob)
-	p("GET", "/jobs/{jid}", auth.RoleViewer, s.handleJob)
-	p("POST", "/jobs/{jid}/cancel", auth.RoleOperator, s.handleCancelJob)
+	p("GET", "/jobs/{jid}", auth.RoleAny, s.handleJob)
+	p("POST", "/jobs/{jid}/cancel", auth.RoleMember, s.handleCancelJob)
 	p("POST", "/jobs/{jid}/retry", auth.RoleOperator, s.handleRetryJob)
 	p("GET", "/contributions", auth.RoleViewer, s.handleContributions)
 	p("GET", "/logs", auth.RoleViewer, s.handleLogs)
-	p("GET", "/artifacts/{aid}", auth.RoleViewer, s.handleAdminDownload)
+	p("GET", "/artifacts/{aid}", auth.RoleAny, s.handleAdminDownload)
+	p("GET", "/settings", auth.RoleOperator, s.handleGetSettings)
+	p("PUT", "/settings", auth.RoleAdmin, s.handlePutSettings)
+	p("GET", "/limits", auth.RoleMember, s.handleLimits)
 
 	// Public leaderboard (only devices that opted in).
 	mux.HandleFunc("GET /api/v1/public/projects/{pid}/leaderboard", s.handlePublicLeaderboard)

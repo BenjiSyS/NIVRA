@@ -25,6 +25,7 @@ import (
 type LocalRuntime struct {
 	Python  string
 	AIDir   string
+	FFmpeg  string // configured ffmpeg path ("" = auto)
 	Device  string // cpu | cuda:N
 	Threads int
 	// Devices are every local device that may render long-video segments
@@ -250,6 +251,17 @@ func (a *App) generateLocal(ctx context.Context, it histItem) {
 		fail("Python/PyTorch is not set up on this computer; run Nivra-Setup.bat again")
 		return
 	}
+	// One model at a time on the GPU: refuse while the network worker is using it,
+	// and keep the worker from taking new tasks until this run ends.
+	endGate, gerr := a.Gate.BeginLocal()
+	if gerr != nil {
+		fail(gerr.Error())
+		return
+	}
+	defer endGate()
+	if a.KeepAwake != nil {
+		defer a.KeepAwake()()
+	}
 	jctx, cancel := context.WithCancel(ctx)
 	a.mu.Lock()
 	a.localCancel[it.ID] = cancel
@@ -304,7 +316,7 @@ func (a *App) generateLocal(ctx context.Context, it histItem) {
 		}
 	}
 	pb, _ := json.Marshal(params)
-	run := &pyexec.Runner{Interpreter: rt.Python, AIDir: rt.AIDir, Threads: rt.Threads, Device: rt.Device}
+	run := &pyexec.Runner{Interpreter: rt.Python, AIDir: rt.AIDir, FFmpeg: rt.FFmpeg, Threads: rt.Threads, Device: rt.Device}
 	res, err := run.Run(jctx, work, pyexec.Job{JobType: "ai.generate", JobID: it.ID, AttemptID: it.ID, Params: pb,
 		Inputs: map[string]any{"weights": filepath.Join(m.Path, "weights.safetensors"),
 			"manifest": filepath.Join(m.Path, "model_version.json"), "vae_weights": filepath.Join(m.Path, "vae.safetensors")}},

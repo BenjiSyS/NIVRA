@@ -5,23 +5,37 @@
   "styles": ["anime", "3d animation", "cartoon", "2d animation", "cel-shaded 3d", "pixel art", "claymation",
              "painterly", "realistic"],
   "default_style": "anime",
-  "vae": {"latent_channels": 64, "channels": [32, 64, 128, 256, 256, 512], "temporal_down": [1, 2, 3],
+  "vae": {"latent_channels": 64, "channels": [32, 64, 128, 256, 256, 512], "temporal_factor": 4,
           "n_res": 1, "n_res_dec": 1, "edge_weight": 0.5},
   "model": {"dim": 1024, "depth": 12, "heads": 16, "mlp_ratio": 4.0, "patch": [1, 1, 1], "text_dim": 256,
-            "qk_norm": true},
+            "qk_norm": true, "frame_cond": true, "fps_cond": true},
   "inference": {"width": 448, "height": 256, "seconds": 2, "fps": 8, "steps": 30, "cfg_scale": 5.0,
-                "sampler": "ab2", "shift_base_tokens": 336, "fp16": true, "int8": false, "offload": false,
+                "sampler": "ab2", "shift_base_tokens": 560, "fp16": true, "int8": false, "offload": false,
                 "attn_chunk": 0, "mlp_chunk": 0, "vae_t_chunk": 1, "vae_tile": 0, "vae_overlap": 2,
                 "vae_margin": null},
   "train": {
     "stages": [
-      {"name": "128p_2s", "height": 128, "width": 224, "frames": 17, "steps": 30000},
-      {"name": "256p_2s", "height": 256, "width": 448, "frames": 17, "steps": 50000},
-      {"name": "256p_4s", "height": 256, "width": 448, "frames": 33, "steps": 20000}
+      {"name": "img_128p", "height": 128, "width": 224, "frames": 1, "steps": 15000},
+      {"name": "128p_2s", "height": 128, "width": 224, "frames": 17, "steps": 15000, "image_fraction": 0.2},
+      {"name": "256p_2s", "height": 256, "width": 448, "frames": 17, "steps": 50000, "image_fraction": 0.1},
+      {"name": "256p_4s", "height": 256, "width": 448, "frames": 33, "steps": 20000, "image_fraction": 0.1}
+    ],
+    "vae_stages": [
+      {"name": "ae_image_256p", "height": 256, "width": 448, "frames": 1, "steps": 10000},
+      {"name": "ae_clips_128p", "height": 128, "width": 224, "frames": 17, "steps": 10000, "image_fraction": 0.2},
+      {"name": "ae_target_256p", "height": 256, "width": 448, "frames": 17, "steps": 12000, "image_fraction": 0.2}
     ],
     "batch_size": 2, "grad_accum": 4, "lr": 1e-4, "weight_decay": 0.0, "warmup": 500, "grad_clip": 1.0,
     "optimizer": "adamw8", "grad_checkpoint": true, "fp16": true, "caption_dropout": 0.1, "style_dropout": 0.1,
-    "shift_base_tokens": 336, "vae_lr": 1e-4, "vae_kl_weight": 1e-6, "vae_perc_weight": 0.5,
-    "vae_tdiff_weight": 0.5, "save_every": 1000, "keep_last": 3
+    "shift_base_tokens": 560, "vae_lr": 1e-4, "vae_kl_weight": 1e-6, "vae_perc_weight": 0.5,
+    "vae_tdiff_weight": 0.5, "save_every": 1000, "keep_last": 3,
+    "vae_gan_weight": 0.05, "vae_gan_start": 20000, "vae_gan_lr": 1e-4, "vae_gan_base": 32, "vae_gan_layers": 3,
+    "vae_latent_norm": "channel",
+    "ema_decay": 0.9995, "ema_warmup": true,
+    "sra": {"weight": 0.5, "student_layer": 3, "teacher_layer": 8, "t_ratio": 0.5, "until_step": 60000},
+    "diffusion_forcing": {"fraction": 0.25, "cond_fraction": 0.15},
+    "fps_dropout": 0.1,
+    "fp32_attn": true,
+    "loss_scale": {"init": 65536.0, "growth_interval": 2000, "growth": 2.0, "backoff": 0.5}
   }
 }

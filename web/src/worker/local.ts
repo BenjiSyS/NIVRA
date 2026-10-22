@@ -34,6 +34,13 @@ export interface AIProbe {
   nivra_version?: string
   job_types?: string[]
 }
+export interface FFmpegProbe {
+  ok: boolean
+  ffmpeg_path?: string
+  ffprobe_path?: string
+  version?: string
+  error?: string
+}
 export interface Settings {
   cpu_threads: number
   gpu_index: number
@@ -44,6 +51,7 @@ export interface Settings {
   schedule: { enabled: boolean; start: string; end: string }
   auto_start: boolean
   contributor_name: string
+  allow_sleep_on_battery: boolean
 }
 export interface TaskView {
   attempt_id: string
@@ -79,7 +87,8 @@ export interface Status {
   controller_fingerprint?: string
   last_heartbeat?: string
   task: TaskView | null
-  hardware: { host: HostInfo; gpus: GPUInfo[] | null; ai: AIProbe }
+  hardware: { host: HostInfo; gpus: GPUInfo[] | null; ai: AIProbe; ffmpeg?: FFmpegProbe }
+  video_disabled_reason?: string
   settings: Settings
   executors: string[] | null
   contributions: Contribution[] | null

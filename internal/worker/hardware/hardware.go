@@ -16,6 +16,7 @@ import (
 
 	"nivra/internal/shared/procattr"
 	"nivra/internal/shared/protocol"
+	"nivra/internal/shared/pyexec"
 	"nivra/internal/shared/sysinfo"
 )
 
@@ -33,11 +34,57 @@ type AIProbe struct {
 	JobTypes     []string `json:"job_types,omitempty"`
 }
 
+// FFmpegProbe says whether videos can be encoded here. Both ffmpeg and ffprobe
+// are needed.
+type FFmpegProbe struct {
+	OK          bool   `json:"ok"`
+	FFmpegPath  string `json:"ffmpeg_path,omitempty"`
+	FFprobePath string `json:"ffprobe_path,omitempty"`
+	Version     string `json:"version,omitempty"`
+	// Error is a plain-language reason when OK is false.
+	Error string `json:"error,omitempty"`
+}
+
 // Report is the full local hardware picture.
 type Report struct {
-	Host sysinfo.Host       `json:"host"`
-	GPUs []protocol.GPUInfo `json:"gpus"`
-	AI   AIProbe            `json:"ai"`
+	Host   sysinfo.Host       `json:"host"`
+	GPUs   []protocol.GPUInfo `json:"gpus"`
+	AI     AIProbe            `json:"ai"`
+	FFmpeg FFmpegProbe        `json:"ffmpeg"`
+}
+
+// ProbeFFmpeg locates ffmpeg and ffprobe (configured path, PATH, winget folder)
+// and reads the ffmpeg version.
+func ProbeFFmpeg(ctx context.Context, configured string) FFmpegProbe {
+	t := pyexec.ResolveFFmpeg(configured)
+	p := FFmpegProbe{FFmpegPath: t.FFmpeg, FFprobePath: t.FFprobe}
+	switch {
+	case t.FFmpeg == "" && t.FFprobe == "":
+		p.Error = "ffmpeg is not installed (needed to save videos)"
+		return p
+	case t.FFmpeg == "":
+		p.Error = "ffmpeg was not found (only ffprobe was)"
+		return p
+	case t.FFprobe == "":
+		p.Error = "ffprobe was not found next to ffmpeg"
+		return p
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, t.FFmpeg, "-version")
+	procattr.HideConsole(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		p.Error = "ffmpeg is installed but does not start: " + err.Error()
+		return p
+	}
+	first, _, _ := strings.Cut(string(out), "\n")
+	first = strings.TrimSpace(first)
+	if f := strings.Fields(first); len(f) >= 3 && f[0] == "ffmpeg" && f[1] == "version" {
+		first = f[2]
+	}
+	p.Version, p.OK = first, true
+	return p
 }
 
 // nvidiaSMI finds nvidia-smi on PATH or in its usual Windows location.
@@ -140,7 +187,7 @@ print(json.dumps(r))
 `
 
 // ProbeAI checks whether python + torch + the nivra package are importable.
-func ProbeAI(ctx context.Context, python, aiDir string) AIProbe {
+func ProbeAI(ctx context.Context, python, aiDir, ffmpegPath string) AIProbe {
 	if python == "" {
 		return AIProbe{Error: "no python configured"}
 	}
@@ -153,6 +200,7 @@ func ProbeAI(ctx context.Context, python, aiDir string) AIProbe {
 		cmd = exec.CommandContext(ctx, python, "-I", "-c", "import sys; sys.path.insert(0, "+strconv.Quote(abs)+")\n"+probeScript)
 	}
 	procattr.HideConsole(cmd)
+	cmd.Env = append(os.Environ(), pyexec.ResolveFFmpeg(ffmpegPath).Env()...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
@@ -171,6 +219,7 @@ func ProbeAI(ctx context.Context, python, aiDir string) AIProbe {
 }
 
 // Detect gathers the full report.
-func Detect(ctx context.Context, dataDir, python, aiDir string) Report {
-	return Report{Host: sysinfo.Snapshot(dataDir), GPUs: GPUs(ctx), AI: ProbeAI(ctx, python, aiDir)}
+func Detect(ctx context.Context, dataDir, python, aiDir, ffmpegPath string) Report {
+	return Report{Host: sysinfo.Snapshot(dataDir), GPUs: GPUs(ctx), AI: ProbeAI(ctx, python, aiDir, ffmpegPath),
+		FFmpeg: ProbeFFmpeg(ctx, ffmpegPath)}
 }

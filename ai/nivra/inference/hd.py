@@ -75,7 +75,8 @@ def sample_flow(model: NivraDiT, shape: tuple, text: Optional[torch.Tensor], tex
                 known: Optional[torch.Tensor] = None, known_start: int = 0, t_offset: int = 0,
                 should_stop: Optional[Callable] = None, on_step: Optional[Callable] = None,
                 device="cpu", init: Optional[torch.Tensor] = None, strength: float = 1.0,
-                anchors: Optional[tuple] = None) -> torch.Tensor:
+                anchors: Optional[tuple] = None, clean_cond: Optional[bool] = None,
+                fps: Optional[float] = None) -> torch.Tensor:
     """Integrate the rectified-flow ODE from t=1 (noise) to t=0 on a shifted schedule.
 
     sampler: "euler" or "ab2" (variable-step 2nd-order Adams-Bashforth on the velocity: one model
@@ -84,7 +85,12 @@ def sample_flow(model: NivraDiT, shape: tuple, text: Optional[torch.Tensor], tex
     known: optional [B,C,K,h,w] clean scaled latents imposed (noised along the flow path) at every step.
     init / strength (SDEdit): start from `init` [B,C,T,h,w] noised to t=strength and integrate only the remaining
     part of the schedule (the first scheduled t <= strength). anchors=(frame_indices, latents [B,C,len,h,w]) are
-    imposed like `known` but at arbitrary latent-frame indices (and restored exactly at the end)."""
+    imposed like `known` but at arbitrary latent-frame indices (and restored exactly at the end).
+
+    clean_cond (None = automatic): for models trained with frame conditioning (``cfg.frame_cond``, nivra-dit/2)
+    the known / anchor frames are CLEAN conditioning frames: they are held at their clean values (not re-noised
+    along the flow path), the model receives a mask for them (t = 0 + flag embedding). Models without it keep the
+    original noise-path replacement. fps: effective drawing-rate conditioning for ``fps_cond`` models."""
     if sampler not in ("euler", "ab2"):
         raise ValueError(f"unknown sampler {sampler!r}")
     B = shape[0]
@@ -108,18 +114,32 @@ def sample_flow(model: NivraDiT, shape: tuple, text: Optional[torch.Tensor], tex
     a_idx = a_lat = None
     if anchors is not None:
         a_idx, a_lat = list(anchors[0]), anchors[1].to(device, torch.float32)
+    cfg_m = getattr(model, "cfg", None)
+    use_mask = (bool(getattr(cfg_m, "frame_cond", False)) if clean_cond is None else bool(clean_cond))
+    if use_mask and not getattr(cfg_m, "frame_cond", False):
+        raise ValueError("clean_cond needs a frame_cond (nivra-dit/2) model")
+    cmask = None
+    fps_t = None
+    if getattr(cfg_m, "fps_cond", False) and fps is not None:
+        fps_t = torch.full((B,), float(fps), device=device)
+    if use_mask and (K or a_idx):
+        pt = cfg_m.patch[0]
+        idx = sorted({*(range(known_start, known_start + K) if K else ()), *(a_idx or ())})
+        cmask = torch.zeros(B, shape[2] // pt, dtype=torch.bool, device=device)
+        cmask[:, sorted({j // pt for j in idx})] = True
+    mkw = {} if cmask is None and fps_t is None else {"cond_mask": cmask, "fps": fps_t}
     for i in range(i0, steps):
         if should_stop is not None and should_stop():
             raise Stopped()
         t, tn = ts[i], ts[i + 1]
         if K:
-            x[:, :, sl] = (1 - t) * known + t * noise[:, :, sl]
+            x[:, :, sl] = known if cmask is not None else (1 - t) * known + t * noise[:, :, sl]
         if a_idx is not None:
-            x[:, :, a_idx] = (1 - t) * a_lat + t * noise[:, :, a_idx]
+            x[:, :, a_idx] = a_lat if cmask is not None else (1 - t) * a_lat + t * noise[:, :, a_idx]
         tt = torch.full((B,), t, device=device)
-        v = model(x, tt, text, text_mask, t_offset=t_offset)
+        v = model(x, tt, text, text_mask, t_offset=t_offset, **mkw)
         if use_cfg:
-            v_u = model(x, tt, None, None, t_offset=t_offset)
+            v_u = model(x, tt, None, None, t_offset=t_offset, **mkw)
             v = v_u + cfg_scale * (v - v_u)
         h = tn - t
         if sampler == "ab2" and prev_v is not None:
@@ -156,7 +176,7 @@ class HDPipeline:
     def __init__(self, dit: NivraDiT, vae: HCVAE, text_encoder: TextEncoder, device="cpu", fp16: bool = True,
                  int8: bool = False, offload: bool = False, attn_chunk: int = 0, mlp_chunk: int = 0,
                  vae_t_chunk: int = 1, vae_tile: int = 0, vae_overlap: int = 2, vae_margin: Optional[int] = None,
-                 shift_base_tokens: int = 4096, model_version_id: str = "unversioned", defaults: Optional[dict] = None,
+                 attn_fp32: bool = False, shift_base_tokens: int = 4096, model_version_id: str = "unversioned", defaults: Optional[dict] = None,
                  domain: str = "general", styles: Optional[list] = None, default_style: Optional[str] = None):
         if not isinstance(text_encoder, TextEncoder):
             raise TypeError("text_encoder must implement nivra.text.interface.TextEncoder")
@@ -175,7 +195,7 @@ class HDPipeline:
         self.model_version_id = model_version_id
         self.defaults = dict(defaults or {})
         self.domain, self.styles, self.default_style = domain, list(styles or []), default_style
-        dit.set_memory(grad_checkpoint=False, attn_chunk=attn_chunk, mlp_chunk=mlp_chunk)
+        dit.set_memory(grad_checkpoint=False, attn_chunk=attn_chunk, mlp_chunk=mlp_chunk, attn_fp32=attn_fp32)
         if int8:
             quantize_int8_(dit)
         if self.half:
@@ -192,10 +212,10 @@ class HDPipeline:
         dit = dit if dit is not None else build_dit(cfg)
         vae = vae if vae is not None else build_hcvae(cfg)
         keys = ("fp16", "int8", "offload", "attn_chunk", "mlp_chunk", "vae_t_chunk", "vae_tile", "vae_overlap",
-                "vae_margin", "shift_base_tokens", "model_version_id")
+                "vae_margin", "attn_fp32", "shift_base_tokens", "model_version_id")
         # NB: domain / styles / default_style come from the config, not from inference overrides
         kw = {k: inf[k] for k in keys if k in inf}
-        defaults = {k: inf[k] for k in ("width", "height", "seconds", "fps", "steps", "cfg_scale", "sampler") if k in inf}
+        defaults = {k: inf[k] for k in ("width", "height", "seconds", "fps", "steps", "cfg_scale", "sampler", "effective_fps") if k in inf}
         return cls(dit, vae, text_encoder, device=device, defaults=defaults, domain=cfg.get("domain", "general"),
                    styles=cfg.get("styles"), default_style=cfg.get("default_style"), **kw)
 
@@ -272,7 +292,8 @@ class HDPipeline:
                  steps: Optional[int] = None, cfg_scale: Optional[float] = None, sampler: Optional[str] = None,
                  out_path=None, on_progress: Optional[ProgressFn] = None, should_stop: Optional[Callable] = None,
                  stop_file=None, known: Optional[torch.Tensor] = None, t_offset: int = 0,
-                 continuation_frames: int = 2, segment: int = 1, style: Optional[str] = None) -> HDResult:
+                 continuation_frames: int = 2, segment: int = 1, style: Optional[str] = None,
+                 effective_fps: Optional[float] = None) -> HDResult:
         style, prompt_used = self.style_prompt(prompt, style)      # validate before any heavy work
         d = self.defaults
         width = int(width or d.get("width", 1280))
@@ -308,7 +329,8 @@ class HDPipeline:
             known = known.unsqueeze(0)
         zs = sample_flow(self.dit, (1, C, Tl, Hl, Wl), emb.to(self.device), mask.to(self.device), steps, cfg_scale,
                          seed, sampler, shift, known=known, t_offset=t_offset, should_stop=stop,
-                         on_step=lambda i, n: progress("sample", i, n), device=self.device)
+                         on_step=lambda i, n: progress("sample", i, n), device=self.device,
+                         fps=effective_fps if effective_fps is not None else (d.get("effective_fps") or fps))
         if self.cuda:
             self._dit_to("cpu")
             torch.cuda.empty_cache()
@@ -326,7 +348,9 @@ class HDPipeline:
                                 recent_latents=recent.contiguous(), temporal_position=t_offset + Tl,
                                 segments=segment, steps=steps, cfg_scale=cfg_scale,
                                 text_embedding=emb[0][mask[0]].contiguous(), frames_so_far=None)
-        meta = {"mode": "text_to_video" if known is None else "continuation", "prompt": prompt, "prompt_used": prompt_used,
+        meta = {"mode": "text_to_video" if known is None else "continuation",
+                "conditioning": ("mask" if getattr(self.dit.cfg, "frame_cond", False) else "replace") if known is not None else None,
+                "prompt": prompt, "prompt_used": prompt_used,
                 "style": style, "domain": self.domain, "seed": seed,
                 "steps": steps, "cfg_scale": cfg_scale, "sampler": sampler, "shift": shift, "width": width,
                 "height": height, "padded": [Hp, Wp], "frames": int(video.shape[0]), "fps": fps,
@@ -454,7 +478,8 @@ class HDPipeline:
         anchors = (idx, z0[:, :, idx]) if idx else None
         zs = sample_flow(self.dit, (1, C, Tl, Hl, Wl), emb.to(self.device), mask.to(self.device), steps, cfg_scale, seed,
                          sampler, shift, should_stop=stop, on_step=lambda i, n: progress("sample", i, n),
-                         device=self.device, init=z0, strength=strength, anchors=anchors)
+                         device=self.device, init=z0, strength=strength, anchors=anchors,
+                         fps=d.get("effective_fps") or d.get("fps"))
         if self.cuda:
             self._dit_to("cpu")
             torch.cuda.empty_cache()
@@ -479,7 +504,8 @@ class HDPipeline:
             self.vae.to("cpu")
             torch.cuda.empty_cache()
         timings["seconds_decode"] = time.time() - t0
-        meta = {"mode": "refine", "prompt": prompt, "prompt_used": prompt_used, "style": style, "domain": self.domain,
+        meta = {"mode": "refine", "conditioning": ("mask" if getattr(self.dit.cfg, "frame_cond", False) else "replace"),
+                "prompt": prompt, "prompt_used": prompt_used, "style": style, "domain": self.domain,
                 "seed": seed, "steps": steps, "strength": strength, "cfg_scale": cfg_scale, "sampler": sampler,
                 "shift": shift, "width": width, "height": height, "padded": [Hp, Wp], "frames": n_out,
                 "latent_shape": [C, Tl, Hl, Wl], "tokens": n_tokens, "text_encoder": self.text_encoder.id,

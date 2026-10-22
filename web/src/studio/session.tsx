@@ -1,7 +1,7 @@
 import { createContext, useContext } from 'react'
 import type { Project, Role, User } from './types'
 
-const RANK: Record<Role, number> = { viewer: 0, operator: 1, admin: 2 }
+const RANK: Record<Role, number> = { viewer: 0, member: 0, operator: 2, admin: 3 }
 
 export interface Session {
   user: User
@@ -23,6 +23,12 @@ export function useSession(): Session {
   return s
 }
 
+/**
+ * Mirrors the controller: a member is above nothing and below operators; a
+ * viewer is not a member. Members satisfy only the member level.
+ */
 export function roleAtLeast(have: Role, need: Role): boolean {
+  if (need === 'member') return have !== 'viewer'
+  if (have === 'member') return false
   return RANK[have] >= RANK[need]
 }

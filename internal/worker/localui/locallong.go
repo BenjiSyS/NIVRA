@@ -56,7 +56,7 @@ func runPy(ctx context.Context, rt LocalRuntime, device, work, jobType, id strin
 		return nil, err
 	}
 	pb, _ := json.Marshal(params)
-	run := &pyexec.Runner{Interpreter: rt.Python, AIDir: rt.AIDir, Threads: rt.Threads, Device: device}
+	run := &pyexec.Runner{Interpreter: rt.Python, AIDir: rt.AIDir, FFmpeg: rt.FFmpeg, Threads: rt.Threads, Device: device}
 	res, err := run.Run(ctx, work, pyexec.Job{JobType: jobType, JobID: id, AttemptID: id, Params: pb, Inputs: inputs}, fnReporter{onProgress})
 	if err != nil {
 		var f *pyexec.Failure

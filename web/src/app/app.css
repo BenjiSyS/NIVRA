@@ -55,3 +55,10 @@ html, body, #root { height: 100%; }
 .gen-settings label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-dim); }
 .gen-settings select.input { width: auto; }
 .input.bad { border-color: #a5484f; }
+
+.confirm { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; width: min(460px, calc(100vw - 32px)); box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+.confirm::backdrop { background: rgba(5,8,12,.65); }
+.confirm h2 { margin: 0 0 8px; }
+.confirm .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
+.waiting-reason { font-size: 13px; color: var(--text-dim); }
+.signin-choice { display: flex; gap: 8px; flex-wrap: wrap; }

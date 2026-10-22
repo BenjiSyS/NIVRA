@@ -1,7 +1,7 @@
 # Distributed training run 002 — continuing the trained model on two workers
 
-Date: 2026-10-21. Controller on Raspberry Pi 5 (system torch 2.6.0, aarch64), workers `benji-laptop`
-(Windows, torch 2.14.1 CPU) and `benjipi-worker` (Pi), both marked **trusted** (required for
+Date: 2026-10-21. Controller on Raspberry Pi 5 (system torch 2.6.0, aarch64), workers `laptop-worker`
+(Windows, torch 2.14.1 CPU) and `pi-worker` (Pi), both marked **trusted** (required for
 model-training jobs since the security hardening).
 
 | Item | Value |

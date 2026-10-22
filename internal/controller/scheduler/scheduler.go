@@ -18,6 +18,21 @@ import (
 	"nivra/internal/shared/protocol"
 )
 
+// maxRefunds caps how many attempts of one job are refunded for events that
+// are not its fault (operator stop, lost worker, expired lease).
+const maxRefunds = 5
+
+var maxRefundsSQL = fmt.Sprint(maxRefunds)
+
+// isVideoStage reports whether a job type belongs to the long-video pipeline.
+func isVideoStage(jobType string) bool {
+	switch jobType {
+	case "ai.draft", "ai.refine_segment", "ai.stitch", "ai.generate":
+		return true
+	}
+	return false
+}
+
 // Errors returned to the API layer.
 var (
 	ErrUnknownJobType = errors.New("unknown job type")
@@ -153,17 +168,14 @@ func (s *Scheduler) Lease(ctx context.Context, projectID, deviceID string) (*pro
 		if err != nil {
 			return err
 		}
+		// Leasing is serialised per project so the fairness ranking below sees
+		// every lease already granted (the device row lock only serialises
+		// calls of one device). The critical section is a handful of indexed reads.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 7))`, "lease:"+projectID); err != nil {
+			return err
+		}
 		var jobID string
-		err = tx.QueryRow(ctx, `SELECT j.id FROM jobs j
-			WHERE j.project_id=$1 AND j.status='ready'
-			  AND j.job_type = ANY($2)
-			  AND j.req_ram_mb <= $3 AND j.req_vram_mb <= $4 AND (NOT j.req_gpu OR $4 > 0)
-			  AND (j.req_os IS NULL OR j.req_os = $5)
-			  AND (j.deadline_at IS NULL OR j.deadline_at > now())
-			  AND NOT EXISTS (SELECT 1 FROM job_attempts x WHERE x.job_id=j.id AND x.device_id=$6 AND x.state='rejected')
-			  AND (NOT j.req_trusted OR $7)
-			ORDER BY j.priority DESC, j.created_at
-			LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, projectID, executors, ram, vram, devOS, deviceID, trusted).Scan(&jobID)
+		jobID, err = s.pickJob(ctx, tx, projectID, deviceID, executors, ram, vram, devOS, trusted)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -223,17 +235,17 @@ type attemptRow struct {
 	attemptID, jobID, projectID, deviceID, state, jobStatus, jobType string
 	fencing                                                          int64
 	current                                                          *string
-	leaseSeconds, attemptCount, maxAttempts                          int
+	leaseSeconds, attemptCount, maxAttempts, refunds                 int
 }
 
 func lockAttempt(ctx context.Context, tx pgx.Tx, attemptID string) (*attemptRow, error) {
 	r := &attemptRow{attemptID: attemptID}
 	err := tx.QueryRow(ctx, `SELECT a.job_id, j.project_id, a.device_id, a.state, j.status, j.job_type, a.fencing_token,
-			j.current_attempt_id::text, j.lease_seconds, j.attempt_count, j.max_attempts
+			j.current_attempt_id::text, j.lease_seconds, j.attempt_count, j.max_attempts, j.refund_count
 		FROM job_attempts a JOIN jobs j ON j.id = a.job_id
 		WHERE a.id=$1 FOR UPDATE OF a, j`, attemptID).
 		Scan(&r.jobID, &r.projectID, &r.deviceID, &r.state, &r.jobStatus, &r.jobType, &r.fencing, &r.current,
-			&r.leaseSeconds, &r.attemptCount, &r.maxAttempts)
+			&r.leaseSeconds, &r.attemptCount, &r.maxAttempts, &r.refunds)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -340,18 +352,24 @@ func (s *Scheduler) Fail(ctx context.Context, deviceID, attemptID string, f prot
 			return err
 		}
 		// A stopped task is requeued without counting against the job.
-		requeue := (f.Retryable && r.attemptCount < r.maxAttempts) || f.Code == "STOPPED"
+		stopRefund := f.Code == "STOPPED" && r.refunds < maxRefunds
+		requeue := (f.Retryable && r.attemptCount < r.maxAttempts) || stopRefund
 		next := JobFailed
 		if requeue {
 			next = JobReady
 		}
 		if f.Code == "STOPPED" {
-			if _, err := tx.Exec(ctx, `UPDATE jobs SET attempt_count=GREATEST(attempt_count-1, 0) WHERE id=$1`, r.jobID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE jobs SET attempt_count=CASE WHEN refund_count < `+maxRefundsSQL+` THEN GREATEST(attempt_count-1, 0) ELSE attempt_count END,
+				refund_count=refund_count+1 WHERE id=$1`, r.jobID); err != nil {
 				return err
 			}
 		}
+		// Video stages back off before they are offered again (a crash loop on one
+		// computer should not burn all attempts within seconds).
 		_, err = tx.Exec(ctx, `UPDATE jobs SET status=$2, current_attempt_id=NULL, failure_reason=$3, updated_at=now(),
-			completed_at=CASE WHEN $2='failed' THEN now() ELSE NULL END WHERE id=$1`, r.jobID, next, msg)
+			completed_at=CASE WHEN $2='failed' THEN now() ELSE NULL END,
+			available_at=CASE WHEN $2='ready' AND $4 AND NOT $5 THEN now() + make_interval(secs => LEAST(300, 10 * power(2, GREATEST(attempt_count-1, 0)))) ELSE NULL END
+			WHERE id=$1`, r.jobID, next, msg, isVideoStage(r.jobType), f.Code == "STOPPED")
 		return err
 	})
 	if err == nil {
@@ -391,7 +409,7 @@ func (s *Scheduler) Cancel(ctx context.Context, actor core.Actor, projectID, job
 
 // Retry moves a failed job back to ready with a fresh attempt budget.
 func (s *Scheduler) Retry(ctx context.Context, actor core.Actor, projectID, jobID string) error {
-	tag, err := s.d.DB.Exec(ctx, `UPDATE jobs SET status='ready', max_attempts=attempt_count + 3, failure_reason='', completed_at=NULL, updated_at=now()
+	tag, err := s.d.DB.Exec(ctx, `UPDATE jobs SET status='ready', max_attempts=attempt_count + 3, failure_reason='', completed_at=NULL, available_at=NULL, updated_at=now()
 		WHERE id=$1 AND project_id=$2 AND status='failed'`, jobID, projectID)
 	if err != nil {
 		return err
@@ -497,7 +515,11 @@ func (s *Scheduler) Reconcile(ctx context.Context, projectID, deviceID string, r
 				if _, err := tx.Exec(ctx, `UPDATE job_attempts SET state='expired', completed_at=now(), error='not held by worker at heartbeat' WHERE id=$1`, x.id); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(ctx, `UPDATE jobs SET status=CASE WHEN attempt_count < max_attempts THEN 'ready' ELSE 'failed' END,
+				// The worker restarted or the computer slept: that is not the job's fault, so the
+				// attempt is refunded (a few times per job, so a poison job cannot loop forever).
+				if _, err := tx.Exec(ctx, `UPDATE jobs SET status=CASE WHEN refund_count < `+maxRefundsSQL+` OR attempt_count < max_attempts THEN 'ready' ELSE 'failed' END,
+					attempt_count=CASE WHEN refund_count < `+maxRefundsSQL+` THEN GREATEST(attempt_count-1, 0) ELSE attempt_count END,
+					refund_count=refund_count+1,
 					current_attempt_id=NULL, updated_at=now(), failure_reason='worker lost attempt'
 					WHERE id=$1 AND current_attempt_id=$2`, x.job, x.id); err != nil {
 					return err

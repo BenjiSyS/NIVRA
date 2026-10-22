@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
-	"nivra/internal/controller/api"
 	"nivra/internal/controller/core"
 	"nivra/internal/controller/scheduler"
 	"nivra/internal/shared/longvideo"
@@ -23,6 +20,26 @@ import (
 // job. advanceGeneration moves a generation forward; it is idempotent and runs
 // both when a child job is finalised and from the periodic tick, so a crash
 // between commit and hook never strands a generation.
+
+// Scheduling priorities of the video stages. All of them sit in priority band 2
+// (priority / 10) together with single clips (20), so one user's huge video
+// cannot outrank other users' quick videos; inside a user's own work the later
+// stage goes first. See scheduler/fair.go.
+const (
+	prioGenerate = 20
+	prioDraft    = 22
+	prioRefine   = 24
+	prioStitch   = 26
+
+	// A crash, a closing laptop or a stale lease burns an attempt, so the stages
+	// of a long video get more of them than the default 3.
+	attemptsDraft  = 4
+	attemptsRefine = 6
+)
+
+// needsAttentionTTL is how long a long video with a failed part waits for its
+// owner to regenerate the part before the video is failed for good.
+const needsAttentionTTL = 72 * time.Hour
 
 // genParams are the user's settings, stored on the generation.
 type genParams struct {
@@ -98,7 +115,7 @@ func (s *Service) createGeneration(ctx context.Context, projectID, versionID str
 		// The draft is low resolution: the model's requirements still apply
 		// (it loads the same weights).
 		draftJob, err = s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: projectID, JobType: "ai.draft", Params: jb,
-			Inputs: p.inputs(), ModelVersion: &versionID, Priority: 25, ReqRAMMB: p.RAMMB, ReqVRAMMB: p.VRAMMB,
+			Inputs: p.inputs(), ModelVersion: &versionID, Priority: prioDraft, MaxAttempts: attemptsDraft, ReqRAMMB: p.RAMMB, ReqVRAMMB: p.VRAMMB,
 			ReqGPU: p.VRAMMB > 0, LeaseSeconds: 900, CreatedBy: createdBy, IdempotencyKey: "gen:" + genID + ":draft:0"})
 		if err != nil {
 			return err
@@ -169,8 +186,9 @@ func (s *Service) advanceGeneration(ctx context.Context, genID string) error {
 		var raw []byte
 		var versionID string
 		var createdBy *string
-		if err := tx.QueryRow(ctx, `SELECT project_id::text, status, stage, segments, params, model_version::text, created_by::text
-			FROM generations WHERE id=$1 FOR UPDATE`, genID).Scan(&projectID, &status, &stage, &segments, &raw, &versionID, &createdBy); err != nil {
+		var attentionSince *time.Time
+		if err := tx.QueryRow(ctx, `SELECT project_id::text, status, stage, segments, params, model_version::text, created_by::text, needs_attention_since
+			FROM generations WHERE id=$1 FOR UPDATE`, genID).Scan(&projectID, &status, &stage, &segments, &raw, &versionID, &createdBy, &attentionSince); err != nil {
 			return err
 		}
 		if status != "running" {
@@ -194,12 +212,32 @@ func (s *Service) advanceGeneration(ctx context.Context, genID string) error {
 				genID, newStatus, truncate(reason, 900))
 			return err
 		}
-		for _, k := range kids {
+		// A part that used up all its attempts does not throw the whole video away
+		// (it may be hours of work): the video stays "running" but needs attention,
+		// and its owner can regenerate the part. Cancelling a part cancels the video.
+		var failedKid *childJob
+		for i, k := range kids {
 			switch k.status {
 			case scheduler.JobFailed:
-				return fail("failed", fmt.Sprintf("%s job %d failed: %s", k.stage, k.idx, k.failure))
+				if failedKid == nil {
+					failedKid = &kids[i]
+				}
 			case scheduler.JobCancelled:
 				return fail("cancelled", "a part of this video was cancelled")
+			}
+		}
+		if failedKid != nil {
+			reason := fmt.Sprintf("%s part %d failed after several tries: %s", failedKid.stage, failedKid.idx, friendlyFailure(failedKid.failure))
+			if attentionSince != nil && time.Since(*attentionSince) > needsAttentionTTL {
+				return fail("failed", reason+" (nobody regenerated it within 3 days)")
+			}
+			_, err := tx.Exec(ctx, `UPDATE generations SET needs_attention_since=COALESCE(needs_attention_since, now()),
+				failure_reason=$2, updated_at=now() WHERE id=$1`, genID, truncate(reason, 900))
+			return err
+		}
+		if attentionSince != nil {
+			if _, err := tx.Exec(ctx, `UPDATE generations SET needs_attention_since=NULL, failure_reason='', updated_at=now() WHERE id=$1`, genID); err != nil {
+				return err
 			}
 		}
 		done := func(st string) (n int, ids []string) {
@@ -228,7 +266,7 @@ func (s *Service) advanceGeneration(ctx context.Context, genID string) error {
 				jb, _ := json.Marshal(params)
 				id, err := s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: projectID, JobType: "ai.refine_segment", Params: jb,
 					Inputs: p.inputs(protocol.ArtifactRef{ID: draftVideo, Role: "draft_video"}), ModelVersion: &versionID,
-					Priority: 30, ReqRAMMB: p.RAMMB, ReqVRAMMB: p.VRAMMB, ReqGPU: p.VRAMMB > 0, LeaseSeconds: 1800,
+					Priority: prioRefine, MaxAttempts: attemptsRefine, ReqRAMMB: p.RAMMB, ReqVRAMMB: p.VRAMMB, ReqGPU: p.VRAMMB > 0, LeaseSeconds: 1800,
 					CreatedBy: createdBy, IdempotencyKey: fmt.Sprintf("gen:%s:refine:%d", genID, i)})
 				if err != nil {
 					return err
@@ -259,7 +297,7 @@ func (s *Service) advanceGeneration(ctx context.Context, genID string) error {
 			}
 			jb, _ := json.Marshal(map[string]any{"fps": p.FPS, "count": len(refs), "crossfade_frames": 4, "name": "video"})
 			id, err := s.sched.Create(ctx, tx, scheduler.NewJob{ProjectID: projectID, JobType: "ai.stitch", Params: jb, Inputs: refs,
-				ModelVersion: &versionID, Priority: 35, ReqRAMMB: 1024, LeaseSeconds: 1800, CreatedBy: createdBy,
+				ModelVersion: &versionID, Priority: prioStitch, MaxAttempts: attemptsRefine, ReqRAMMB: 1024, LeaseSeconds: 1800, CreatedBy: createdBy,
 				IdempotencyKey: "gen:" + genID + ":stitch:0"})
 			if err != nil {
 				return err
@@ -318,142 +356,6 @@ func (s *Service) tickGenerations(ctx context.Context) {
 		}
 		_ = s.advanceGeneration(ctx, id)
 	}
-}
-
-// generationView is what clients poll.
-var (
-	errGenNotFound = errors.New("video not found")
-	uuidRe         = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-)
-
-func (s *Service) generationView(ctx context.Context, projectID, genID string) (map[string]any, error) {
-	if !uuidRe.MatchString(genID) {
-		return nil, errGenNotFound
-	}
-	var status, stage, failure string
-	var segments int
-	var artifact *string
-	var created time.Time
-	var rawParams []byte
-	if err := s.d.DB.QueryRow(ctx, `SELECT status, stage, segments, artifact_id::text, failure_reason, created_at, params
-		FROM generations WHERE id=$1 AND project_id=$2`, genID, projectID).Scan(&status, &stage, &segments, &artifact, &failure, &created, &rawParams); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errGenNotFound
-		}
-		return nil, err
-	}
-	kids, err := s.genChildren(ctx, s.d.DB, genID)
-	if err != nil {
-		return nil, err
-	}
-	var draft, stitch float64
-	segDone, segSum := 0, 0.0
-	workers := map[string]bool{}
-	running := []string{}
-	for _, k := range kids {
-		p := k.progress
-		if k.status == scheduler.JobCompleted {
-			p = 1
-		}
-		switch k.stage {
-		case "draft":
-			draft = p
-		case "refine":
-			segSum += p
-			if k.status == scheduler.JobCompleted {
-				segDone++
-			}
-		case "stitch":
-			stitch = p
-		}
-		if k.device != "" && !scheduler.IsTerminalJob(k.status) {
-			if !workers[k.device] {
-				running = append(running, k.device)
-			}
-			workers[k.device] = true
-		}
-	}
-	var gp genParams
-	_ = json.Unmarshal(rawParams, &gp)
-	wd, wr, ws := longvideo.Weights(gp.Width, gp.Height, max(1, len(running)))
-	progress := wd*draft + wr*segSum/float64(segments) + ws*stitch
-	if status == "completed" {
-		progress = 1
-	}
-	return map[string]any{"id": genID, "status": status, "stage": stage, "progress": progress, "segments_total": segments,
-		"segments_done": segDone, "workers": running, "artifact_id": artifact, "failure_reason": failure, "created_at": created}, nil
-}
-
-func (s *Service) registerGenerationRoutes(r *api.Router) {
-	r.Admin("GET", "/long-videos", "viewer", func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
-		rows, err := s.d.DB.Query(req.Context(), `SELECT id::text, params->>'prompt' FROM generations WHERE project_id=$1
-			ORDER BY created_at DESC LIMIT 50`, a.ProjectID)
-		if err != nil {
-			s.writeErr(w, req, r, err)
-			return
-		}
-		type row struct{ id, prompt string }
-		var list []row
-		for rows.Next() {
-			var x row
-			var prompt *string
-			if rows.Scan(&x.id, &prompt) == nil {
-				if prompt != nil {
-					x.prompt = *prompt
-				}
-				list = append(list, x)
-			}
-		}
-		rows.Close()
-		out := []map[string]any{}
-		for _, x := range list {
-			v, err := s.generationView(req.Context(), a.ProjectID, x.id)
-			if err != nil {
-				continue
-			}
-			v["prompt"] = x.prompt
-			out = append(out, v)
-		}
-		api.WriteJSON(w, 200, map[string]any{"videos": out})
-	})
-	r.Admin("GET", "/generations/{gid}", "viewer", func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
-		v, err := s.generationView(req.Context(), a.ProjectID, req.PathValue("gid"))
-		if errors.Is(err, errGenNotFound) {
-			api.WriteErr(w, 404, protocol.ErrNotFound, err.Error())
-			return
-		}
-		if err != nil {
-			s.writeErr(w, req, r, err)
-			return
-		}
-		api.WriteJSON(w, 200, v)
-	})
-	r.Admin("POST", "/generations/{gid}/cancel", "operator", func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
-		gid := req.PathValue("gid")
-		if !uuidRe.MatchString(gid) {
-			api.WriteErr(w, 404, protocol.ErrNotFound, "video not found")
-			return
-		}
-		tag, err := s.d.DB.Exec(req.Context(), `UPDATE generations SET status='cancelled', failure_reason='cancelled by operator',
-			updated_at=now(), completed_at=now() WHERE id=$1 AND project_id=$2 AND status='running'`, gid, a.ProjectID)
-		if err != nil {
-			s.writeErr(w, req, r, err)
-			return
-		}
-		if tag.RowsAffected() == 0 {
-			api.WriteErr(w, 409, protocol.ErrConflict, "this video is not running")
-			return
-		}
-		kids, err := s.genChildren(req.Context(), s.d.DB, gid)
-		if err == nil {
-			for _, k := range kids {
-				if !scheduler.IsTerminalJob(k.status) {
-					_ = s.sched.Cancel(req.Context(), a.Actor, a.ProjectID, k.jobID)
-				}
-			}
-		}
-		api.WriteJSON(w, 200, map[string]any{"ok": true})
-	})
 }
 
 // hdDefaults reads the bundle's default clip length and fps from the manifest.

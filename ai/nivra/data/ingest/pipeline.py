@@ -13,9 +13,10 @@ from safetensors.numpy import save_file
 
 from . import media
 from ..styles import UNSPECIFIED, detect_leading_style, parse_data_style
-from .quality import DedupIndex, QualityLimits, clip_phash, phash_hex, quality_reject, quality_stats
+from .quality import (DedupIndex, QualityLimits, clip_phash, estimate_holds, gray_diffs, phash_hex, quality_reject,
+                      quality_stats)
 
-INGEST_VERSION = 2
+INGEST_VERSION = 3          # 3: manifest rows may carry hold / effective_fps (animation frame holds)
 PROFILES = ("stylized", "live")
 LIVE_SCENE_THRESHOLD = 0.3
 # Hard anime cuts score far above this; a higher threshold avoids false cuts from limited animation drawn on
@@ -61,6 +62,18 @@ class IngestOptions:
     overwrite: bool = False
     profile: str = "stylized"             # "stylized" (anime/cartoon/3D: relaxed flat+static filters) | "live" (original)
     default_style: str | None = None      # style for clips without any style label (a tag / alias, or None)
+    # Animation frame holds ("on 1s / 2s / 3s"): None -> on for the stylized profile, off for live. When on, every
+    # clip's SOURCE-rate frame differences give `hold` (most common drawing duration in frames) and
+    # `effective_fps` (source fps / mean drawing duration), stored in the manifest row; the DiT trainer can condition
+    # on effective_fps (model.fps_cond).
+    detect_holds: bool | None = None
+    hold_width: int = 96                  # width of the small gray frames used for hold detection
+    # Re-read a clip at its drawing rate (effective_fps < fps) instead of padding held frames: the clip then spans
+    # more source time with every frame a new drawing. Needs detect_holds.
+    drawing_rate_sampling: bool = False
+
+    def resolved_detect_holds(self) -> bool:
+        return self.profile == "stylized" if self.detect_holds is None else bool(self.detect_holds)
 
     def resolved_scene_threshold(self) -> float | None:
         if self.scene_threshold == "auto":
@@ -205,6 +218,18 @@ class ShardWriter:
         self.buf, self.n, self.rows, self.shard_no = None, 0, [], self.shard_no + 1
 
 
+def detect_clip_holds(path, start: float, seconds: float, info, width: int = 96) -> dict:
+    """Hold statistics (see quality.estimate_holds) of the clip window [start, start+seconds) decoded at the
+    source frame rate; all-None statistics when the window cannot be decoded (never rejects a clip)."""
+    try:
+        g = media.read_gray_window(path, start, seconds, info.fps, info.width, info.height, width)
+    except media.MediaError:
+        g = None
+    if g is None:
+        return estimate_holds(np.zeros(0), 0.0)
+    return estimate_holds(gray_diffs(g), info.fps)
+
+
 def _split_of(rel: str, val_fraction: float) -> str:
     h = int(hashlib.sha256(rel.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
     return "val" if h < val_fraction else "train"
@@ -229,6 +254,9 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
     prov = load_provenance(root)                 # refuse before touching the output directory
     scene_threshold = opts.resolved_scene_threshold()
     qlim = opts.resolved_quality()
+    holds_on = opts.resolved_detect_holds()
+    if opts.drawing_rate_sampling and not holds_on:
+        raise IngestError("drawing_rate_sampling needs hold detection (detect_holds)")
     b = BUCKETS[opts.bucket]
     fps = float(opts.fps or b.default_fps)
     window = b.frames / fps                       # source seconds consumed per clip
@@ -300,6 +328,7 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
                 if opts.max_clips and len(manifest) >= opts.max_clips:
                     full = True
                     break
+                clip_fps, clip_window = fps, window
                 try:
                     clip = media.read_clip(vp, start, b.frames, fps, b.width, b.height)
                 except media.MediaError as e:
@@ -313,6 +342,23 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
                 if why:
                     reject(why, rel, f"@{start:.2f}s")
                     continue
+                hold = None
+                if holds_on:
+                    hold = detect_clip_holds(vp, start, window, info, opts.hold_width)
+                    eff = hold["effective_fps"]
+                    if opts.drawing_rate_sampling and eff and eff < 0.9 * fps:
+                        new_fps = max(1.0, float(eff))
+                        new_window = b.frames / new_fps
+                        if start + new_window <= hi + 1e-6:        # the slower sampling must still fit the scene
+                            try:
+                                clip2 = media.read_clip(vp, start, b.frames, new_fps, b.width, b.height)
+                            except media.MediaError:
+                                clip2 = None
+                            if clip2 is not None:
+                                st2 = quality_stats(clip2)
+                                if quality_reject(st2, qlim) is None:
+                                    clip, st, clip_fps, clip_window = clip2, st2, new_fps, new_window
+                                    t = start + new_window
                 ph = clip_phash(clip)
                 if dedup.is_duplicate(ph):
                     di, dd = dedup.nearest(ph)
@@ -323,10 +369,12 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
                 shard, idx = writers[split].add(clip, {"id": cid, "caption": caption, "style": style, "lang": lang})
                 manifest.append({
                     "id": cid, "split": split, "shard": shard, "index": idx, "bucket": b.name, "caption": caption,
-                    "style": style, "lang": lang, "source_file": rel, "start": round(start, 3), "end": round(start + window, 3),
-                    "fps": fps, "frames": b.frames, "width": b.width, "height": b.height,
+                    "style": style, "lang": lang, "source_file": rel, "start": round(start, 3), "end": round(start + clip_window, 3),
+                    "fps": clip_fps, "frames": b.frames, "width": b.width, "height": b.height,
                     "source_resolution": [info.width, info.height], "source_codec": info.codec,
-                    "scene_index": si, "provenance": prov, "phash": phash_hex(ph), "quality": st})
+                    "scene_index": si, "provenance": prov, "phash": phash_hex(ph), "quality": st,
+                    **({"hold": hold["hold"], "effective_fps": hold["effective_fps"], "hold_purity": hold["hold_purity"],
+                        "hold_fraction": hold["hold_fraction"]} if hold is not None else {})})
                 per_file_clips[rel] += 1
             if full:
                 break
@@ -350,7 +398,8 @@ def ingest_folder(input_dir, output_dir, opts: IngestOptions | None = None, log=
         "styles": dict(sorted(Counter(m["style"] for m in manifest).items())), "profile": opts.profile,
         "options": {"profile": opts.profile, "default_style": opts.default_style, "scene_threshold": scene_threshold, "scene_margin": opts.scene_margin,
                     "val_fraction": opts.val_fraction, "dedup_bits": opts.dedup_bits, "shard_bytes": opts.shard_bytes,
-                    "allow_upscale": opts.allow_upscale, "quality": vars(qlim)},
+                    "allow_upscale": opts.allow_upscale, "quality": vars(qlim), "detect_holds": holds_on,
+                    "drawing_rate_sampling": opts.drawing_rate_sampling},
         "provenance": prov, "shards": shards}
     (out / "dataset.json").write_text(json.dumps(summary, indent=1, sort_keys=True, ensure_ascii=False), encoding="utf-8")
     return summary

@@ -7,19 +7,19 @@ import (
 )
 
 func TestCheckControllerURL(t *testing.T) {
-	ok := []string{"https://api.benjiserver.com", "http://127.0.0.1:8740", "http://localhost:8740/", "http://192.168.1.142:8740", "http://[::1]:8740"}
+	ok := []string{"https://api.example.com", "http://127.0.0.1:8740", "http://localhost:8740/", "http://192.168.1.142:8740", "http://[::1]:8740"}
 	for _, u := range ok {
 		if _, err := CheckControllerURL(u, false); err != nil {
 			t.Errorf("%s rejected: %v", u, err)
 		}
 	}
-	bad := []string{"http://api.benjiserver.com", "ftp://x", "api.benjiserver.com", "", "http://8.8.8.8"}
+	bad := []string{"http://api.example.com", "ftp://x", "api.example.com", "", "http://8.8.8.8"}
 	for _, u := range bad {
 		if _, err := CheckControllerURL(u, false); err == nil {
 			t.Errorf("%s accepted", u)
 		}
 	}
-	if _, err := CheckControllerURL("http://api.benjiserver.com", true); err != nil {
+	if _, err := CheckControllerURL("http://api.example.com", true); err != nil {
 		t.Errorf("allow-insecure override ignored: %v", err)
 	}
 }
@@ -62,4 +62,20 @@ func quote(s string) string {
 		out += string(r)
 	}
 	return out + `"`
+}
+
+func TestWorkerFFmpegPathFromFileAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "w.json")
+	if err := os.WriteFile(p, []byte(`{"data_dir":"`+filepath.ToSlash(dir)+`","ffmpeg_path":"C:/tools/ffmpeg"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := LoadWorker(p)
+	if err != nil || w.FFmpegPath != "C:/tools/ffmpeg" {
+		t.Fatalf("file: %v %q", err, w.FFmpegPath)
+	}
+	t.Setenv("NIVRA_FFMPEG", "/opt/ffmpeg")
+	if w, _ = LoadWorker(p); w.FFmpegPath != "/opt/ffmpeg" {
+		t.Fatalf("env override: %q", w.FFmpegPath)
+	}
 }

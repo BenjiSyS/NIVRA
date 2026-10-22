@@ -42,6 +42,9 @@ type Agent struct {
 	cfg  config.Worker
 	ids  *identity.Store
 	logs *logRing
+	gate *Gate
+	// diskFree overrides sysinfo.DiskFree (tests).
+	diskFree func(string) (uint64, error)
 
 	mu           sync.Mutex
 	id           *identity.Identity
@@ -73,7 +76,8 @@ func New(ctx context.Context, cfg config.Worker) (*Agent, error) {
 			return nil, err
 		}
 	}
-	a := &Agent{cfg: cfg, ids: identity.NewStore(cfg.DataDir), logs: newLogRing(2000), state: StateNotEnrolled}
+	a := &Agent{cfg: cfg, ids: identity.NewStore(cfg.DataDir), logs: newLogRing(2000), state: StateNotEnrolled, gate: NewGate()}
+	a.gate.register(a)
 	id, err := a.ids.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
@@ -120,7 +124,7 @@ func (a *Agent) hwSummary() string {
 }
 
 func (a *Agent) detectHardware(ctx context.Context) {
-	hw := hardware.Detect(ctx, a.cfg.DataDir, a.cfg.PythonPath, a.cfg.AIPackageDir)
+	hw := hardware.Detect(ctx, a.cfg.DataDir, a.cfg.PythonPath, a.cfg.AIPackageDir, a.cfg.FFmpegPath)
 	a.mu.Lock()
 	a.hw = hw
 	a.capsDirty = true
@@ -135,8 +139,14 @@ func (a *Agent) rebuildExecutors() {
 		ex[t] = b
 	}
 	if a.hw.AI.OK && len(a.hw.AI.JobTypes) > 0 {
-		p := &executor.Python{Interpreter: a.cfg.PythonPath, AIDir: a.cfg.AIPackageDir, JobTypes: a.hw.AI.JobTypes}
+		p := &executor.Python{Interpreter: a.cfg.PythonPath, AIDir: a.cfg.AIPackageDir, FFmpeg: a.cfg.FFmpegPath,
+			JobTypes: a.hw.AI.JobTypes}
 		for _, t := range p.Types() {
+			// Without ffmpeg a video job would render for minutes and then fail at
+			// encoding, so the controller must not hand such jobs to this worker.
+			if !a.hw.FFmpeg.OK && executor.IsVideoJobType(t) {
+				continue
+			}
 			ex[t] = p
 		}
 	}
@@ -192,6 +202,8 @@ type Status struct {
 	CompletedLocal int                        `json:"completed_this_session"`
 	FailedLocal    int                        `json:"failed_this_session"`
 	Version        string                     `json:"version"`
+	// VideoDisabledReason is set when video jobs are switched off on this computer.
+	VideoDisabledReason string `json:"video_disabled_reason,omitempty"`
 }
 
 // Status returns a snapshot.
@@ -209,6 +221,10 @@ func (a *Agent) Status() Status {
 	if !a.lastBeat.IsZero() {
 		t := a.lastBeat
 		st.LastHeartbeat = &t
+	}
+	if a.hw.AI.OK && !a.hw.FFmpeg.OK {
+		st.VideoDisabledReason = "Video jobs are off on this computer: " + a.hw.FFmpeg.Error +
+			". Install ffmpeg (Nivra-Setup.bat does this) or set ffmpeg_path in the worker settings, then press Refresh."
 	}
 	if a.task != nil {
 		v := a.task.view()

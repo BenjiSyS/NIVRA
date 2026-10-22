@@ -37,6 +37,8 @@ func NewSlots(ctx context.Context, cfg config.Worker) ([]*Agent, error) {
 			return nil, fmt.Errorf("worker slot for GPU %d: %w", k, err)
 		}
 		a.slot = k
+		a.gate = primary.gate
+		a.gate.register(a)
 		a.mu.Lock()
 		s := a.settings
 		a.mu.Unlock()

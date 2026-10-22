@@ -57,6 +57,9 @@ Usage:
   nivra generate             --bundle DIR --prompt TEXT [--out clip.mp4]            (runs on this computer)
   nivra dataset push         DIR --url URL [--kind raw|latents] [--name N] [--redistribution owner_devices|any]   Upload + register training data (resumable)
   nivra caption              PATH [--style S] [--subtitles M] [--frames N] [--overwrite]   Caption videos (.txt + .subtitles.txt); --install for deps
+  nivra admin invite [--role member] [--note TEXT] [--expires-days N]   Create a single-use invitation link for a friend
+  nivra admin invites | disable | enable --username NAME
+  nivra backup run|list [--config FILE]           Database + secrets backup (also runs nightly in the controller)
   nivra migrate status|apply                      Inspect or apply database migrations
   nivra worker run           [--config FILE] [--open]   Start the worker and its local website
   nivra app                  [--no-window]  (Nivra App: generate + this computer as a worker)
@@ -104,6 +107,8 @@ func main() {
 		err = cmdGenerate(ctx, args)
 	case "migrate":
 		err = cmdMigrate(ctx, args)
+	case "backup":
+		err = cmdBackup(ctx, args)
 	case "app":
 		err = cmdApp(ctx, args)
 	case "worker":
@@ -245,12 +250,17 @@ func cmdAdmin(ctx context.Context, args []string) error {
 	verb, rest := sub(args)
 	fs := flag.NewFlagSet("admin", flag.ExitOnError)
 	user := fs.String("username", "", "account name")
-	role := fs.String("role", auth.RoleAdmin, "admin|operator|viewer")
+	role := fs.String("role", auth.RoleAdmin, "admin|operator|member|viewer (invite: member|operator|viewer)")
+	note := fs.String("note", "", "invite: who this is for (shown in Studio)")
+	expDays := fs.Int("expires-days", 7, "invite: days the code stays valid (max 30)")
 	display := fs.String("display-name", "", "display name")
 	pwStdin := fs.Bool("password-stdin", false, "read the password from standard input")
 	_ = fs.Parse(rest)
-	if *user == "" {
+	if *user == "" && verb != "invite" && verb != "invites" {
 		return errors.New("--username is required")
+	}
+	if verb == "invite" && !flagPassed(fs, "role") {
+		*role = auth.RoleMember
 	}
 	d, closeFn, err := deps(ctx)
 	if err != nil {
@@ -269,6 +279,34 @@ func cmdAdmin(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Printf("created %s account %q\n", u.Role, u.Username)
+	case "invite":
+		code, inv, err := svc.CreateInvite(ctx, "", *role, *note, time.Duration(*expDays)*24*time.Hour)
+		if err != nil {
+			return err
+		}
+		base := strings.TrimRight(d.Cfg.PublicURL, "/")
+		if base == "" {
+			base = "http://<server-address>:8740"
+		}
+		fmt.Printf("Invitation for a %s (single use, valid until %s):\n\n  %s/join?code=%s\n\nSend that link to your friend. They choose their own username and password.\n",
+			inv.Role, inv.ExpiresAt.Local().Format("2006-01-02 15:04"), base, code)
+	case "invites":
+		list, err := svc.ListInvites(ctx)
+		if err != nil {
+			return err
+		}
+		for _, v := range list {
+			fmt.Printf("%-8s %-8s %s  %s  %s\n", v.Status, v.Role, v.ExpiresAt.Local().Format("2006-01-02 15:04"), v.UsedBy, v.Note)
+		}
+	case "disable", "enable":
+		var id string
+		if err := d.DB.QueryRow(ctx, `SELECT id::text FROM users WHERE username=$1`, strings.ToLower(*user)).Scan(&id); err != nil {
+			return fmt.Errorf("user %q not found", *user)
+		}
+		if err := svc.SetUserStatus(ctx, core.System, id, verb == "enable"); err != nil {
+			return err
+		}
+		fmt.Printf("account %q %sd\n", *user, verb)
 	case "token":
 		days := 365
 		if v := os.Getenv("NIVRA_TOKEN_DAYS"); v != "" {
@@ -289,7 +327,7 @@ func cmdAdmin(ctx context.Context, args []string) error {
 		}
 		fmt.Println("password updated; existing sessions were signed out")
 	default:
-		return errors.New("usage: nivra admin create|passwd|token --username NAME")
+		return errors.New("usage: nivra admin create|passwd|token|disable|enable --username NAME  |  nivra admin invite [--role member] [--note TEXT]  |  nivra admin invites")
 	}
 	return nil
 }

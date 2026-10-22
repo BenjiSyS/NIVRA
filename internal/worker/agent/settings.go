@@ -31,6 +31,9 @@ type Settings struct {
 	Schedule        Schedule `json:"schedule"`
 	AutoStart       bool     `json:"auto_start"`
 	ContributorName string   `json:"contributor_name"`
+	// AllowSleepOnBattery: when true and the computer runs on battery, a running
+	// task does not keep it awake. Default false: tasks always block sleep.
+	AllowSleepOnBattery bool `json:"allow_sleep_on_battery"`
 }
 
 // DefaultSettings derives conservative defaults from the hardware.

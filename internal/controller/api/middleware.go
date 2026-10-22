@@ -116,6 +116,15 @@ type AdminCtx struct {
 	Actor     core.Actor
 }
 
+// UserID is the authenticated account's id.
+func (a *AdminCtx) UserID() string { return a.Session.User.ID }
+
+// Role is the authenticated account's role.
+func (a *AdminCtx) Role() string { return a.Session.User.Role }
+
+// IsMember reports whether the caller is a restricted member (own data only).
+func (a *AdminCtx) IsMember() bool { return a.Session.User.Role == auth.RoleMember }
+
 // admin wraps a route requiring a session with at least role. Mutating
 // requests must carry the CSRF header and, if present, a same-origin Origin.
 func (s *Server) admin(role string, projectScoped bool, h func(http.ResponseWriter, *http.Request, *AdminCtx)) http.Handler {

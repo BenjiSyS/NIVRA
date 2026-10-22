@@ -24,13 +24,31 @@ import (
 const (
 	RoleAdmin    = "admin"
 	RoleOperator = "operator"
-	RoleViewer   = "viewer"
+	// RoleMember is a friend who may generate videos and manage only their
+	// own generations, jobs and videos. It sits below operator and is NOT a
+	// superset of viewer: members cannot read project-wide data.
+	RoleMember = "member"
+	RoleViewer = "viewer"
+	// RoleAny only requires a valid, active account (own profile, own tokens).
+	RoleAny = "any"
 )
 
-var roleRank = map[string]int{RoleViewer: 1, RoleOperator: 2, RoleAdmin: 3}
+var roleRank = map[string]int{RoleViewer: 1, RoleMember: 2, RoleOperator: 3, RoleAdmin: 4}
 
-// RoleAtLeast reports whether role grants at least min.
-func RoleAtLeast(role, min string) bool { return roleRank[role] >= roleRank[min] && roleRank[min] > 0 }
+// RoleAtLeast reports whether role grants at least min. RoleAny accepts every
+// known role; the viewer level excludes members (they see only their own data).
+func RoleAtLeast(role, min string) bool {
+	if _, ok := roleRank[role]; !ok {
+		return false
+	}
+	switch min {
+	case RoleAny:
+		return true
+	case RoleViewer:
+		return role != RoleMember
+	}
+	return roleRank[role] >= roleRank[min] && roleRank[min] > 0
+}
 
 // ValidRole reports whether r is a known role.
 func ValidRole(r string) bool { _, ok := roleRank[r]; return ok }

@@ -1,9 +1,9 @@
 # OPT-IN: Nivra does not install this automatically.
-# Install (as the benji user, after reviewing paths):
+# Install (as your Linux user, after reviewing paths):
 #   mkdir -p ~/.config/systemd/user
 #   cp deploy/systemd/nivra-controller.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now nivra-controller
-#   sudo loginctl enable-linger benji      # keep user services running without a login session
+#   sudo loginctl enable-linger <user>      # keep user services running without a login session
 # Remove: systemctl --user disable --now nivra-controller
 [Unit]
 Description=Nivra controller (API + Nivra Studio)

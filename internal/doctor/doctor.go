@@ -53,7 +53,7 @@ func Run(ctx context.Context, w io.Writer, o Options) bool {
 	if h.MemTotal > 0 {
 		r.ok("memory", fmt.Sprintf("%d MiB total, %d MiB available", h.MemTotal>>20, h.MemAvail>>20))
 	}
-	for _, t := range []string{"git", "ffmpeg"} {
+	for _, t := range []string{"git"} {
 		if p, err := exec.LookPath(t); err == nil {
 			r.ok("tool "+t, p)
 		} else {
@@ -67,11 +67,15 @@ func Run(ctx context.Context, w io.Writer, o Options) bool {
 	if workPath == "" {
 		workPath = filepath.Join("config", "worker.json")
 	}
+	workerRole := o.Role == "worker" || (o.Role == "" && exists(workPath))
+	if !workerRole {
+		checkFFmpeg(ctx, r, "", false)
+	}
 	if o.Role == "controller" || (o.Role == "" && exists(ctrlPath)) {
 		fmt.Fprintln(w, "\nController")
 		checkController(ctx, r, ctrlPath, o.Repair)
 	}
-	if o.Role == "worker" || (o.Role == "" && exists(workPath)) {
+	if workerRole {
 		fmt.Fprintln(w, "\nWorker")
 		checkWorker(ctx, r, workPath, o.Repair)
 	}
@@ -175,7 +179,7 @@ func checkController(ctx context.Context, r *reporter, path string, repair bool)
 }
 
 func checkPython(ctx context.Context, r *reporter, python, aiDir, purpose string) {
-	p := hardware.ProbeAI(ctx, python, aiDir)
+	p := hardware.ProbeAI(ctx, python, aiDir, "")
 	if p.OK {
 		r.ok("python/torch", fmt.Sprintf("python %s, torch %s, cuda=%v (%s)", p.Python, p.Torch, p.CUDA, purpose))
 		if p.CUDA {
@@ -235,6 +239,7 @@ func checkWorker(ctx context.Context, r *reporter, path string, repair bool) {
 			r.ok(fmt.Sprintf("gpu %d", g.Index), fmt.Sprintf("%s, %d MiB, driver %s", g.Name, g.VRAMMB, g.Driver))
 		}
 	}
+	checkFFmpeg(ctx, r, cfg.FFmpegPath, true)
 	checkPython(ctx, r, cfg.PythonPath, cfg.AIPackageDir, "worker AI jobs")
 	ln, err := net.Listen("tcp", cfg.UIListenAddr)
 	if err != nil {
@@ -242,5 +247,22 @@ func checkWorker(ctx context.Context, r *reporter, path string, repair bool) {
 	} else {
 		ln.Close()
 		r.ok("worker website port", cfg.UIListenAddr+" available")
+	}
+}
+
+// checkFFmpeg reports whether videos can be saved here. Without ffmpeg a worker
+// cannot run video jobs, so that is a failure for the worker role and a warning
+// elsewhere.
+func checkFFmpeg(ctx context.Context, r *reporter, configured string, mustHave bool) {
+	p := hardware.ProbeFFmpeg(ctx, configured)
+	if p.OK {
+		r.ok("tool ffmpeg", p.FFmpegPath+" (version "+p.Version+"); ffprobe "+p.FFprobePath)
+		return
+	}
+	msg := p.Error + " (install it with winget install Gyan.FFmpeg, or set ffmpeg_path in the worker config)"
+	if mustHave {
+		r.fail("tool ffmpeg", msg)
+	} else {
+		r.warn("tool ffmpeg", msg)
 	}
 }

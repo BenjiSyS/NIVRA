@@ -491,6 +491,14 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request, a *Admi
 		writeErr(w, http.StatusBadRequest, protocol.ErrValidation, "lease_seconds must be >= 15")
 		return
 	}
+	// Only administrators may jump the queue or starve the video band
+	// (priority / 10 = 2); everyone else is clamped below it.
+	switch {
+	case a.Role() == auth.RoleAdmin:
+		req.Priority = max(-100, min(req.Priority, 100))
+	default:
+		req.Priority = max(0, min(req.Priority, 19))
+	}
 	uid := a.Session.User.ID
 	var ids []string
 	err := core.WithTx(r.Context(), s.d.DB, func(tx pgx.Tx) error {
@@ -515,6 +523,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request, a *Admi
 }
 
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	if a.IsMember() && !s.OwnsJob(r, a.ProjectID, r.PathValue("jid"), a.UserID()) {
+		denyNotFound(w, "job")
+		return
+	}
 	v, err := s.Sched.GetJob(r.Context(), a.ProjectID, r.PathValue("jid"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeErr(w, http.StatusNotFound, protocol.ErrNotFound, "job not found")
@@ -528,6 +540,10 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request, a *AdminCtx) 
 }
 
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	if a.IsMember() && !s.OwnsJob(r, a.ProjectID, r.PathValue("jid"), a.UserID()) {
+		denyNotFound(w, "job")
+		return
+	}
 	if err := s.Sched.Cancel(r.Context(), a.Actor, a.ProjectID, r.PathValue("jid")); err != nil {
 		s.schedErr(w, r, err)
 		return
@@ -676,5 +692,9 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, a *AdminCtx)
 }
 
 func (s *Server) handleAdminDownload(w http.ResponseWriter, r *http.Request, a *AdminCtx) {
+	if a.IsMember() && !s.ownsArtifact(r, a.ProjectID, r.PathValue("aid"), a.UserID()) {
+		denyNotFound(w, "file")
+		return
+	}
 	s.serveArtifact(w, r, a.ProjectID, r.PathValue("aid"))
 }

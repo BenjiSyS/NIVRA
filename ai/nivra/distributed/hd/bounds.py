@@ -33,18 +33,18 @@ class BoundViolation(Exception):
         self.code, self.message = code, message
 
 
-def check_tensor(name: str, d32: torch.Tensor, bound: float) -> float:
+def check_tensor(name: str, d32: torch.Tensor, bound: float, slack: float = FP16_SLACK) -> float:
     """Validate one fp32 view of a delta tensor; returns its squared L2 norm (float). Raises BoundViolation."""
     if d32.numel() == 0:
         return 0.0
     if not bool(torch.isfinite(d32).all()):
         raise BoundViolation("non_finite", f"{name}: update contains NaN or Inf")
     linf = float(d32.abs().max())
-    lim = bound * FP16_SLACK
+    lim = bound * slack
     if linf > lim:
         raise BoundViolation("bound_exceeded", f"{name}: ||delta||_inf {linf:.4g} > c*H*lr = {bound:.4g}")
     l2sq = float(d32.double().pow(2).sum())
-    l2lim = bound * FP16_SLACK * math.sqrt(d32.numel())
+    l2lim = bound * slack * math.sqrt(d32.numel())
     if math.sqrt(l2sq) > l2lim:
         raise BoundViolation("bound_exceeded", f"{name}: ||delta||_2 {math.sqrt(l2sq):.4g} > c*H*lr*sqrt(numel) = {l2lim:.4g}")
     return l2sq

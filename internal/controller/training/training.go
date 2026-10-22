@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -183,6 +185,8 @@ type Service struct {
 	sched *scheduler.Scheduler
 	store *artifacts.Store
 	kick  chan struct{}
+	// kickGen and kickData wake the generation and dataset loops.
+	kickGen, kickData chan struct{}
 }
 
 // RegisterJobTypes registers the AI job types. svc may be nil for tools that
@@ -195,13 +199,38 @@ func RegisterJobTypes(reg *scheduler.Registry, svc *Service) {
 	reg.Register(&scheduler.JobType{Name: "ai.evaluate", Category: "evaluation", Async: true,
 		ValidateParams: objectParams, Validate: svcOr(svc, (*Service).validateEvaluate)})
 	reg.Register(&scheduler.JobType{Name: "ai.generate", Category: "generation", Async: true,
-		ValidateParams: objectParams, Validate: svcOr(svc, (*Service).validateGenerate)})
+		ValidateParams: videoParams, Validate: svcOr(svc, (*Service).validateGenerate)})
 	registerHDJobTypes(reg, svc)
 	// Long videos: draft -> parallel refine segments -> stitch (generations.go).
 	for _, t := range []struct{ name, kind string }{{"ai.draft", "draft_video"}, {"ai.refine_segment", "segment_video"}, {"ai.stitch", "video"}} {
-		reg.Register(&scheduler.JobType{Name: t.name, Category: "generation", Async: true, ValidateParams: objectParams,
+		reg.Register(&scheduler.JobType{Name: t.name, Category: "generation", Async: true, ValidateParams: videoParams,
 			Validate: svcOr(svc, mp4Validator(t.kind)), OnFinalized: svcKick(svc)})
 	}
+}
+
+var videoNameRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
+
+// videoParams validates the user-controlled fields of the video job types
+// (the AI runtime enforces the same rules): operators can create these jobs
+// directly, so a bad name must never reach a path on a worker.
+func videoParams(raw json.RawMessage) error {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return errors.New("params must be a JSON object")
+	}
+	if p, ok := m["prompt"]; ok {
+		s, isStr := p.(string)
+		if !isStr || utf8.RuneCountInString(strings.TrimSpace(s)) < 1 || utf8.RuneCountInString(s) > 1000 {
+			return errors.New("params.prompt must be 1-1000 characters")
+		}
+	}
+	if n, ok := m["name"]; ok {
+		s, isStr := n.(string)
+		if !isStr || !videoNameRe.MatchString(s) {
+			return errors.New("params.name must be 1-64 characters of letters, digits, _ . - (no path separators)")
+		}
+	}
+	return nil
 }
 
 func objectParams(raw json.RawMessage) error {
@@ -231,7 +260,7 @@ func svcKick(svc *Service) func(context.Context, scheduler.ValidationInput, sche
 
 // Factory plugs training into the controller (app.ExtensionFactory).
 func Factory(rt *app.Runtime) (api.Extension, func(context.Context), error) {
-	svc := &Service{d: rt.Deps, sched: rt.Sched, store: rt.Artifacts, kick: make(chan struct{}, 1)}
+	svc := &Service{d: rt.Deps, sched: rt.Sched, store: rt.Artifacts, kick: make(chan struct{}, 1), kickGen: make(chan struct{}, 1), kickData: make(chan struct{}, 1)}
 	RegisterJobTypes(rt.Registry, svc)
 	return svc, svc.RunLoop, nil
 }
@@ -240,6 +269,14 @@ func Factory(rt *app.Runtime) (api.Extension, func(context.Context), error) {
 func (s *Service) Kick() {
 	select {
 	case s.kick <- struct{}{}:
+	default:
+	}
+	select {
+	case s.kickGen <- struct{}{}:
+	default:
+	}
+	select {
+	case s.kickData <- struct{}{}:
 	default:
 	}
 }
@@ -528,5 +565,5 @@ func (s *Service) Overview(ctx context.Context, projectID string) map[string]any
 
 // NewService builds the training service without starting its loop (CLI tools).
 func NewService(rt *app.Runtime) *Service {
-	return &Service{d: rt.Deps, sched: rt.Sched, store: rt.Artifacts, kick: make(chan struct{}, 1)}
+	return &Service{d: rt.Deps, sched: rt.Sched, store: rt.Artifacts, kick: make(chan struct{}, 1), kickGen: make(chan struct{}, 1), kickData: make(chan struct{}, 1)}
 }

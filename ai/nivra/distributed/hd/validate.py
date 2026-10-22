@@ -5,7 +5,10 @@ is the first pass of ``ai.hd_aggregate``.
 
 Reason codes (``Validation.codes``): manifest_too_large, manifest_invalid, size_limit, size_mismatch,
 checksum_mismatch, shape_mismatch, stale_base_version, manifest_mismatch, non_finite, bound_exceeded,
-zero_update, norm_outlier, duplicate_update.
+zero_update, norm_outlier, duplicate_update, int8_invalid.
+
+Two delta formats: ``float16`` (default; one F16 tensor per base tensor) and ``int8`` (``quant.py``: I8 values + F32
+per-row scales, exact size checked before any tensor is read, bounds applied to the dequantised values).
 """
 from __future__ import annotations
 
@@ -15,10 +18,11 @@ from typing import Optional
 
 from .. import version as ver
 from ..update import SCHEMA, Validation
-from . import bounds
+from . import bounds, quant
 from .stream_io import StReader, StreamIOError, check_exact_size, sha256_file
 
 DELTA_DTYPE = "float16"
+DELTA_DTYPES = ("float16", "int8")
 DEFAULT_MAX_BYTES = 8 << 30
 ECHO_FIELDS = ("run_id", "round", "round_batch", "base_version_id", "update_id", "attempt_id", "target",
                "hd_config_sha", "stage", "inner_steps", "lr", "shards", "samples_seen", "delta_dtype")
@@ -95,10 +99,18 @@ def validate_hd_update(update_path, manifest_path, base_manifest: dict, *, expec
                        lr: Optional[float] = None, max_rel_norm: float = bounds.DEFAULT_MAX_REL_NORM,
                        max_bytes: int = DEFAULT_MAX_BYTES, peer_norms=None, max_norm_ratio: float = 5.0,
                        expected_base_version_id: Optional[str] = None, base_weights_path=None,
-                       base_l2_value: Optional[float] = None) -> Validation:
+                       base_l2_value: Optional[float] = None, delta_dtype: Optional[str] = None,
+                       allowed_stale_base_ids=()) -> Validation:
     """Structural + numerical validation of one update. ``expected`` carries the job parameters the manifest must
-    echo (EXPECT_KEYS); inner_steps / lr default to expected's. Never loads more than one tensor."""
+    echo (EXPECT_KEYS); inner_steps / lr default to expected's. ``delta_dtype`` (default: expected's, else float16)
+    selects the format. ``allowed_stale_base_ids``: older base versions whose deltas are still accepted (staleness
+    window); such an update is then checked against that base id instead of the current one.
+    Never loads more than one tensor."""
     expected = dict(expected or {})
+    want_dtype = delta_dtype or expected.get("delta_dtype") or DELTA_DTYPE
+    if want_dtype not in DELTA_DTYPES:
+        return Validation(False, [("manifest_mismatch", f"unsupported delta_dtype {want_dtype!r}")])
+    expected["delta_dtype"] = want_dtype
     steps = int(inner_steps if inner_steps is not None else expected.get("inner_steps", 0) or 0)
     lr_ = float(lr if lr is not None else expected.get("lr", 0.0) or 0.0)
     v = Validation(False)
@@ -127,19 +139,24 @@ def validate_hd_update(update_path, manifest_path, base_manifest: dict, *, expec
     shapes = base_manifest.get("tensor_shapes")
     if not isinstance(shapes, dict) or not shapes:
         return fail("manifest_invalid", "base manifest has no tensor_shapes")
-    msg = check_exact_size(p, shapes, "F16")                   # header only, before any tensor is read
+    if want_dtype == "int8":
+        msg = quant.check_exact_size_int8(p, shapes)           # header only, before any tensor is read
+    else:
+        msg = check_exact_size(p, shapes, "F16")
     if msg:
         return fail("shape_mismatch" if "tensor" in msg else "size_mismatch", msg)
     if sha256_file(p) != str(m["update_sha256"]).lower():
         return fail("checksum_mismatch", "update file sha256 differs from its manifest")
     exp_base = expected_base_version_id or expected.get("base_version_id") or base_manifest["version_id"]
+    if m.get("base_version_id") in set(allowed_stale_base_ids) and m.get("base_version_id") != exp_base:
+        exp_base = m["base_version_id"]
     if m.get("base_version_id") != exp_base:
         v.reasons.append(("stale_base_version", f"update base {m.get('base_version_id')} != current {exp_base}"))
     if m.get("architecture_version") != base_manifest.get("architecture_version") \
             or m.get("vocab_hash") != base_manifest.get("vocab_hash"):
         v.reasons.append(("manifest_mismatch", "architecture / text encoder differs from the base"))
-    if m.get("delta_dtype") != DELTA_DTYPE:
-        v.reasons.append(("manifest_mismatch", f"delta_dtype {m.get('delta_dtype')!r} != {DELTA_DTYPE!r}"))
+    if m.get("delta_dtype") != want_dtype:
+        v.reasons.append(("manifest_mismatch", f"delta_dtype {m.get('delta_dtype')!r} != {want_dtype!r}"))
     exp = {k: val for k, val in expected.items() if k in EXPECT_KEYS}
     exp.setdefault("base_version_id", exp_base)
     v.reasons.extend(check_echo(m, exp))
@@ -148,13 +165,21 @@ def validate_hd_update(update_path, manifest_path, base_manifest: dict, *, expec
         return v
     bound = bounds.elementwise_bound(bound_c, steps, lr_)
     total = 0.0
+    int8 = want_dtype == "int8"
     try:
         with StReader(p) as r:
-            v.num_tensors = len(r.info)
-            for name in r.names():
+            v.num_tensors = len(r.info) // (2 if int8 else 1)
+            for name in (shapes if int8 else r.names()):
                 try:
-                    total += bounds.check_tensor(name, r.read_f32(name), bound)
+                    if int8:
+                        d32 = quant.read_int8_delta(r, name)
+                        total += bounds.check_tensor(name, d32, bound, quant.INT8_SLACK)
+                    else:
+                        total += bounds.check_tensor(name, r.read_f32(name), bound)
                 except bounds.BoundViolation as e:
+                    v.reasons.append((e.code, e.message))
+                    return v
+                except quant.QuantError as e:
                     v.reasons.append((e.code, e.message))
                     return v
     except StreamIOError as e:

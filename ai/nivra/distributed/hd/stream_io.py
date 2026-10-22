@@ -21,8 +21,8 @@ import torch
 
 MAX_HEADER_BYTES = 64 << 20
 DTYPES = {"F32": (torch.float32, 4, np.float32), "F16": (torch.float16, 2, np.float16),
-          "BF16": (torch.bfloat16, 2, None)}
-CODE_OF = {torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16"}
+          "BF16": (torch.bfloat16, 2, None), "I8": (torch.int8, 1, np.int8)}
+CODE_OF = {torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16", torch.int8: "I8"}
 
 
 class StreamIOError(Exception):
@@ -33,15 +33,21 @@ def _numel(shape) -> int:
     return math.prod(int(d) for d in shape)
 
 
+def _split(e, dtype):
+    """(name, shape[, dtype]) -> (name, shape, dtype code); the per-entry dtype overrides the default."""
+    dt = e[2] if len(e) > 2 and e[2] is not None else dtype
+    return e[0], e[1], CODE_OF[dt]
+
+
 def header_bytes(entries: list, dtype, metadata: Optional[dict] = None) -> bytes:
-    """The exact header (padded to 8 bytes) StWriter writes for [(name, shape)] entries."""
-    code = CODE_OF[dtype]
-    size = DTYPES[code][1]
+    """The exact header (padded to 8 bytes) StWriter writes for [(name, shape[, dtype])] entries.
+    ``dtype`` is the default for entries without their own (mixed-dtype files, e.g. int8 + fp32 scales)."""
     header, off = {}, 0
     if metadata:
         header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
-    for name, shape in entries:
-        n = size * _numel(shape)
+    for e in entries:
+        name, shape, code = _split(e, dtype)
+        n = DTYPES[code][1] * _numel(shape)
         header[name] = {"dtype": code, "shape": [int(d) for d in shape], "data_offsets": [off, off + n]}
         off += n
     hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
@@ -50,8 +56,11 @@ def header_bytes(entries: list, dtype, metadata: Optional[dict] = None) -> bytes
 
 def expected_file_size(entries: list, dtype, metadata: Optional[dict] = None) -> int:
     """Exact byte size of the file StWriter produces: 8 + header + sum(numel * itemsize)."""
-    size = DTYPES[CODE_OF[dtype]][1]
-    return 8 + len(header_bytes(entries, dtype, metadata)) + sum(size * _numel(s) for _, s in entries)
+    body = 0
+    for e in entries:
+        _, shape, code = _split(e, dtype)
+        body += DTYPES[code][1] * _numel(shape)
+    return 8 + len(header_bytes(entries, dtype, metadata)) + body
 
 
 class StReader:
@@ -157,9 +166,10 @@ class StWriter:
 
     def __init__(self, path, entries: list, dtype=torch.float32, metadata: Optional[dict] = None):
         if dtype not in CODE_OF:
-            raise ValueError("StWriter supports float32 / float16 / bfloat16")
+            raise ValueError("StWriter supports float32 / float16 / bfloat16 / int8")
         self.path, self.dtype = Path(path), dtype
-        self.entries = [(n, tuple(int(d) for d in s)) for n, s in entries]
+        self.entries = [(e[0], tuple(int(d) for d in e[1]), (e[2] if len(e) > 2 and e[2] is not None else dtype))
+                        for e in entries]
         self._i = 0
         self._h = hashlib.sha256()
         self._f = open(self.path, "wb")
@@ -171,12 +181,14 @@ class StWriter:
     def write(self, name: str, t: torch.Tensor) -> None:
         if self._i >= len(self.entries):
             raise StreamIOError("more tensors written than declared")
-        en, shape = self.entries[self._i]
+        en, shape, dt = self.entries[self._i]
         if name != en:
             raise StreamIOError(f"tensor order violated: expected {en!r}, got {name!r}")
         if tuple(t.shape) != shape:
             raise StreamIOError(f"{name}: shape {tuple(t.shape)} != declared {shape}")
-        a = t.detach().to(self.dtype).contiguous().cpu()
+        if dt == torch.int8 and t.dtype != torch.int8:
+            raise StreamIOError(f"{name}: int8 entries must be written as int8 tensors")
+        a = t.detach().to(dt).contiguous().cpu()
         b = a.reshape(-1).view(torch.uint8).numpy().tobytes() if a.numel() else b""
         self._f.write(b)
         self._h.update(b)

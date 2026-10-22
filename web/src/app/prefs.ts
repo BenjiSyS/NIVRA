@@ -32,7 +32,34 @@ export const DEFAULT_PREFS: Prefs = { resolution: '720p', fps: '30', length: '8s
 
 export const LIMITS = {
   fps: [1, 60] as const,
-  seconds: [0.5, 3 * 3600] as const, // up to 3 hours, built from segments
+  // The network renders at most 30 minutes (its draft is one job that cannot resume yet);
+  // this computer's own GPU may go up to 3 hours.
+  seconds: [0.5, 30 * 60] as const,
+  localSeconds: [0.5, 3 * 3600] as const,
+}
+
+// Videos longer than this ask for confirmation before they start.
+export const LONG_CONFIRM_SECONDS = 5 * 60
+
+export interface SegmentInfo {
+  segments: number
+  segmentFrames: number
+  totalFrames: number
+}
+
+// segmentPlan mirrors internal/shared/longvideo (SegmentFrames, TotalFrames, Plan):
+// one model clip is segSeconds long and has 1 + 8k frames; neighbouring segments share
+// a frame. Defaults (8 s, 30 fps) apply when the model reports none.
+export function segmentPlan(seconds: number, fps: number, segSeconds = 8): SegmentInfo {
+  const f = fps > 0 ? fps : 30
+  const s = segSeconds > 0 ? segSeconds : 8
+  const k = Math.max(1, Math.ceil(Math.round(s * f * 1e6) / 1e6 / 8 - 1e-9))
+  const segmentFrames = 1 + 8 * k
+  const totalFrames = Math.round(seconds * f) + 1
+  const step = segmentFrames - 1
+  let segments = 0
+  for (let st = 0; st < totalFrames - 1; st += step) segments++
+  return { segments: Math.max(1, segments), segmentFrames, totalFrames }
 }
 
 export function clamp(n: number, [lo, hi]: readonly [number, number]): number {

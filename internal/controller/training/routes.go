@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -154,30 +156,27 @@ func (s *Service) Register(r *api.Router) {
 	s.registerModelRoutes(r)
 	s.registerGenerationRoutes(r)
 	s.registerDatasetRoutes(r)
+	s.registerStorageRoutes(r)
 	r.Admin("GET", "/checkpoints", auth.RoleViewer, s.handleCheckpoints)
-	r.Admin("GET", "/models", auth.RoleViewer, s.handleModels)
+	r.Admin("GET", "/models", auth.RoleAny, s.handleModels)
 	r.Admin("GET", "/artifacts", auth.RoleViewer, s.handleListArtifacts)
 	r.Admin("POST", "/artifacts", auth.RoleOperator, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
 		s.handleUpload(w, req, r, a)
 	})
-	r.Admin("POST", "/generate", auth.RoleOperator, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
+	r.Admin("POST", "/generate", auth.RoleMember, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
 		s.handleGenerate(w, req, r, a)
 	})
-	r.Admin("GET", "/generations", auth.RoleViewer, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
-		jobs, err := s.sched.ListJobs(req.Context(), a.ProjectID, scheduler.JobFilter{JobType: "ai.generate", Limit: 100})
+	r.Admin("GET", "/generations", auth.RoleAny, func(w http.ResponseWriter, req *http.Request, a *api.AdminCtx) {
+		jobs, err := s.sched.ListJobs(req.Context(), a.ProjectID, scheduler.JobFilter{JobType: "ai.generate", Limit: 100, CreatedBy: userFilter(a)})
 		if err != nil {
 			r.Internal(w, req, err)
 			return
 		}
 		out := []map[string]any{}
-		for _, j := range jobs {
-			full, err := s.sched.GetJob(req.Context(), a.ProjectID, j.ID)
-			if err != nil {
-				continue
-			}
+		for _, full := range jobs {
 			item := map[string]any{"job": full}
 			var arts []byte
-			if s.d.DB.QueryRow(req.Context(), `SELECT r.artifacts FROM job_results r WHERE r.job_id=$1 AND r.validation_status='accepted'`, j.ID).Scan(&arts) == nil {
+			if s.d.DB.QueryRow(req.Context(), `SELECT r.artifacts FROM job_results r WHERE r.job_id=$1 AND r.validation_status='accepted'`, full.ID).Scan(&arts) == nil {
 				item["artifacts"] = json.RawMessage(arts)
 			}
 			out = append(out, item)
@@ -323,6 +322,16 @@ func (s *Service) handleUpload(w http.ResponseWriter, req *http.Request, r *api.
 		api.WriteErr(w, 400, protocol.ErrValidation, "kind query parameter required (a-z and _)")
 		return
 	}
+	if req.ContentLength > s.d.Cfg.MaxUploadBytes {
+		api.WriteErr(w, 413, protocol.ErrTooLarge, "the upload is larger than the configured limit")
+		return
+	}
+	// Refuse before reading a byte when the disk could not take it (the SD card of a
+	// Raspberry Pi also holds the database): at least 10 GB, or twice the size.
+	if err := s.store.EnsureFree(max(req.ContentLength, 0)); err != nil {
+		api.WriteErr(w, http.StatusInsufficientStorage, protocol.ErrUnavailable, "not enough free disk space on the server: "+err.Error())
+		return
+	}
 	req.Body = http.MaxBytesReader(w, req.Body, s.d.Cfg.MaxUploadBytes)
 	tmp, err := os.CreateTemp(filepath.Join(s.d.Cfg.DataDir, "tmp"), "upload-*")
 	if err != nil {
@@ -344,7 +353,8 @@ func (s *Service) handleUpload(w http.ResponseWriter, req *http.Request, r *api.
 	if ct == "" || len(ct) > 100 {
 		ct = "application/octet-stream"
 	}
-	info, err := s.store.Import(req.Context(), a.ProjectID, kind, tmp.Name(), ct)
+	// The temporary file is renamed into the store (one copy on disk, not two).
+	info, err := s.store.ImportMove(req.Context(), a.ProjectID, kind, tmp.Name(), ct)
 	if err != nil {
 		r.Internal(w, req, err)
 		return
@@ -382,8 +392,11 @@ func hdFrameRAMMB(w, h int) int {
 	return int(5400 * float64(w*h) / (2560 * 1440))
 }
 
-// maxVideoSeconds is the longest video one request may ask for (3 hours).
-const maxVideoSeconds = 3 * 3600
+// maxVideoSeconds is the longest video one request may ask for (30 minutes).
+// The draft of a long video is one job that cannot be resumed (the continuation
+// state lives in the Python draft code), so a failure restarts it from zero;
+// 30 minutes bounds that loss. Longer videos need a chunked, resumable draft.
+const maxVideoSeconds = 30 * 60
 
 var styleRe = regexp.MustCompile(`^[A-Za-z0-9 -]{1,40}$`)
 
@@ -460,8 +473,15 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 	if req2.HD {
 		maxPrompt = 1000 // HD text encoders take long, detailed prompts
 	}
-	if body.Prompt == "" || len(body.Prompt) > maxPrompt {
+	// The same rule as the App and the AI runtime: count characters, not bytes,
+	// so Swedish or Japanese text is not rejected early.
+	body.Prompt = strings.TrimSpace(body.Prompt)
+	if n := utf8.RuneCountInString(body.Prompt); n == 0 || n > maxPrompt {
 		api.WriteErr(w, 400, protocol.ErrValidation, "prompt must be 1-"+strconv.Itoa(maxPrompt)+" characters")
+		return
+	}
+	if msg := s.checkQuota(req.Context(), a, body.Seconds, req2.HD); msg != "" {
+		api.WriteErr(w, 400, protocol.ErrValidation, msg)
 		return
 	}
 	params := map[string]any{"prompt": body.Prompt, "seed": body.Seed, "name": "nivra-" + strconv.Itoa(body.Seed)}
@@ -485,7 +505,7 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 		// HD bundles: native resolution/duration, no nearest-neighbour upscale.
 		if body.Width < 0 || body.Width > 2560 || body.Height < 0 || body.Height > 1440 || body.Seconds < 0 || body.Seconds > maxVideoSeconds ||
 			body.FPS < 0 || body.FPS > 60 {
-			api.WriteErr(w, 400, protocol.ErrValidation, "width <= 2560, height <= 1440, fps <= 60, seconds <= 10800 (3 hours)")
+			api.WriteErr(w, 400, protocol.ErrValidation, "width <= 2560, height <= 1440, fps <= 60, and a video can be at most 30 minutes long")
 			return
 		}
 		if body.Width > 0 {
@@ -515,6 +535,10 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 		// Longer than one model clip: draft -> parallel segments -> stitch.
 		segSeconds, defFPS := s.hdDefaults(req.Context(), mv)
 		if body.Seconds > segSeconds {
+			if msg := s.checkLongQuota(req.Context(), a); msg != "" {
+				api.WriteErr(w, 400, protocol.ErrValidation, msg)
+				return
+			}
 			fps := body.FPS
 			if fps <= 0 {
 				fps = defFPS
@@ -540,7 +564,7 @@ func (s *Service) handleGenerate(w http.ResponseWriter, req *http.Request, r *ap
 	}
 	pb, _ := json.Marshal(params)
 	id, err := s.sched.Create(req.Context(), nil, scheduler.NewJob{ProjectID: a.ProjectID, JobType: "ai.generate", Params: pb, Inputs: inputs,
-		ModelVersion: &mv, Priority: 20, ReqRAMMB: req2.RAMMB, ReqVRAMMB: req2.VRAMMB, ReqGPU: req2.VRAMMB > 0,
+		ModelVersion: &mv, Priority: prioGenerate, ReqRAMMB: req2.RAMMB, ReqVRAMMB: req2.VRAMMB, ReqGPU: req2.VRAMMB > 0,
 		LeaseSeconds: 900, CreatedBy: &uid})
 	if err != nil {
 		api.WriteErr(w, 400, protocol.ErrValidation, err.Error())

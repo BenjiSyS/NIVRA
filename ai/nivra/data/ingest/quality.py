@@ -125,3 +125,46 @@ class DedupIndex:
 
     def add(self, h: list[int]):
         self._rows.append(np.array(h, dtype=np.uint64))
+
+
+# ===================================================================== animation frame holds ("on 2s / 3s")
+HOLD_ABS = 0.15      # mean |luma diff| (0-255) at or below this is never a new drawing (codec noise)
+HOLD_REL = 0.08      # ... nor is anything below this fraction of the clip's 90th-percentile frame difference
+MAX_HOLD = 6
+
+
+def gray_diffs(gray: np.ndarray) -> np.ndarray:
+    """Mean absolute difference between consecutive frames of a uint8/float gray clip [T,h,w] -> [T-1]."""
+    g = gray.astype(np.float32)
+    if g.shape[0] < 2:
+        return np.zeros(0, dtype=np.float32)
+    return np.abs(g[1:] - g[:-1]).mean(axis=(1, 2))
+
+
+def estimate_holds(diffs: np.ndarray, src_fps: float, max_hold: int = MAX_HOLD) -> dict:
+    """Effective drawing rate of a clip from its consecutive-frame differences.
+
+    A frame pair is a CHANGE when its difference exceeds max(HOLD_ABS, HOLD_REL * p90(diffs)); the gaps between
+    consecutive changes are how many frames each drawing is shown. `hold` is the most common gap (1 = on ones,
+    2 = on twos, 3 = on threes, ...), `effective_fps` = src_fps / mean gap (a 2,3,2,3 pattern gives ~9.6 fps at
+    24), `hold_purity` the share of gaps equal to `hold`, `hold_fraction` the share of frame pairs that are
+    repeats. `hold` / `effective_fps` are None when the clip has fewer than two changes (static or too short to
+    tell). The first and last drawing are cut by the clip window, so only gaps BETWEEN changes are used."""
+    d = np.asarray(diffs, dtype=np.float64)
+    out = {"hold": None, "effective_fps": None, "hold_purity": None, "hold_fraction": None, "changes": 0}
+    if d.size < 3 or src_fps <= 0:
+        return out
+    thr = max(HOLD_ABS, HOLD_REL * float(np.percentile(d, 90)))
+    changed = np.flatnonzero(d > thr)
+    out["changes"] = int(changed.size)
+    out["hold_fraction"] = round(float(1.0 - changed.size / d.size), 4)
+    if changed.size < 2:
+        return out
+    gaps = np.diff(changed)
+    gaps = gaps[gaps <= max_hold * 2] if (gaps <= max_hold * 2).any() else gaps     # a pause is not a drawing rate
+    counts = np.bincount(np.minimum(gaps, max_hold).astype(int), minlength=max_hold + 1)
+    hold = int(np.argmax(counts[1:]) + 1)
+    out["hold"] = hold
+    out["hold_purity"] = round(float(counts[hold] / gaps.size), 4)
+    out["effective_fps"] = round(float(src_fps / max(1.0, float(gaps.mean()))), 3)
+    return out

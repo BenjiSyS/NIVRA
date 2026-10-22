@@ -10,7 +10,7 @@ This is the first real multi-worker optimisation of an original Nivra model (Par
 | Run | `diloco-pi-laptop-1` (id `16218f9a-5a86-4916-b611-e9a05b7f5415`) |
 | Architecture | `nivra_small` (2,414,352 generator parameters), random initialisation (`seed` 11) via `ai.init_model` on the Pi |
 | VAE | trained single-node VAE, sha256 `e5cd7f7c3b63…debe27` (uploaded as artifact, frozen) |
-| Workers | `benji-laptop` (Windows 11, i5-8250U, torch 2.14.1+cpu) and `benjipi-worker` (the Pi itself, Debian 13 arm64, torch 2.6.0) |
+| Workers | `laptop-worker` (Windows 11, i5-8250U, torch 2.14.1+cpu) and `pi-worker` (the Pi itself, Debian 13 arm64, torch 2.6.0) |
 | Algorithm | DiLoCo-style: per round each worker runs H = 20 inner AdamW steps (batch 4, lr 3e-4) from the current global version on a disjoint procedural shard (64 clips), uploads `base − local`; controller validates and applies outer Nesterov SGD (lr 0.7, momentum 0.9) on the mean of the updates |
 | Rounds | 3, `workers_per_round` = `min_updates` = 2 |
 | Evaluation | `heldout_loss_*`: flow-matching loss on a fixed synthetic batch (seed 424242, 16 clips), computed **by the controller** with the frozen VAE, before and after each aggregation — not reported by workers |
@@ -27,12 +27,12 @@ Per-update records (worker-reported training losses are unverified metadata):
 
 | Round | Worker | Update L2 | Samples | Inner loss first → last | Job wall time |
 |------:|--------|----------:|--------:|-------------------------|--------------:|
-| 0 | benji-laptop | 3.1699 | 80 | 1.8957 → 1.6042 | 43 s |
-| 0 | benjipi-worker | 3.5259 | 80 | 1.9680 → 1.6374 | 174 s |
-| 1 | benji-laptop | 3.3281 | 80 | 1.9433 → 1.7686 | 22 s |
-| 1 | benjipi-worker | 3.4261 | 80 | 1.7656 → 1.6413 | 173 s |
-| 2 | benji-laptop | 3.2186 | 80 | 1.7176 → 1.2753 | 31 s |
-| 2 | benjipi-worker | 3.0880 | 80 | 1.8098 → 1.4392 | 178 s |
+| 0 | laptop-worker | 3.1699 | 80 | 1.8957 → 1.6042 | 43 s |
+| 0 | pi-worker | 3.5259 | 80 | 1.9680 → 1.6374 | 174 s |
+| 1 | laptop-worker | 3.3281 | 80 | 1.9433 → 1.7686 | 22 s |
+| 1 | pi-worker | 3.4261 | 80 | 1.7656 → 1.6413 | 173 s |
+| 2 | laptop-worker | 3.2186 | 80 | 1.7176 → 1.2753 | 31 s |
+| 2 | pi-worker | 3.0880 | 80 | 1.8098 → 1.4392 | 178 s |
 
 Checkpoints: one per global version (v0 `init`, v1–v3 `round`, v3 `stop`), all valid with SHA-256
 recorded; every update applied exactly once (`training_updates.state = applied`, update ids also

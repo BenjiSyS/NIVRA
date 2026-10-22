@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,6 +87,16 @@ type Runner struct {
 	Threads     int
 	Device      string // cpu | cuda | cuda:N
 	StopGrace   time.Duration
+	// FFmpeg is the configured ffmpeg file or folder ("" = find it on PATH or in the
+	// winget folder); the resolved paths are passed as NIVRA_FFMPEG / NIVRA_FFPROBE.
+	FFmpeg string
+	// StallTimeout kills the process tree and fails retryably (code STALLED) when no
+	// output line arrived for this long. 0 = the default for the job type
+	// (StallTimeoutFor); negative = no watchdog.
+	StallTimeout time.Duration
+
+	// stallCheck overrides how often the watchdog looks (tests).
+	stallCheck time.Duration
 }
 
 type jobFile struct {
@@ -160,7 +172,8 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 		env = append(env, "PYTHONPATH="+abs)
 	}
 	env = append(env, "NIVRA_THREADS="+strconv.Itoa(threads), "NIVRA_DEVICE="+device, "PYTHONUNBUFFERED=1",
-		"OMP_NUM_THREADS="+strconv.Itoa(threads), "PYTHONIOENCODING=utf-8")
+		"OMP_NUM_THREADS="+strconv.Itoa(threads), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
+	env = append(env, ResolveFFmpeg(r.FFmpeg).Env()...)
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -186,6 +199,41 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 	done := make(chan struct{})
 	var mu sync.Mutex
 	stopped := false
+	stalled := false
+	var lastOut atomic.Int64
+	lastOut.Store(time.Now().UnixNano())
+	stall := r.StallTimeout
+	if stall == 0 {
+		stall = StallTimeoutFor(job.JobType)
+	}
+	if stall > 0 {
+		check := r.stallCheck
+		if check <= 0 {
+			check = min(stall/4, 10*time.Second)
+		}
+		go func() {
+			tick := time.NewTicker(check)
+			defer tick.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-tick.C:
+				}
+				if time.Since(time.Unix(0, lastOut.Load())) < stall {
+					continue
+				}
+				mu.Lock()
+				stalled = true
+				mu.Unlock()
+				if rep != nil {
+					rep.Log("error", fmt.Sprintf("python job printed nothing for %s; killing its process tree", stall.Round(time.Second)))
+				}
+				_ = pg.Kill()
+				return
+			}
+		}()
+	}
 	go func() {
 		select {
 		case <-done:
@@ -210,8 +258,9 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 	var errEv *event
 	var arts []Artifact
 	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	sc.Buffer(make([]byte, 64<<10), 8<<20)
 	for sc.Scan() {
+		lastOut.Store(time.Now().UnixNano())
 		line := sc.Bytes()
 		var ev event
 		if len(line) == 0 || line[0] != '{' || json.Unmarshal(line, &ev) != nil {
@@ -254,6 +303,14 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 			errEv = &e
 		}
 	}
+	if err := sc.Err(); err != nil {
+		// A line longer than the buffer (or a read error) ends the scanner; keep
+		// draining so Python never blocks on a full pipe.
+		if rep != nil {
+			rep.Log("warn", "python output could not be read further ("+err.Error()+"); ignoring the rest")
+		}
+		_, _ = io.Copy(io.Discard, stdout)
+	}
 	werr := cmd.Wait()
 	close(done)
 	code := 0
@@ -266,8 +323,12 @@ func (r *Runner) Run(ctx context.Context, workDir string, job Job, rep Reporter)
 		}
 	}
 	mu.Lock()
-	wasStopped := stopped
+	wasStopped, wasStalled := stopped, stalled
 	mu.Unlock()
+	if wasStalled && !wasStopped {
+		return nil, &Failure{ExitCode: code, Code: CodeStalled, Retryable: true,
+			Message: "the task made no progress for " + humanDur(stall) + " and was stopped"}
+	}
 	if wasStopped && code != 0 {
 		return nil, ErrStopped
 	}
@@ -315,4 +376,11 @@ func tailFile(path string, n int64) string {
 	b := make([]byte, st.Size()-off)
 	_, _ = f.ReadAt(b, off)
 	return strings.TrimSpace(string(b))
+}
+
+func humanDur(d time.Duration) string {
+	if d >= time.Minute {
+		return fmt.Sprintf("%d minutes", int(d.Round(time.Minute)/time.Minute))
+	}
+	return fmt.Sprintf("%d seconds", int(d.Round(time.Second)/time.Second))
 }

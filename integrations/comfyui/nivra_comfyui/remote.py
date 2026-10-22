@@ -132,7 +132,7 @@ class NivraRemoteTextToVideo:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "controller_url": ("STRING", {"default": "https://studio.benjiserver.com"}),
+            "controller_url": ("STRING", {"default": os.environ.get("NIVRA_URL", "").strip(), "tooltip": "Address of your Nivra controller. Defaults to the NIVRA_URL environment variable."}),
             "prompt": ("STRING", {"multiline": True, "default": "a red circle moves from left to right"}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
             "steps": ("INT", {"default": 30, "min": 1, "max": 200}),
@@ -144,7 +144,7 @@ class NivraRemoteTextToVideo:
             "model_version": ("STRING", {"default": ""}),
             "width": ("INT", {"default": 0, "min": 0, "max": 2560, "step": 16}),
             "height": ("INT", {"default": 0, "min": 0, "max": 1440, "step": 16}),
-            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10800.0, "step": 0.5,
+            "seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1800.0, "step": 0.5,
                                   "tooltip": "Longer than the model's clip (8 s) = built from segments that all connected workers render in parallel."}),
             "sampler": (["default", "ab2", "euler"],),
             "style": ("STRING", {"default": "", "tooltip": "HD stylized models: anime, 3d animation, cartoon, 2d animation, ... or none. Empty = model default."}),
@@ -152,6 +152,11 @@ class NivraRemoteTextToVideo:
 
     def run(self, controller_url, prompt, seed, steps, cfg_scale, upscale, timeout_minutes, project="", model_version="",
             width=0, height=0, seconds=0.0, sampler="default", style=""):
+        controller_url = (controller_url or os.environ.get("NIVRA_URL", "")).strip()
+        if not controller_url:
+            raise ValueError(
+                "No controller address. Fill in controller_url (for example https://nivra.example.com) "
+                "or set the NIVRA_URL environment variable.")
         cl = NivraClient(controller_url, load_token())
         pid = cl.project_id(project)
         body = {"prompt": prompt, "seed": int(seed), "steps": int(steps), "cfg_scale": float(cfg_scale), "upscale": int(upscale)}

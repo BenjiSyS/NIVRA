@@ -119,7 +119,7 @@ export default function Generate() {
           <Field label="Upscale" hint="Small models only: pixel scale 1 to 8">{(id) => <input id={id} className="input" type="number" min={1} max={8} value={upscale} onChange={(e) => setUpscale(+e.target.value || 1)} />}</Field>
           <Field label="Width (HD)" hint="HD models: 0 = model default (1280)">{(id) => <input id={id} className="input" type="number" min={0} max={2560} step={16} value={width} onChange={(e) => setWidth(+e.target.value || 0)} />}</Field>
           <Field label="Height (HD)" hint="HD models: 0 = model default (720)">{(id) => <input id={id} className="input" type="number" min={0} max={1440} step={16} value={height} onChange={(e) => setHeight(+e.target.value || 0)} />}</Field>
-          <Field label="Seconds (HD)" hint="0 = model default (8); longer = segments rendered in parallel by all workers (max 10800)">{(id) => <input id={id} className="input" type="number" min={0} max={10800} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
+          <Field label="Seconds (HD)" hint="0 = model default (8); longer = segments rendered in parallel by all workers (max 1800 = 30 minutes)">{(id) => <input id={id} className="input" type="number" min={0} max={1800} step={0.5} value={seconds} onChange={(e) => setSeconds(+e.target.value || 0)} />}</Field>
           <Field label="Sampler (HD)" hint="ab2 needs fewer steps">{(id) => <select id={id} className="input" value={sampler} onChange={(e) => setSampler(e.target.value)}><option value="">default</option><option value="ab2">ab2</option><option value="euler">euler</option></select>}</Field>
           <Field label="Style (HD)" hint="empty = model default; none = no style tag">{(id) => <select id={id} className="input" value={style} onChange={(e) => setStyle(e.target.value)}><option value="">default</option>{['anime', '3d animation', 'cartoon', '2d animation', 'cel-shaded 3d', 'pixel art', 'claymation', 'painterly', 'realistic', 'none'].map((s) => <option key={s} value={s}>{s}</option>)}</select>}</Field>
         </div>
@@ -153,7 +153,18 @@ export default function Generate() {
                     </div>
                   </div>
                 )}
-                {v.status === 'failed' && <div className="notice err">{v.failure_reason || 'Failed.'}</div>}
+                {v.waiting_reason && <div className="notice warn">{v.waiting_reason}</div>}
+                {v.needs_attention && (
+                  <div className="notice err">
+                    {v.failure_reason || 'A part of this video failed.'}
+                    {can('operator') && (
+                      <div className="row" style={{ marginTop: 6 }}>
+                        <button className="btn sm primary" disabled={busy} onClick={() => void run(() => api.post(`${pbase(pid)}/generations/${encodeURIComponent(v.id)}/regenerate`, {}), 'Failed parts queued again').then(() => longs.reload())}>Regenerate failed parts</button>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {v.status === 'failed' && !v.needs_attention && <div className="notice err">{v.failure_reason || 'Failed.'}</div>}
                 {v.artifact_id && (
                   <>
                     <video className="gen" controls preload="metadata" src={artifactUrl(pid, v.artifact_id)} />
@@ -245,4 +256,6 @@ interface LongVideo {
   artifact_id: string | null
   failure_reason: string
   created_at: string
+  needs_attention?: boolean
+  waiting_reason?: string
 }

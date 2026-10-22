@@ -22,6 +22,9 @@ export interface AppModel {
   default_style?: string
   source?: 'local' | 'network'
   path?: string
+  // One clip of this model (local models report it); longer videos are built from segments.
+  default_seconds?: number
+  default_fps?: number
 }
 export type JobStatus = 'queued' | 'running' | 'downloading' | 'done' | 'failed' | 'cancelled'
 export interface GenParams {
@@ -50,6 +53,8 @@ export interface HistoryItem {
   seconds_total?: number
   eta_seconds?: number | null
   local?: boolean
+  // Why nothing can run this job yet (from the server; absent or empty = no problem).
+  waiting_reason?: string
 }
 export interface GenerateRequest extends GenParams {
   prompt: string
@@ -75,6 +80,8 @@ async function call<T>(method: string, path: string, body?: unknown, signal?: Ab
 export const app = {
   config: (signal?: AbortSignal) => call<AppConfig>('GET', '/config', undefined, signal),
   saveConfig: (b: { controller_url: string; token?: string; project?: string }) => call<AppConfig>('PUT', '/config', b),
+  // Sign in once with a username and password; the app keeps only a personal access key.
+  login: (b: { controller_url: string; username: string; password: string; project?: string }) => call<AppConfig>('POST', '/login', b),
   models: async (signal?: AbortSignal) => {
     const r = await call<{ models: AppModel[] | null; network_error?: string }>('GET', '/models', undefined, signal)
     return { models: r.models ?? [], networkError: r.network_error ?? '' }

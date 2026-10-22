@@ -1,18 +1,18 @@
 import { useState } from 'react'
 import { fmtAgo, fmtBytes, fmtDateTime, fmtDuration } from '../../shared/format'
 import { CopyButton, ErrorNote, applyDensity, Pill, Spinner, confirmDialog, loadPref, savePref, useAction, useAsync, useNow } from '../../shared/ui'
-import { api } from '../api'
+import { api, pbase } from '../api'
 import { Facts, Json } from '../components'
 import { useSession } from '../session'
-import type { AuditEvent, SystemInfo, User } from '../types'
+import type { AuditEvent, SystemInfo } from '../types'
 
 interface ApiToken { id: string; name: string; created_at: string; last_used_at: string | null; expires_at: string | null; revoked_at: string | null }
 
-/** Personal API tokens for ComfyUI's "Nivra Remote" node and scripts. */
-function ApiTokens() {
+/** Personal API tokens for the Nivra App, ComfyUI's "Nivra Remote" node and scripts. */
+export function ApiTokens(props: { intro?: string; defaultName?: string; title?: string }) {
   const now = useNow(10000)
   const list = useAsync(async () => (await api.get<{ tokens: ApiToken[] }>('/tokens')).tokens, [])
-  const [name, setName] = useState('comfyui')
+  const [name, setName] = useState(props.defaultName ?? 'nivra-app')
   const [days, setDays] = useState(365)
   const [fresh, setFresh] = useState<string | null>(null)
   const { busy, run } = useAction()
@@ -28,8 +28,10 @@ function ApiTokens() {
   }
   return (
     <div className="card stack">
-      <h2>API tokens</h2>
-      <p className="dim">Use a token for ComfyUI's <strong>Nivra Remote Text-to-Video</strong> node or the <code>nivra generate</code> command. Set it as the <code>NIVRA_TOKEN</code> environment variable or save it in <code>ComfyUI/user/nivra_token.txt</code>. Never paste it into a workflow you share. Tokens have your role ({'generation needs operator or admin'}).</p>
+      <h2>{props.title ?? 'API tokens'}</h2>
+      <p className="dim">
+        {props.intro ?? <>Use a token to sign the Nivra App in, for ComfyUI's <strong>Nivra Remote Text-to-Video</strong> node or for the <code>nivra generate</code> command. In ComfyUI set it as the <code>NIVRA_TOKEN</code> environment variable or save it in <code>ComfyUI/user/nivra_token.txt</code>. Never paste it into a workflow you share. A token can do what your account can do.</>}
+      </p>
       <form className="row" onSubmit={(e) => void create(e)}>
         <label className="field"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} maxLength={64} /></label>
         <label className="field"><span>Valid days (0 = no expiry)</span><input type="number" min={0} max={3650} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
@@ -59,6 +61,58 @@ function ApiTokens() {
   )
 }
 
+interface ProjectSettings {
+  member_max_video_seconds: number
+  max_concurrent_long_videos: number
+  max_queued_jobs: number
+  intermediate_retention_hours: number
+}
+
+/** Limits for friends and file retention. Operators can read them, administrators change them. */
+function LimitsCard() {
+  const { pid, can } = useSession()
+  const cur = useAsync(() => api.get<ProjectSettings>(`${pbase(pid)}/settings`), [pid])
+  const [draft, setDraft] = useState<ProjectSettings | null>(null)
+  const { busy, run } = useAction()
+  const v = draft ?? cur.data
+  const admin = can('admin')
+  const set = (k: keyof ProjectSettings, val: number) => v && setDraft({ ...v, [k]: val })
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!v) return
+    const r = await run(() => api.put<ProjectSettings>(`${pbase(pid)}/settings`, v), 'Limits saved')
+    if (r) {
+      setDraft(null)
+      cur.reload()
+    }
+  }
+  return (
+    <div className="card stack">
+      <h2>Limits and cleanup</h2>
+      <p className="dim">Keeps one friend from using up every helper computer and the server's disk. Members are the accounts you invited with the "make videos" role.</p>
+      {cur.error ? <ErrorNote error={cur.error} retry={cur.reload} /> : !v ? <Spinner /> : (
+        <form className="stack" onSubmit={(e) => void save(e)}>
+          <div className="form-grid">
+            <label className="field"><span>Longest video for members (minutes)</span>
+              <input className="input" type="number" min={1} max={1440} disabled={!admin} value={Math.round(v.member_max_video_seconds / 60)} onChange={(e) => set('member_max_video_seconds', Math.max(1, Math.round(+e.target.value || 1)) * 60)} /></label>
+            <label className="field"><span>Long videos at the same time, per person</span>
+              <input className="input" type="number" min={1} max={1000} disabled={!admin} value={v.max_concurrent_long_videos} onChange={(e) => set('max_concurrent_long_videos', Math.max(1, Math.round(+e.target.value || 1)))} /></label>
+            <label className="field"><span>Unfinished videos, per person</span>
+              <input className="input" type="number" min={1} max={100000} disabled={!admin} value={v.max_queued_jobs} onChange={(e) => set('max_queued_jobs', Math.max(1, Math.round(+e.target.value || 1)))} /></label>
+            <label className="field"><span>Delete temporary video files after (hours)</span>
+              <input className="input" type="number" min={0} max={8760} disabled={!admin} value={v.intermediate_retention_hours} onChange={(e) => set('intermediate_retention_hours', Math.max(0, Math.round(+e.target.value || 0)))} /></label>
+          </div>
+          <p className="hint faint">Operators and administrators are not limited in video length, but they share the helper computers fairly like everyone else. Nobody can ask for more than 30 minutes per video for now.</p>
+          <div className="row">
+            <button className="btn primary" disabled={!admin || busy || !draft}>Save</button>
+            {!admin && <span className="dim">Only administrators can change these.</span>}
+          </div>
+        </form>
+      )}
+    </div>
+  )
+}
+
 export default function Settings() {
   const { user, project, can } = useSession()
   const now = useNow(5000)
@@ -70,6 +124,7 @@ export default function Settings() {
     <div className="stack">
       <div className="page-head"><h1>Settings</h1></div>
       <ApiTokens />
+      {can('operator') && <LimitsCard />}
       <div className="grid cols-2">
         <div className="card">
           <h2 style={{ marginBottom: 8 }}>System</h2>
@@ -112,30 +167,15 @@ export default function Settings() {
           <p className="hint faint">Stored in this browser only.</p>
         </div>
       </div>
-      {can('admin') ? <AdminSection now={now} /> : <p className="dim">Users and the audit log are visible to administrators only.</p>}
+      {can('admin') ? <AdminSection now={now} /> : <p className="dim">The audit log is visible to administrators only.</p>}
     </div>
   )
 }
 
 function AdminSection({ now }: { now: number }) {
-  const users = useAsync(async () => (await api.get<{ users: User[] | null }>('/users')).users ?? [], [])
   const audit = useAsync(async () => (await api.get<{ events: AuditEvent[] | null }>('/audit')).events ?? [], [], 20000)
   return (
     <>
-      <div className="card scroll-x">
-        <h2 style={{ marginBottom: 8 }}>Users</h2>
-        {users.error ? <ErrorNote error={users.error} retry={users.reload} /> : !users.data ? <Spinner /> : (
-          <table className="tbl">
-            <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Created</th></tr></thead>
-            <tbody>
-              {users.data.map((u) => (
-                <tr key={u.id}><td>{u.username}</td><td>{u.display_name || '–'}</td><td>{u.role}</td><td><Pill state={u.status === 'active' ? 'active' : u.status} /></td><td className="dim">{fmtDateTime(u.created_at)}</td></tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        <p className="hint faint" style={{ marginTop: 8 }}>Create or change users with the command line: <code>nivra admin create</code>.</p>
-      </div>
       <div className="card scroll-x">
         <h2 style={{ marginBottom: 8 }}>Audit log</h2>
         {audit.error ? <ErrorNote error={audit.error} retry={audit.reload} /> : !audit.data ? <Spinner /> : audit.data.length === 0 ? <p className="dim">No audit events yet.</p> : (

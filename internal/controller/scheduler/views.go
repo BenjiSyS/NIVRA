@@ -44,6 +44,10 @@ type JobView struct {
 	CompletedAt   *time.Time      `json:"completed_at"`
 	Current       *AttemptView    `json:"current_attempt"`
 	Result        *ResultView     `json:"result,omitempty"`
+	CreatedBy     *string         `json:"created_by"`
+	// WaitingReason explains why a ready job is not starting (no online
+	// computer can run it, ...). Empty when it is simply queued.
+	WaitingReason string `json:"waiting_reason,omitempty"`
 }
 
 // ResultView summarises the latest result of a job.
@@ -58,7 +62,7 @@ type ResultView struct {
 const jobSelect = `SELECT j.id, j.job_type, j.category, j.status, j.priority, j.attempt_count, j.max_attempts,
 	j.training_run_id::text, j.params, j.failure_reason, j.created_at, j.updated_at, j.completed_at,
 	a.id::text, a.device_id::text, d.name, a.attempt_number, a.fencing_token, a.state, a.progress, a.stage,
-	a.lease_expires_at, a.leased_at, a.started_at, a.completed_at, a.error
+	a.lease_expires_at, a.leased_at, a.started_at, a.completed_at, a.error, j.created_by::text
 	FROM jobs j
 	LEFT JOIN LATERAL (SELECT * FROM job_attempts x WHERE x.job_id=j.id ORDER BY x.attempt_number DESC LIMIT 1) a ON true
 	LEFT JOIN devices d ON d.id = a.device_id `
@@ -73,7 +77,7 @@ func scanJob(r pgx.Row) (JobView, error) {
 	var aStart, aDone *time.Time
 	err := r.Scan(&v.ID, &v.JobType, &v.Category, &v.Status, &v.Priority, &v.AttemptCount, &v.MaxAttempts,
 		&v.TrainingRunID, &v.Params, &v.FailureReason, &v.CreatedAt, &v.UpdatedAt, &v.CompletedAt,
-		&aID, &aDev, &aName, &aNum, &aFence, &aState, &aProg, &aStage, &aExp, &aLeased, &aStart, &aDone, &aErr)
+		&aID, &aDev, &aName, &aNum, &aFence, &aState, &aProg, &aStage, &aExp, &aLeased, &aStart, &aDone, &aErr, &v.CreatedBy)
 	if err != nil {
 		return v, err
 	}
@@ -105,6 +109,9 @@ func (s *Scheduler) GetJob(ctx context.Context, projectID, jobID string) (JobVie
 	if err == nil {
 		v.Result = &rv
 	}
+	if v.Status == JobReady {
+		v.WaitingReason = s.WaitingReason(ctx, projectID, jobID)
+	}
 	return v, nil
 }
 
@@ -113,8 +120,10 @@ type JobFilter struct {
 	Status  string
 	JobType string
 	RunID   string
-	Before  *time.Time
-	Limit   int
+	// CreatedBy restricts the list to jobs created by this user (members).
+	CreatedBy string
+	Before    *time.Time
+	Limit     int
 }
 
 // ListJobs returns jobs newest first with keyset pagination on created_at.
@@ -126,7 +135,8 @@ func (s *Scheduler) ListJobs(ctx context.Context, projectID string, f JobFilter)
 		AND ($2 = '' OR j.status = $2) AND ($3 = '' OR j.job_type = $3)
 		AND ($4 = '' OR j.training_run_id::text = $4)
 		AND ($5::timestamptz IS NULL OR j.created_at < $5)
-		ORDER BY j.created_at DESC LIMIT $6`, projectID, f.Status, f.JobType, f.RunID, f.Before, f.Limit)
+		AND ($7 = '' OR j.created_by::text = $7)
+		ORDER BY j.created_at DESC LIMIT $6`, projectID, f.Status, f.JobType, f.RunID, f.Before, f.Limit, f.CreatedBy)
 	if err != nil {
 		return nil, err
 	}

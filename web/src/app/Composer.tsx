@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppModel, GenerateRequest, HistoryItem } from './api'
-import { estimateSeconds, fmtDuration, fmtLength, LIMITS, parseFps, parseLength, parsePrompt, resolutionById, RESOLUTIONS, type Prefs } from './prefs'
+import { estimateSeconds, fmtDuration, fmtLength, LIMITS, LONG_CONFIRM_SECONDS, parseFps, parseLength, parsePrompt, resolutionById, RESOLUTIONS, segmentPlan, type Prefs } from './prefs'
 
 export function modelLabel(m: AppModel): string {
   return m.name || m.id
@@ -22,6 +22,66 @@ export function bestModel(models: AppModel[]): AppModel | undefined {
     models.find((m) => m.source !== 'local' && m.active) ??
     models.find((m) => m.family === 'hd') ??
     models[0]
+  )
+}
+
+interface LongInfo {
+  segments: number
+  length: string
+  hours: number
+  rough: boolean
+  local: boolean
+}
+
+// LongConfirm asks before a video longer than five minutes starts. It is a real
+// modal <dialog>: focus moves into it, Tab stays inside, Esc cancels, and focus
+// returns to the Generate button afterwards.
+function LongConfirm(props: { info: LongInfo | null; onStart: () => void; onCancel: () => void }) {
+  const ref = useRef<HTMLDialogElement>(null)
+  const { info } = props
+  useEffect(() => {
+    const d = ref.current
+    if (!d) return
+    if (info && !d.open) d.showModal()
+    if (!info && d.open) d.close()
+  }, [info])
+  const work = info ? (info.hours < 0.1 ? 'under 10 minutes' : `${info.hours.toFixed(1)} machine-hours`) : ''
+  return (
+    <dialog
+      ref={ref}
+      className="confirm"
+      aria-labelledby="lc-title"
+      aria-describedby="lc-body"
+      onCancel={(e) => {
+        e.preventDefault()
+        props.onCancel()
+      }}
+      onClick={(e) => {
+        if (e.target === ref.current) props.onCancel()
+      }}
+    >
+      {info && (
+        <>
+          <h2 id="lc-title">Start a long video?</h2>
+          <div id="lc-body" className="stack" style={{ gap: 8 }}>
+            <p style={{ margin: 0 }}>
+              This video is <b>{info.length}</b> long, so it is built from <b>{info.segments} segments</b>.
+            </p>
+            <p style={{ margin: 0 }}>
+              {info.local
+                ? <>It will keep this computer busy for about <b>{work}</b>.</>
+                : <>That is about <b>{work}</b> of work across all helping computers.</>}
+              {info.rough ? ' This is a rough guess; you get a better estimate after your first video.' : ''}
+            </p>
+            <p className="dim" style={{ margin: 0 }}>More computers sharing the work means it finishes sooner. You can cancel it any time.</p>
+          </div>
+          <div className="actions">
+            <button type="button" className="btn" onClick={props.onCancel}>Cancel</button>
+            <button type="button" className="btn primary" onClick={props.onStart}>Start</button>
+          </div>
+        </>
+      )}
+    </dialog>
   )
 }
 
@@ -48,6 +108,7 @@ export function Composer(props: {
   // '' = the model's default style; 'none' = no style tag.
   const [style, setStyle] = useState('')
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const [pending, setPending] = useState<{ req: GenerateRequest; info: LongInfo } | null>(null)
 
   // Auto-pick the best model until the user chooses one; follow new models.
   useEffect(() => {
@@ -75,7 +136,7 @@ export function Composer(props: {
   const hd = model?.family === 'hd'
   const styles = model?.styles ?? []
   const needsNetwork = !!model && model.source !== 'local' && !props.networkReady
-  const blockReason = models.length === 0 ? props.disabledReason : needsNetwork ? props.disabledReason || 'Not connected to the controller.' : ''
+  const blockReason = models.length === 0 ? props.disabledReason : needsNetwork ? props.disabledReason || 'Not connected to the Nivra server.' : ''
   const parsed = useMemo(() => parsePrompt(prompt), [prompt])
 
   // Typed in the message wins over the fields below the box.
@@ -84,7 +145,7 @@ export function Composer(props: {
   const res = resolutionById(parsed.found.resolution ?? prefs.resolution)
   const fps = parsed.found.fps ?? fpsField ?? 30
   const seconds = parsed.found.seconds ?? lenField
-  const lenBad = parsed.found.seconds === undefined && (lenField === undefined || lenField < LIMITS.seconds[0] || lenField > LIMITS.seconds[1])
+  const lenBad = parsed.found.seconds === undefined && (lenField === undefined || lenField < LIMITS.seconds[0] || lenField > (model?.source === 'local' ? LIMITS.localSeconds : LIMITS.seconds)[1])
   const fpsBad = parsed.found.fps === undefined && fpsField === undefined
   const canSend = parsed.prompt !== '' && !props.busy && !blockReason && !!model && (!hd || (!lenBad && !fpsBad))
   const fromMsg = Object.keys(parsed.found).length > 0
@@ -106,6 +167,18 @@ export function Composer(props: {
       r.sampler = sampler
       if (style) r.style = style
     }
+    if (hd && seconds !== undefined && seconds > LONG_CONFIRM_SECONDS) {
+      const plan = segmentPlan(seconds, fps, model.default_seconds && model.default_seconds > 0 ? model.default_seconds : 8)
+      // Machine time: the measured rate from earlier videos when there is one,
+      // else a rough 9 minutes per segment.
+      const machineSec = est ?? plan.segments * 9 * 60
+      setPending({ req: r, info: { segments: plan.segments, length: fmtLength(seconds), hours: machineSec / 3600, rough: est === undefined, local: model.source === 'local' } })
+      return
+    }
+    await submit(r)
+  }
+
+  async function submit(r: GenerateRequest) {
     const ok = await onSend(r)
     if (ok) {
       setPrompt('')
@@ -118,6 +191,18 @@ export function Composer(props: {
 
   return (
     <div className="composer">
+      <LongConfirm
+        info={pending?.info ?? null}
+        onCancel={() => {
+          setPending(null)
+          taRef.current?.focus()
+        }}
+        onStart={() => {
+          const r = pending?.req
+          setPending(null)
+          if (r) void submit(r)
+        }}
+      />
       <div className="composer-in">
         {open && (
           <div className="popover" role="dialog" aria-label="More options">
@@ -182,7 +267,7 @@ export function Composer(props: {
               <input className={'input' + (lenBad ? ' bad' : '')} style={{ width: 110 }} placeholder="8s, 2 min, 1 h" value={parsed.found.seconds !== undefined ? fmtLength(parsed.found.seconds) : prefs.length} disabled={parsed.found.seconds !== undefined} onChange={(e) => setPref({ length: e.target.value })} aria-invalid={lenBad} />
             </label>
             <span className="faint" style={{ fontSize: 12 }}>
-              {lenBad ? 'Length: e.g. 8s, 90 sec, 2 min, 1.5 h (max 3 h)' : fpsBad ? 'FPS: a number from 1 to 60' : `${fromMsg ? 'from your message · ' : ''}${seconds !== undefined ? fmtLength(seconds) : ''}${seconds !== undefined && seconds > 8 ? ` · built from ${Math.ceil(seconds / 8)} segments` : ''}${est !== undefined ? ` · about ${fmtDuration(est)}${model?.source !== 'local' && seconds !== undefined && seconds > 8 ? ' on one GPU (less with more workers)' : ''}` : ' · time estimate after your first video'}`}
+              {lenBad ? 'Length: e.g. 8s, 90 sec, 2 min, 1.5 h (max ' + (model?.source === 'local' ? '3 h on this computer' : '30 min') + ')' : fpsBad ? 'FPS: a number from 1 to 60' : `${fromMsg ? 'from your message · ' : ''}${seconds !== undefined ? fmtLength(seconds) : ''}${seconds !== undefined && seconds > 8 ? ` · built from ${Math.ceil(seconds / 8)} segments` : ''}${est !== undefined ? ` · about ${fmtDuration(est)}${model?.source !== 'local' && seconds !== undefined && seconds > 8 ? ' on one GPU (less with more workers)' : ''}` : ' · time estimate after your first video'}`}
             </span>
           </div>
         )}

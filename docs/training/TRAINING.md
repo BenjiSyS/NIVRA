@@ -156,3 +156,63 @@ one machine (a 6 GB GPU is enough for `nivra_base`; a CPU works for tiny tests o
 Troubleshooting: "no train clips" after ingest means the videos were shorter than 2 s, lower resolution than 448x256 or lacked a caption
 (the counts are in `RUN\dataset\dataset.json`, key `rejected`). A `StreamStateTooLarge` error while decoding means the VAE tile size is too small for the output size:
 use a larger `vae_tile` (the cache state grows with the number of tiles).
+
+## 2026 improvement pass: what is new in the HD trainer (all config-gated)
+
+Source: `docs/research/IMPROVEMENT_RESEARCH_2026.md` (changes 1-7, 9, 10, 12 and the EMA note). Every option lives in the config's `train`
+(or `model` / `vae`) section, is validated by `hd_config.train_options`, and **a config without these keys trains exactly as before**
+(loss histories of the old trainer are reproduced to 1e-4 in `ai/tests/test_improve_training.py`; an old bundle loads, generates and
+keeps its `hd_config_sha`). Checkpoints written by the old trainer resume with the new one (new groups are created on resume).
+
+| Option (section `train` unless noted) | Meaning | tiny | base | medium / large |
+|---|---|---|---|---|
+| `vae.temporal_factor` (`vae`) | 4 or 8 (alias for `temporal_down` `[2,3]` / `[1,2,3]`; 32x spatial layout) | 8 | **4** | 8 |
+| `vae_stages` | VAE schedule: image AE (T=1) -> low-res clips -> target fine-tune; per stage `image_fraction` mixes T=1 batches into video stages | on | on | on |
+| `vae_gan_weight`, `vae_gan_start`, `vae_gan_lr`, `vae_gan_base`, `vae_gan_layers` | hinge patch-GAN (3D, T=1 for images) with the VQGAN adaptive weight, switched on at step `vae_gan_start` | 0.05 | 0.05 | 0.05 |
+| `vae.edge_weight` (`vae`) | edge/gradient loss; absent in a stylized config means 0.3, general means 0 | 0.5 | 0.5 | 0.5 |
+| `vae_latent_norm` | `channel`: per-channel `[C]` latent shift/scale from encode statistics (needs `nivra-hc-vae/2`); `scalar`: the old pair | channel | channel | channel |
+| stage keys `image_fraction`, `buckets` | image-first DiT stage = a stage with `frames: 1`; joint stage = `image_fraction` p of micro-batches are T=1 stills; `buckets` = weighted list of {height,width,frames} | on | on | on |
+| `ema_decay`, `ema_warmup` | EMA of the DiT; **the bundle exports the EMA weights when `ema_decay > 0`**; decay ramps (1+n)/(10+n) up to `ema_decay` | 0.99 | 0.9995 | 0.9999 |
+| `sra` `{weight, student_layer, teacher_layer, t_ratio, until_step, hidden}` | self-representation alignment: `1 - cos(proj(block[student] at noise t), stop-grad block[teacher] of the EMA model at noise t*t_ratio)`; projector is training-only (checkpointed, never exported) | 0.5 (0->1) | **0.5 (3->8 of 12)** | 0.5 (5->15 of 24) |
+| `repa` | REPA with an external teacher (DINOv2, licensed opt-in). **Not implemented**: `enabled: true` is rejected; `RepaHook` in `hd_trainer.py` documents the interface | off | off | off |
+| `diffusion_forcing` `{fraction, cond_fraction}` | fraction of DiT micro-batches with an independent timestep per latent frame; `cond_fraction`: batches with clean first / last latent frame(s) as conditioning (needs `model.frame_cond`) | 0.25 / 0 | **0.25 / 0.15** | 0.25 / 0 |
+| `model.frame_cond`, `model.fps_cond` (`model`) | v2 DiT: conditioning-frame flag embedding + effective-fps embedding (architecture change: `nivra-dit/2`) | off | **on** | off |
+| `fps_dropout` | probability the clip's effective fps is replaced by the learned "unknown" embedding | 0.1 | 0.1 | 0.1 |
+| `fp32_attn` | attention logits / softmax in float32 for half inputs | on | on | on |
+| `loss_scale` `{init, growth_interval, growth, backoff}` | dynamic loss scaling (CUDA fp16, or any device with `force_loss_scaling: true` for tests) | - | defaults | defaults |
+
+**Order of work.** VAE: `vae_stages` (image autoencoder at T=1, then causal-3D low-resolution short clips with 20 % image batches, then the target
+resolution fine-tune), GAN from `vae_gan_start`, then calibration on training clips (per channel when `vae_latent_norm: channel`). The latent
+calibration travels with the VAE (`hc_vae.json`, safetensors metadata, bundle manifest `config.vae.latent_shift/latent_scale/latent_norm`); every
+consumer calls `vae.to_scaled` / `from_scaled`, which handle both forms. DiT: image-first stage (stills are encoded by the same causal VAE; the
+`latents` stage writes extra T=1 shards `lat-still-*` with random frames of every clip, listed under `still_shards` in the latents `dataset.json`), then
+joint image + video stages with buckets; the timestep shift is `clamp(sqrt(tokens / shift_base_tokens), 1, 6)` with tokens = T x H x W of the latent;
+training (per micro-batch) and inference apply the same `resolution_shift(tokens, base)`, so image batches (few tokens) get shift 1 and a long 256p clip the full shift.
+
+**fp16 on Turing (RTX 20xx has no bf16).** The timestep / fps embedders, the adaLN modulation projection, every LayerNorm / RMSNorm, the modulation
+arithmetic and the gate multiply run in float32 under autocast and in a half model (identical to the old code in float32); `train.fp32_attn` /
+`inference.attn_fp32` also run the attention logits in float32. The GradScaler is dynamic: an overflow step is skipped, logged
+(`fp16 overflow ... optimizer step skipped, loss scale a -> b`), counted in `skipped_steps` and `history[].skipped`, EMA is not advanced, and the scale
+never drops below 1; 200 skipped steps in a row raise instead of looping. None of this has run on a GPU yet (this machine has no CUDA device); on CPU it is
+exercised with `train.force_loss_scaling` and forced overflows.
+
+**Anime holds.** Ingest (`--profile stylized`, on by default there; `IngestOptions.detect_holds`) decodes each clip window at the SOURCE frame rate
+as small gray frames, finds the frame pairs that really change (threshold = max(0.15, 8 % of the clip's 90th-percentile difference)), and stores in
+every manifest row `hold` (most common drawing duration in frames: 1 = on ones, 2 = on twos...), `effective_fps` (source fps / mean duration; 2,3,2,3 at
+24 fps gives 9.6), `hold_purity` and `hold_fraction`. `model.fps_cond` makes the DiT condition on `effective_fps`; at inference it defaults to the
+output fps (`generate(effective_fps=...)` overrides). `IngestOptions.drawing_rate_sampling=True` instead re-reads such a clip at its drawing rate
+(every frame a new drawing, the clip spans more source time); it is a Python option only (no CLI flag yet). OCR subtitle / credit filtering is
+not implemented: it needs an OCR dependency (PaddleOCR) and this pass installs nothing.
+
+**Frame conditioning for long videos.** For `frame_cond` models `sample_flow` holds the known frames (continuation overlap, refine anchors) CLEAN with
+t = 0 and the flag embedding instead of re-noising them along the flow path; older models keep the replacement scheme. `run_draft` / `run_refine`
+results report `conditioning: "mask" | "replace"`.
+
+**What a smoke test shows.** `train-pipeline --config nivra_hd_tiny` (8 VAE steps scaled to 4, 6 DiT steps) runs every new path on CPU in about 12 s
+and produces a bundle that loads and generates (`ai/tests/test_improve_pipeline.py`). That proves plumbing and exact-resume behaviour, not quality.
+
+**Measured CPU cost of the new options** (this laptop, 4 threads, CPU seconds per optimizer step from `time.process_time`, other jobs were running so
+read it as +-10 %; DiT: dim 512, depth 8, 64-channel latent 5x8x14 = 560 tokens, batch 2, grad checkpointing; VAE: channels 16..64, 64 latent channels,
+17x128x224, batch 1). DiT baseline 12.8 s: + EMA 1.08x, + SRA with EMA teacher 1.30x, + diffusion forcing 25 % ~1.0x, the whole `nivra_base` recipe (EMA, SRA,
+DF + conditioning frames, fp32 attention logits, v2 embeddings) 1.27x. VAE baseline 25.4 s: + patch-GAN (discriminator forward / backward, two extra
+gradient passes for the adaptive weight) 1.47x while it is on. fp16 numbers on a real GPU are not measured (no CUDA device here).

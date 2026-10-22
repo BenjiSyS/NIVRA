@@ -138,6 +138,8 @@ func (a *Agent) effectivelyPaused() (bool, string) {
 		return true, "paused by the project administrator"
 	case a.localPaused:
 		return true, "paused on this computer"
+	case a.gate.LocalActive():
+		return true, "paused while this computer makes a video for you"
 	case !a.settings.InSchedule(time.Now()):
 		return true, "outside scheduled operating hours"
 	}

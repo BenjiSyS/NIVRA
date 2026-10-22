@@ -25,7 +25,7 @@ const generateUsage = `Generate a video with a Nivra model.
 
 Remote (any computer; the work runs on a connected worker computer):
   nivra generate --url https://studio.example.com --user alice --prompt "a red circle moves from left to right" --out clip.mp4
-  Password: prompted, or from the NIVRA_PASSWORD environment variable. The account needs the operator role.
+  Password: prompted, or from the NIVRA_PASSWORD environment variable. The account needs the member role or higher (invite a friend from Studio, People).
 
 Local (one computer, no controller; needs Python + PyTorch from the worker install):
   nivra generate --bundle path/to/model-bundle --prompt "two blue squares move up" --out clip.mp4

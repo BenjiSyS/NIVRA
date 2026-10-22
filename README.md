@@ -83,8 +83,13 @@ Summary:
 | Nivra Small model (64×64, 16 frames, synthetic domain) | Trained on CPU; see [docs/research/EXPERIMENTS.md](docs/research/EXPERIMENTS.md) |
 | Distributed DiLoCo training | Implemented; physical results in EXPERIMENTS.md |
 | ComfyUI nodes | Implemented; test status in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) |
+| Nivra App (`Nivra.exe`): chat-style generation, local and network models, this computer as a worker | Verified end to end with the tiny HD model |
+| HD models, stylized specialization, long videos (up to 30 minutes on the network) | Plumbing verified with the tiny model; **no quality claims**: nothing is trained on real data yet |
+| Friends: invitations, `member` role, per-person limits, fair scheduling, storage cleanup, nightly backups | Implemented with tests (see [docs/installation/INVITE_FRIENDS.md](docs/installation/INVITE_FRIENDS.md)) |
+| HD training on real video (captioning, encoding, distributed rounds, evaluation gate) | Verified with the tiny config on CPU workers; GPU paths untested |
+| Windows installer from a release zip (no compilers needed) | Implemented; not yet tested on a clean machine |
 | Audio, speech, lip-sync | Not started |
-| 720p / 240-frame generation | Research goal, not implemented |
+| Photoreal 720p+ quality | Research goal; the pipeline for it exists, the weights do not |
 
 ## 3. Features
 
@@ -100,6 +105,15 @@ Summary:
 * Original model: 3D-conv VAE tokenizer + factorised space/time transformer trained with rectified flow,
   bilingual (English/Swedish) prompts, video continuation and image-to-video conditioning.
 * ComfyUI custom nodes.
+* **Nivra App** for Windows: type a prompt, get a video; runs on this computer's GPU or on the network; the same
+  window can lend the computer to the network. Sign in with a username and password (the App keeps only an access key).
+* **Friends**: single-use invitation links, a restricted `member` role (own videos only), per-person limits on video
+  length, long videos and queue size, fair sharing of helper computers, and a reserved share for training.
+* **Long videos** (draft, parallel segments, stitch) up to 30 minutes; a failed segment can be regenerated without
+  losing the rest; workers lacking ffmpeg or memory are never given jobs they cannot run, and the App says why a job waits.
+* **Operations**: Storage page with automatic cleanup of temporary files, size-rotated logs, nightly database and
+  secrets backups with retention ([docs/installation/BACKUP.md](docs/installation/BACKUP.md)), upgrade guide
+  ([docs/installation/UPGRADES.md](docs/installation/UPGRADES.md)), release packaging (`make release`) and CI.
 
 ## 4. Actual Video Examples
 
@@ -147,19 +161,26 @@ See [QUICKSTART.md](QUICKSTART.md) — where everything lives, start/stop, addin
 
 Send someone only [`Nivra-Setup.bat`](Nivra-Setup.bat). Double-clicking it:
 
-1. installs Git with winget if it is missing (it asks first),
-2. clones Nivra into `%USERPROFILE%\Nivra` (or the folder given as the first argument),
-3. installs missing tools with winget (Go and Node.js to build, Python 3.12 to run the model),
+1. looks for the latest tagged **release** on GitHub (`NIVRA_REPO`, or the `REPO=` line at the top of the file), downloads
+   its zip and **verifies the SHA-256** from the release's `SHA256SUMS`; only Python and PyTorch are needed then. If there
+   is no release, or the download fails or does not verify, it falls back to the source build below,
+2. source build: installs Git with winget if it is missing (it asks first), clones Nivra into `%USERPROFILE%\Nivra` (or the
+   folder given as the first argument), installs Go and Node.js to build,
+3. installs Python 3.12 to run the model and **ffmpeg** (winget `Gyan.FFmpeg`; its absolute path is written to the worker
+   config, so `PATH` does not matter),
 4. detects the hardware: an NVIDIA GPU gets CUDA PyTorch, matched to the GPU generation; anything
    else gets CPU PyTorch,
-5. builds `Nivra.exe` in the Nivra folder and adds Desktop and Start menu shortcuts.
+5. installs `Nivra.exe` in the Nivra folder and adds Desktop and Start menu shortcuts.
 
-Running it again updates Nivra (`git pull`) and rebuilds. `NIVRA_SETUP_YES=1` answers every question
+Running it again updates Nivra (a new release, or `git pull` and rebuild). It refuses to start while `Nivra.exe` is
+running, before anything is changed. Make the release files with `make release`
+(see [docs/installation/UPGRADES.md](docs/installation/UPGRADES.md)). `NIVRA_SETUP_YES=1` answers every question
 with yes. Nothing starts automatically at boot.
 
 **The Nivra App (`Nivra.exe`)** opens a window where you type a prompt and the video comes back as the
 reply, like a chat. It is not a chatbot: the text goes to the video model. The first time, enter the
-controller URL and a personal API token (Studio → Settings → API tokens). Generation runs on whichever
+address of your Nivra server and either your username and password (the App then creates an access key for itself and
+forgets the password) or an access key you made in Studio → Settings. Generation runs on whichever
 worker computer the controller picks (one controller, many workers), so a laptop without a GPU can
 still use a GPU computer elsewhere. The same window has **This computer as a worker**: enroll it with a
 project code and it trains and generates for everyone too. It only gets jobs that fit its RAM/VRAM
@@ -170,7 +191,7 @@ budget, so HD jobs that need a GPU never land on a CPU-only computer. Closing th
   Videos or ComfyUI are detected (Models → Search now) and the best one is picked. Models on this computer run
   without any controller.
 * **Under the prompt box**: Resolution (144p, 480p, 720p, 1080p, 1440p), FPS and Length typed as `8s`, `2 min` or
-  `1.5 h` (up to 3 hours). You can also type them in the message (`…, 2 min 24fps 1080p`). Sampling steps are
+  `1.5 h` (up to 30 minutes on the network, 3 hours on this computer's own GPU). You can also type them in the message (`…, 2 min 24fps 1080p`). Sampling steps are
   automatic. Before sending you see an estimated time; while running, the time left.
 * **Long videos** (longer than the model's 8 s clip) are drawn once at low resolution, then split into segments
   that every connected GPU renders at the same time (other people's workers too), then joined.
@@ -215,9 +236,13 @@ budget, disk cache, bandwidth, operating hours) are set in the Worker website.
 
 ## 13. Cloudflare and Domain
 
-Planned hostnames: `studio.benjiserver.com` (admin) and `api.benjiserver.com` (workers/API) via the
-existing Cloudflare Tunnel — step-by-step in [deploy/cloudflare/README.md](deploy/cloudflare/README.md).
-Public routes are **not** enabled yet; when the controller is stopped, the sites are offline.
+The controller is published through a Cloudflare Tunnel on two hostnames, for example `studio.example.com` (Studio, the
+App, ComfyUI) and `api.example.com` (workers), separated by host: the worker hostname does not serve the admin site and
+the Studio hostname does not serve worker routes. Step by step in [deploy/cloudflare/README.md](deploy/cloudflare/README.md);
+use your own domain (nothing about the owner's domain is stored in this repository). When the Raspberry Pi is off the
+sites are offline. Before sharing the address with friends rotate the project code and the admin password
+([docs/installation/BACKUP.md](docs/installation/BACKUP.md#rotating-passwords-and-the-project-code)) and read
+[docs/installation/INVITE_FRIENDS.md](docs/installation/INVITE_FRIENDS.md).
 
 ## 14. Network Architecture
 
@@ -238,7 +263,9 @@ Two different capabilities are measured separately:
 ## 16. Controller Website
 
 Nivra Studio pages: Overview, Workers, Queue, Training, Experiments, Checkpoints, Models, Generate,
-Datasets, Contributions, Logs, Settings. Live updates via SSE; pause/resume/stop/revoke actions call
+Datasets, Contributions, Storage (operators), People (administrators: accounts and invitations), Logs, Settings
+(access keys, limits and cleanup, audit log). Members who follow an invitation link see a small page instead: their
+access keys, their limits and their own videos. Live updates via SSE; pause/resume/stop/revoke actions call
 the real API and show "requested" vs "confirmed".
 
 ## 17. Worker Website
@@ -338,11 +365,12 @@ Then generate from any computer:
 * **Command line** (no install needed except the `nivra` binary):
 
   ```bash
-  nivra generate --url https://studio.benjiserver.com --user alice --prompt "two blue squares move up" --out clip.mp4
+  nivra generate --url https://studio.example.com --user alice --prompt "two blue squares move up" --out clip.mp4
   ```
 
-  The password is asked for (or read from `NIVRA_PASSWORD`). Accounts need the **operator** role:
-  `bin/nivra admin create --username alice --role operator` on the controller.
+  The password is asked for (or read from `NIVRA_PASSWORD`). Friends use the **member** role: invite them from
+  Studio → People or run `bin/nivra admin invite` on the controller
+  ([docs/installation/INVITE_FRIENDS.md](docs/installation/INVITE_FRIENDS.md)).
 
 ### B. Use a model on this computer only (no controller)
 
@@ -360,14 +388,17 @@ The controller sends each generation to an idle connected worker whose AI execut
 RAM/VRAM budget fits the job. To force generation onto one machine, pause the others in Studio or
 lower their budgets. Generated videos are stored on the controller and listed on the Generate page.
 
-More details and measured timings: [docs/inference/INFERENCE.md](docs/inference/INFERENCE.md).
+If no computer can run a job (no helper online, not enough GPU memory, no ffmpeg) the job view says so in plain words
+instead of waiting silently. More details and measured timings: [docs/inference/INFERENCE.md](docs/inference/INFERENCE.md).
 
 ## 25. Prompt Guide
 
-The current model understands its synthetic vocabulary: counts (one–three), colours (red, green, blue,
+The small synthetic model (Nivra Small) understands its synthetic vocabulary: counts (one–three), colours (red, green, blue,
 yellow, white, purple), shapes (circle, square, triangle) and motions (left to right, right to left,
 up, down, stationary). Unknown words are ignored and reported. Prompt-adherence scores are measured,
-not guaranteed.
+not guaranteed. HD models take free text of up to 1000 characters (small models: 200) with an optional style
+(anime, 3D animation, cartoon, ...); how well they follow a prompt depends entirely on what they were trained on, and no
+model has been trained on real video yet.
 
 ## 26. Multilingual Prompts
 
@@ -401,7 +432,7 @@ no GPU needed) can generate at the same time on the same set of workers. Each pe
 API token in Nivra Studio → Settings → API tokens and sets it as `NIVRA_TOKEN` (or saves it in
 `ComfyUI/user/nivra_token.txt`) — never inside a shared workflow. Details: [docs/comfyui/COMFYUI.md](docs/comfyui/COMFYUI.md#two-ways-to-run).
 
-The command line works the same way with a token: `NIVRA_TOKEN=... nivra generate --url https://studio.benjiserver.com --prompt "..."`.
+The command line works the same way with a token: `NIVRA_TOKEN=... nivra generate --url https://studio.example.com --prompt "..."`.
 
 ## 31. ComfyUI Workflows
 

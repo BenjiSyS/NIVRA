@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 STAGES = ["ingest", "tokenizer", "text", "vae", "latents", "dit", "bundle"]
@@ -82,12 +83,13 @@ def floor_mult(n: int, m: int) -> int:
     return max(m, (int(n) // m) * m)
 
 
-def fit_stages(stages: list, height: int, width: int, frames: int) -> list:
-    """Stages whose clip geometry fits inside (height, width, frames); never empty."""
+def fit_stages(stages: list, height: int, width: int, frames: int, tf: int = 8) -> list:
+    """Stages whose clip geometry fits inside (height, width, frames); never empty. `tf` is the VAE temporal factor
+    (the fallback stage uses a frame count of the form 1 + tf*k)."""
     ok = [dict(s) for s in stages if s["height"] <= height and s["width"] <= width and s["frames"] <= frames]
     if ok:
         return ok
-    f = 1 + 8 * ((frames - 1) // 8)
+    f = 1 + tf * ((frames - 1) // tf)
     return [{"name": "dataset", "height": floor_mult(height, 32), "width": floor_mult(width, 32), "frames": f, "steps": 1}]
 
 
@@ -251,7 +253,7 @@ class Pipeline:
         rate = EFFECTIVE_FLOPS[dev]
         tc = cfg["train"]
         vc, dc = vae_config(cfg), dit_config(cfg)
-        stages = fit_stages(tc["stages"], *self.geometry())
+        stages = fit_stages(tc["stages"], *self.geometry(), tf=vc.temporal_factor)
         st = stages[-1]
         try:
             tr = shape_trace(vc, st["frames"], st["height"], st["width"])
@@ -399,20 +401,45 @@ class Pipeline:
                 "sha256": _sha_file(w), "id": res["meta"]["id"], "params": res["meta"]["params"],
                 "first_loss": h[0][1], "last_loss": h[-1][1]}
 
+    def vae_tf(self) -> int:
+        from ..models.hd_config import vae_config
+        return vae_config(self.cfg).temporal_factor
+
     def train_cfg(self, total: int, stages: Optional[list] = None) -> dict:
         cfg = copy.deepcopy(self.cfg)
         h, w, f = self.geometry()
         base = stages if stages is not None else cfg["train"]["stages"]
-        cfg["train"]["stages"] = scale_stages(fit_stages(base, h, w, f), total)
+        fitted = fit_stages(base, h, w, f, self.vae_tf())
+        cfg["train"]["stages"] = scale_stages(fitted, total)
         if self.o.save_every:
             cfg["train"]["save_every"] = self.o.save_every
         return cfg
 
+    @staticmethod
+    def rescale_step_keys(tc: dict, ratio: float) -> None:
+        """Step-valued options (GAN start, SRA end) are written for the config's own schedule; when the schedule is
+        scaled to a different total, they scale with it."""
+        if tc.get("vae_gan_start"):
+            tc["vae_gan_start"] = int(round(tc["vae_gan_start"] * ratio))
+        if isinstance(tc.get("sra"), dict) and tc["sra"].get("until_step"):
+            tc["sra"] = dict(tc["sra"], until_step=int(round(tc["sra"]["until_step"] * ratio)))
+
     def stage_vae(self) -> dict:
         from ..compression.hc_vae import save_hcvae
         from ..training.hd_trainer import train_hd
-        cfg = self.train_cfg(self.o.vae_steps)
-        self.log(f"[vae] stages {[(s['name'], s['height'], s['width'], s['frames'], s['steps']) for s in cfg['train']['stages']]}")
+        vs = self.cfg["train"].get("vae_stages")
+        if vs:                                         # staged recipe: image AE -> low-res clips -> target fine-tune
+            cfg = self.train_cfg(self.o.vae_steps, stages=vs)
+            cfg["train"]["vae_stages"] = cfg["train"].pop("stages")
+            cfg["train"]["stages"] = self.cfg["train"]["stages"]
+            orig_total = sum(int(x["steps"]) for x in vs)
+            key = "vae_stages"
+        else:
+            cfg = self.train_cfg(self.o.vae_steps)
+            orig_total = sum(int(x["steps"]) for x in self.cfg["train"]["stages"])
+            key = "stages"
+        self.rescale_step_keys(cfg["train"], self.o.vae_steps / max(1, orig_total))
+        self.log(f"[vae] {key} {[(s['name'], s['height'], s['width'], s['frames'], s['steps'], s.get('image_fraction', 0)) for s in cfg['train'][key]]}")
         res = train_hd(cfg, self.dataset_dir(), self.p("vae_run"), target="vae", total_steps=self.o.vae_steps,
                        device=self.device, seed=self.o.seed, resume=True, log=self.log)
         if res["status"] != "done":
@@ -438,7 +465,8 @@ class Pipeline:
         eh = floor_mult(min(h, max(s["height"] for s in sh)), 32)
         ew = floor_mult(min(w, max(s["width"] for s in sh)), 32)
         ef = min(f, max(s["frames"] for s in sh))
-        ef = 1 + 8 * ((ef - 1) // 8)
+        tf = self.vae_tf()
+        ef = 1 + tf * ((ef - 1) // tf)
         ds = json.loads((self.dataset_dir() / "dataset.json").read_text(encoding="utf-8"))
         return {"h": eh, "w": ew, "frames": ef, "fps": int(round(float(ds.get("fps", 8))))}
 
@@ -456,7 +484,9 @@ class Pipeline:
             for q in out.glob("lat-*.safetensors"):
                 q.unlink()
         out.mkdir(parents=True, exist_ok=True)
-        new_rows, files = [], []
+        new_rows, files, still_files = [], [], []
+        wants_stills = any(int(st.get("frames", 2)) == 1 or float(st.get("image_fraction", 0)) > 0
+                           for st in self.cfg["train"]["stages"])
         for sh in ds["shards"]:
             mine = sorted((r for r in rows if r["shard"] == sh["file"]), key=lambda r: r["index"])
             with safe_open(str(ds_dir / sh["file"]), framework="pt") as f:
@@ -468,9 +498,26 @@ class Pipeline:
                              split_override=sh["split"])
             self.log(f"[latents] {name}: {s['clips']} clips, latent mean {s['latent_mean']:.3f} std {s['latent_std']:.3f}")
             for r in mine:
-                nr = {k: r[k] for k in ("id", "split", "caption", "style", "lang") if k in r}
-                nr.update(shard=name, index=r["index"])
+                nr = {k: r[k] for k in ("id", "split", "caption", "style", "lang", "effective_fps", "hold") if k in r}
+                nr.update(shard=name, index=r["index"], lat_t=1 + (stage["frames"] - 1) // vae.cfg.temporal_factor)
                 new_rows.append(nr)
+            if wants_stills:
+                # image-first DiT stages: T=1 latents of random frames of every clip (a causal VAE encodes a single
+                # frame to exactly one latent frame, the same as latent frame 0 of a clip that starts with it)
+                sname = "lat-still-" + sh["file"].split("shard-", 1)[1]
+                rng = np.random.default_rng(self.o.seed * 7919 + len(files))
+                pick = rng.integers(0, videos.shape[1], size=len(mine))
+                stills = torch.stack([videos[i, int(r): int(r) + 1] for i, r in enumerate(pick)])
+                s2 = encode_shard(None, out / sname, vae=vae, enc=enc, stage=dict(stage, frames=1), parent_sha=sh["sha256"],
+                                  vae_version=vsha, text_encoder_id=tsha, style_dropout=self.style_dropout(),
+                                  seed=self.o.seed, device=self.device, extra_meta={"shard_idx": len(files), "kind": "still"},
+                                  videos_override=stills, rows_override=mine, split_override=sh["split"])
+                for r in mine:
+                    nr = {k: r[k] for k in ("split", "caption", "style", "lang", "effective_fps", "hold") if k in r}
+                    nr.update(id=f"{r.get('id', r['index'])}:still", shard=sname, index=r["index"], lat_t=1, still=True)
+                    new_rows.append(nr)
+                still_files.append({"file": sname, "split": sh["split"], "clips": s2["clips"], "sha256": s2["sha256"],
+                                    "bytes": (out / sname).stat().st_size, "parent_shard_sha256": sh["sha256"]})
             files.append({"file": name, "split": sh["split"], "clips": s["clips"], "sha256": s["sha256"],
                           "bytes": (out / name).stat().st_size, "parent_shard_sha256": sh["sha256"]})
         mtext = "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in new_rows)
@@ -479,8 +526,10 @@ class Pipeline:
         info = {"format": LATENT_DS_FORMAT, "fingerprint": fp, "parent_fingerprint": ds["fingerprint"], "vae_version": vsha,
                 "text_encoder_id": tsha, "stage": stage, "latent_shift": 0.0, "latent_scale": 1.0, "scaled": True,
                 "clips": len(new_rows), "shards": files}
+        if still_files:
+            info["still_shards"] = still_files          # T=1 latents for the image stages (not part of "shards")
         (out / "dataset.json").write_text(json.dumps(info, indent=1, sort_keys=True), encoding="utf-8")
-        return {"files": [str(out / "dataset.json"), str(out / "manifest.jsonl")] + [str(out / f["file"]) for f in files],
+        return {"files": [str(out / "dataset.json"), str(out / "manifest.jsonl")] + [str(out / f["file"]) for f in files + still_files],
                 "dir": str(out), "fingerprint": fp, "stage": stage, "clips": len(new_rows)}
 
     def stage_dit(self) -> dict:
@@ -489,9 +538,10 @@ class Pipeline:
         lat = self.results["latents"]
         stage = lat["stage"]
         cfg = self.train_cfg(self.o.dit_steps)
-        cfg["train"]["stages"] = scale_stages(fit_stages(self.cfg["train"]["stages"], stage["h"], stage["w"], stage["frames"]),
+        cfg["train"]["stages"] = scale_stages(fit_stages(self.cfg["train"]["stages"], stage["h"], stage["w"], stage["frames"], self.vae_tf()),
                                               self.o.dit_steps)
-        self.log(f"[dit] stages {[(s['name'], s['height'], s['width'], s['frames'], s['steps']) for s in cfg['train']['stages']]}")
+        self.rescale_step_keys(cfg["train"], self.o.dit_steps / max(1, sum(int(x["steps"]) for x in self.cfg["train"]["stages"])))
+        self.log(f"[dit] stages {[(s['name'], s['height'], s['width'], s['frames'], s['steps'], s.get('image_fraction', 0)) for s in cfg['train']['stages']]}")
         torch.manual_seed(self.o.seed)
         net = build_dit(cfg)
         res = train_hd(cfg, lat["dir"], self.p("dit_run"), target="dit", text_encoder=self.load_text(), vae=self.load_vae(),
@@ -503,12 +553,15 @@ class Pipeline:
         net.cpu()
         w = self.p("dit_final", "dit.safetensors")
         w.parent.mkdir(parents=True, exist_ok=True)
-        save_file({k: v.detach().contiguous() for k, v in net.state_dict().items()}, str(w))
+        # the EMA weights are what gets exported when EMA is on (train.ema_decay > 0); otherwise the raw weights
+        state = res["export_state"] if res.get("export_state") else net.state_dict()
+        save_file({k: v.detach().contiguous() for k, v in state.items()}, str(w))
         hist = res["history"]
         k = max(1, min(10, len(hist) // 5))
         return {"files": [str(w)], "weights": str(w), "sha256": _sha_file(w), "params": res["params"],
                 "loss_first": sum(h["loss"] for h in hist[:k]) / k, "loss_last": sum(h["loss"] for h in hist[-k:]) / k,
-                "steps": res["step"]}
+                "steps": res["step"], "export_kind": res.get("export_kind", "raw"),
+                "skipped_steps": res.get("skipped_steps", 0)}
 
     def bundle_dir(self) -> Path:
         o = self.o
@@ -523,8 +576,11 @@ class Pipeline:
         from safetensors.torch import load_file
         from ..inference.hd_bundle import load_hd_bundle, write_hd_bundle
         cfg = copy.deepcopy(self.cfg)
-        ln = self.results["vae"]["latent_norm"]
-        cfg["vae"]["latent_shift"], cfg["vae"]["latent_scale"] = ln["latent_shift"], ln["latent_scale"]
+        # the calibrated VAE config (latent shift / scale, scalar or per-channel [C] vectors, hc-vae version) travels
+        # into the bundle; loss options that live in the vae section (edge_weight) stay as configured
+        from ..models.hd_config import VAE_TRAIN_KEYS
+        saved = json.loads((Path(self.results["vae"]["dir"]) / "hc_vae.json").read_text(encoding="utf-8"))["config"]
+        cfg["vae"] = {**saved, **{k: v for k, v in cfg["vae"].items() if k in VAE_TRAIN_KEYS}}
         out = self.bundle_dir()
         if out.exists():
             for q in ("model_version.json", "weights.safetensors", "vae.safetensors"):

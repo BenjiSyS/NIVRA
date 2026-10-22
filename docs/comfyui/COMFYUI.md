@@ -28,13 +28,13 @@ same bundle; the loader refuses a VAE whose SHA-256 differs from the one the mod
 
 ### Setting up the remote node (each person)
 
-1. Ask the Nivra administrator for an account with the **operator** role
-   (`bin/nivra admin create --username alice --role operator` on the controller).
+1. Ask the Nivra administrator for an invitation (a **member** account is enough to make videos)
+   (`bin/nivra admin invite` on the controller, or Studio → People).
 2. Sign in to Nivra Studio → **Settings → API tokens → Create token**, copy it once.
 3. Give it to ComfyUI **outside the workflow** (so shared workflows never contain it), either:
    * environment variable `NIVRA_TOKEN=nivra_pat_...` before starting ComfyUI, or
    * a text file `ComfyUI/user/nivra_token.txt` containing only the token.
-4. In the node, set `controller_url` to the Studio address (e.g. `https://studio.benjiserver.com`) and
+4. In the node, set `controller_url` to the Studio address (e.g. `https://studio.example.com`) and
    type a prompt. Load `examples/workflows/nivra_remote_network_api.json` for a ready-made graph.
 5. Revoke a token any time in Studio Settings; it stops working immediately.
 

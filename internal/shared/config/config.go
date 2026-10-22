@@ -57,6 +57,21 @@ type Controller struct {
 	StudioHosts          []string `json:"studio_hosts,omitempty"`
 	MaxDevicesPerProject int      `json:"max_devices_per_project"`
 	DBMaxConns           int      `json:"db_max_conns"`
+
+	// Nightly backup of the database (pg_dump) and the secrets directory into
+	// <data_dir>/backups. Set backup_enabled to false to switch it off.
+	BackupEnabled bool `json:"backup_enabled"`
+	// BackupRetain is how many backups to keep.
+	BackupRetain int `json:"backup_retain"`
+	// BackupHour is the local hour (0-23) after which the daily backup runs.
+	BackupHour int `json:"backup_hour"`
+	// PgDumpPath overrides the pg_dump executable (default: search PATH).
+	PgDumpPath string `json:"pg_dump_path,omitempty"`
+	// BackupDir overrides the backup folder (for example a USB disk).
+	BackupDir string `json:"backup_dir,omitempty"`
+	// BackupDockerContainer is the PostgreSQL container to run pg_dump in when
+	// the host has no pg_dump (the Raspberry Pi install uses "nivra-pg").
+	BackupDockerContainer string `json:"backup_docker_container"`
 }
 
 // Worker is the worker agent configuration.
@@ -68,6 +83,9 @@ type Worker struct {
 	DataDir      string `json:"data_dir"`
 	PythonPath   string `json:"python_path"`
 	AIPackageDir string `json:"ai_package_dir"`
+	// FFmpegPath is the ffmpeg executable, or a folder containing ffmpeg and ffprobe.
+	// Empty = find them on PATH or in the winget install folder.
+	FFmpegPath string `json:"ffmpeg_path,omitempty"`
 	// AllowInsecureHTTP permits plain HTTP to non-private controller addresses.
 	// Plain HTTP to loopback/private LAN addresses is always allowed.
 	AllowInsecureHTTP bool `json:"allow_insecure_http"`
@@ -95,6 +113,10 @@ func DefaultController() Controller {
 		CheckpointRetain:        5,
 		MaxDevicesPerProject:    1000,
 		DBMaxConns:              16,
+		BackupEnabled:           true,
+		BackupRetain:            7,
+		BackupHour:              3,
+		BackupDockerContainer:   "nivra-pg",
 	}
 }
 
@@ -145,6 +167,8 @@ func LoadController(path string) (Controller, error) {
 	envBool("NIVRA_TRUST_PROXY", &c.TrustProxyHeaders)
 	envBool("NIVRA_COOKIE_SECURE", &c.CookieSecure)
 	envInt("NIVRA_HEARTBEAT_SEC", &c.HeartbeatIntervalSec)
+	envBool("NIVRA_BACKUP_ENABLED", &c.BackupEnabled)
+	envInt("NIVRA_BACKUP_RETAIN", &c.BackupRetain)
 	if c.DatabaseURL == "" {
 		if v, err := readEnvFile(filepath.Join(c.DataDir, "secrets", "database.env"), "NIVRA_DATABASE_URL"); err == nil {
 			c.DatabaseURL = v
@@ -195,6 +219,12 @@ func (c Controller) Validate() error {
 	if c.MaxDevicesPerProject < 1 {
 		errs = append(errs, errors.New("max_devices_per_project must be >= 1"))
 	}
+	if c.BackupRetain < 1 || c.BackupRetain > 365 {
+		errs = append(errs, errors.New("backup_retain must be 1..365"))
+	}
+	if c.BackupHour < 0 || c.BackupHour > 23 {
+		errs = append(errs, errors.New("backup_hour must be 0..23"))
+	}
 	return errors.Join(errs...)
 }
 
@@ -209,6 +239,7 @@ func LoadWorker(path string) (Worker, error) {
 	envStr("NIVRA_DATA_DIR", &w.DataDir)
 	envStr("NIVRA_PYTHON", &w.PythonPath)
 	envStr("NIVRA_AI_DIR", &w.AIPackageDir)
+	envStr("NIVRA_FFMPEG", &w.FFmpegPath)
 	envBool("NIVRA_ALLOW_INSECURE_HTTP", &w.AllowInsecureHTTP)
 	return w, w.Validate()
 }

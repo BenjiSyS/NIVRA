@@ -15,13 +15,13 @@ Cloudflare Zero Trust → Networks → Tunnels → *(the Pi tunnel)* → Public 
 
 | Subdomain | Domain | Service | Purpose |
 |-----------|--------|---------|---------|
-| `api` | `benjiserver.com` | `http://127.0.0.1:8740` | Worker protocol + API |
-| `studio` | `benjiserver.com` | `http://127.0.0.1:8740` | Nivra Studio (admin) |
+| `api` | `example.com` | `http://127.0.0.1:8740` | Worker protocol + API |
+| `studio` | `example.com` | `http://127.0.0.1:8740` | Nivra Studio (admin) |
 
 Check first that neither hostname already has a DNS record — adding a public hostname creates a
 proxied CNAME and must not overwrite an existing record.
 
-Optional `workers.benjiserver.com` (onboarding docs) can point to the same service; `assets.` is
+Optional `workers.example.com` (onboarding docs) can point to the same service; `assets.` is
 not needed because artifacts are served by the API with Range support.
 
 ## 2. Controller settings for HTTPS behind the tunnel
@@ -30,7 +30,7 @@ In `config/controller.json` on the Pi:
 
 ```json
 {
-  "public_url": "https://api.benjiserver.com",
+  "public_url": "https://api.example.com",
   "cookie_secure": true,
   "trust_proxy_headers": true
 }
@@ -41,20 +41,20 @@ requests arriving from loopback (i.e. from `cloudflared`). Restart the controlle
 
 ## 3. Access separation
 
-* `studio.benjiserver.com` — recommended: a Cloudflare Access application (email one-time PIN or
+* `studio.example.com` — recommended: a Cloudflare Access application (email one-time PIN or
   SSO) **in addition to** Nivra's own login. Access protects the admin surface from the internet;
   Nivra still enforces roles and CSRF.
-* `api.benjiserver.com` — **no** Cloudflare Access policy (or a bypass policy), because workers
+* `api.example.com` — **no** Cloudflare Access policy (or a bypass policy), because workers
   authenticate with their own Ed25519 device keys and cannot complete interactive Access logins.
   Never hand out Cloudflare service tokens or administrator credentials to contributors.
 
 ## 4. Verify from outside the LAN
 
 ```bash
-curl -fsS https://api.benjiserver.com/api/v1/health
+curl -fsS https://api.example.com/api/v1/health
 ```
 
-Then enroll a worker with `https://api.benjiserver.com` as the controller URL. The worker refuses
+Then enroll a worker with `https://api.example.com` as the controller URL. The worker refuses
 plain HTTP to public hosts.
 
 ## 5. Health in Nivra Studio

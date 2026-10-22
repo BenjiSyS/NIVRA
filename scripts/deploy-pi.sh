@@ -1,21 +1,48 @@
 #!/usr/bin/env bash
-# Deploy the current source tree to a Raspberry Pi controller over SSH.
+# Deploy the current source tree to a Raspberry Pi (or other Linux arm64) controller over SSH.
 #
-#   PI_HOST=benji@192.168.1.142 scripts/deploy-pi.sh [--skip-build]
+#   NIVRA_PI_HOST=203.0.113.5 NIVRA_PI_USER=pi scripts/deploy-pi.sh [--skip-build]
+#   scripts/deploy-pi.sh --host 192.0.2.10 --user pi [--path Desktop/Nivra] [--skip-build]
+#
+# NIVRA_PI_HOST   address or SSH alias of the Pi (required)
+# NIVRA_PI_USER   Linux user on the Pi (required)
+# NIVRA_PI_PATH   install directory relative to the user's home (default Desktop/Nivra; must end in /Nivra)
+# NIVRA_PI_DATA   data directory relative to the user's home (default NivraData)
 #
 # Uses normal SSH host-key verification and key/agent authentication; it
 # never handles passwords. Steps: build linux/arm64 binary, package tracked
-# files, verify checksum remotely, back up the existing Desktop/Nivra, unpack
-# (keeping config/), record the deployed version. It does not start services.
+# files, verify checksum remotely, back up the existing install, unpack
+# (keeping config/),
+# record the deployed version. It does not start or restart the controller.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-PI_HOST="${PI_HOST:-benji@192.168.1.142}"
-REMOTE_DIR="${REMOTE_DIR:-Desktop/Nivra}"
-REMOTE_DATA="${REMOTE_DATA:-NivraData}"
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+PI_HOST_ARG="${NIVRA_PI_HOST:-}"; PI_USER_ARG="${NIVRA_PI_USER:-}"
+REMOTE_DIR="${NIVRA_PI_PATH:-Desktop/Nivra}"
+REMOTE_DATA="${NIVRA_PI_DATA:-NivraData}"
+SKIP_BUILD=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) shift; PI_HOST_ARG="${1:-}" ;;
+    --user) shift; PI_USER_ARG="${1:-}" ;;
+    --path) shift; REMOTE_DIR="${1:-}" ;;
+    --skip-build) SKIP_BUILD=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ -z "$PI_HOST_ARG" ] || [ -z "$PI_USER_ARG" ]; then
+  echo "error: set NIVRA_PI_HOST and NIVRA_PI_USER (or pass --host and --user)." >&2
+  usage >&2
+  exit 2
+fi
+PI_HOST="${PI_USER_ARG}@${PI_HOST_ARG}"
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
 SCP="scp -o BatchMode=yes -o StrictHostKeyChecking=yes"
 
-if [ "${1:-}" != "--skip-build" ]; then
+if [ "$SKIP_BUILD" -eq 0 ]; then
   # --skip-web: deploy never reinstalls web dependencies; build the web UI
   # separately (scripts/build.sh) when it changed.
   bash scripts/build.sh --skip-web --target linux/arm64
@@ -65,6 +92,8 @@ if [ -d "$DIR/config.keep" ]; then rm -rf "$DIR/config"; mv "$DIR/config.keep" "
 rm -rf "$TMP"
 chmod +x "$DIR/bin/nivra" "$DIR/install.sh" "$DIR/start.sh" "$DIR"/scripts/*.sh
 "$DIR/bin/nivra" version
+# The controller itself makes the nightly database + secrets backup (backup_enabled in config/controller.json);
+# it needs pg_dump (apt install postgresql-client). See docs/installation/BACKUP.md.
 echo "==> deployed to $DIR"
 EOF
 rm -rf "$STAGE"

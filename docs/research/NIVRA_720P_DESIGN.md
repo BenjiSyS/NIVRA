@@ -22,7 +22,7 @@ noise ──► Nivra DiT (rectified flow, 3D RoPE, cross-attention) ──► l
   denoising stage. **Chunked causal temporal decoding** and **spatial tiling with overlap blending**
   so decoding fits in 6 GB.
 * Losses: L1 + LPIPS-free perceptual proxy (original, no pretrained networks) + small KL + temporal
-  difference loss; optional adversarial loss later.
+  difference loss + edge loss (stylized) + a hinge patch-GAN switched on late (section 9).
 * Versioned config + compatibility metadata (latent shape, scaling/shift factors, causal flag).
 
 ## 3. Text encoders (pluggable interface)
@@ -115,3 +115,49 @@ from `ai/nivra/data/styles.py`, `realistic` last and never the default), `"defau
   open-vocabulary stylized content, so no prompt-adherence or quality number is produced.
 * **Not claimed**: nothing here has been trained on real stylized data; the tiny tests only show that tags, filters, losses and plumbing behave as
   specified. Output quality of trained models is unknown until training runs exist.
+
+## 9. 2026 improvement pass (from `docs/research/IMPROVEMENT_RESEARCH_2026.md`)
+
+All items are config-gated and backward compatible: a config without the new keys, and every bundle written before, loads and behaves as it did
+(`hd_config_sha` of old configs is unchanged; the old tiny bundle regenerates bit-identical latents). Operational detail and the per-config table are in
+`docs/training/TRAINING.md` (section "2026 improvement pass"). Versions: `nivra-hc-vae/2` (per-channel latent normalisation) and `nivra-dit/2`
+(`frame_cond` / `fps_cond`) are only produced when those features are used; `/1` files stay readable.
+
+* **VAE sharpness.** Hinge patch-GAN (small 3D discriminator, T=1 for images) from `vae_gan_start`, weight 0.05 x the VQGAN adaptive weight
+  `||dL_rec/dW|| / ||dL_gan/dW||` at the decoder's last layer (computed on the loss-scaled graph, 0 if non-finite); discriminator trained from scratch,
+  no licence issue. `edge_weight` defaults to 0.3 in stylized configs without an explicit value (the shipped ones set 0.5).
+* **VAE schedule** (Wan recipe, no pretrained weights): image autoencoder at T=1 -> causal-3D low-resolution short clips with ~20 % image batches ->
+  target-resolution fine-tune, GAN on in the last part. `train.vae_stages` carries it; `train-pipeline` scales it to `--vae-steps` (and scales
+  `vae_gan_start` the same way).
+* **Per-channel latent normalisation.** `[C]` shift / scale from encode statistics, stored in `hc_vae.json`, the safetensors metadata and the bundle
+  config; `to_scaled` / `from_scaled` accept both forms, so the encode job, the sampler and the continuation re-encode need no change. The hd config
+  hash ignores the calibration, so it does not change when statistics are filled in.
+* **Temporal factor 4 or 8** (`vae.temporal_factor`; alias for `temporal_down`). **Decision for `nivra_base`: 4x, agreeing with the report.**
+  Reasons: (1) Wan, HunyuanVideo, Open-Sora 2.0 and DC-AE-V all use 4x and only LTX uses 8x (with a denoising decoder Nivra does not have);
+  (2) the VAE cannot be changed after latents are encoded, so the asymmetric risk favours the safer factor: 8x spans 4 drawings of anime on twos
+  and loses fast cuts / 3D animation on ones; (3) at the base target the price is small: 256x448 x 17 frames goes from 14x8x3 = 336 to 14x8x5 = 560
+  tokens (attention is cheap there; `shift_base_tokens` was moved 336 -> 560 so the shift curve is unchanged for the same clip). **Medium and Large keep
+  8x**: at 720p x 8 s a 4x VAE doubles 28.5 k tokens to ~57 k, which full attention cannot afford on a 6 GB card (report item 15). No A/B reconstruction
+  comparison has been run (no GPU, no real data): the report's advice to measure PSNR / edge F1 at 4x vs 8x on 3D-animation and fast-action clips before
+  locking the VAE still stands, and either value is one config line (`temporal_factor`).
+* **DiT curriculum.** Image-first stage (`frames: 1`; stills from the same causal VAE: a one-frame input encodes to exactly latent frame 0), then joint
+  image + video stages (`image_fraction`, optional `buckets`). Per-resolution timestep shift was verified: `resolution_shift(tokens, base) =
+  clamp(sqrt(tokens/base), 1, 6)` with tokens = latent T x H x W, used identically by the trainer (per micro-batch, so a T=1 still gets shift 1)
+  and by inference (`HDPipeline`); Open-Sora 2.0 scales its shift with T x H x W the same way.
+* **SRA** (self-representation alignment, no external model): block `student_layer` of the online DiT at noise t is pulled (cosine, through a small MLP
+  projector) towards block `teacher_layer` of the EMA model at noise t x `t_ratio`. On by default for `nivra_base` (3 -> 8 of 12, weight 0.5, first
+  60 k steps). Costs one extra no-grad forward of the EMA model per micro-batch. **REPA** (DINOv2 features, Apache-2.0 weights) would be a licensed
+  opt-in teacher: the interface (`RepaHook`) and the config key exist, `enabled: true` is rejected, nothing is downloaded.
+* **Diffusion forcing + conditioning frames.** A fraction (0.25 for base) of DiT micro-batches uses an independent logit-normal timestep per latent
+  frame (the timestep embedding, adaLN modulation and gates become per-frame, same cost); for `frame_cond` models 15 % of batches also hold the first
+  and/or last latent frame(s) clean with t = 0 and a learned flag embedding, excluded from the loss. Inference imposes continuation overlaps and refine
+  anchors the same way (clean, masked) instead of re-noising them; older models fall back to the previous replacement scheme.
+* **fp16 on Turing.** fp32 islands (embedders, adaLN, norms, gates, optional attention logits, loss) and a dynamic loss scaler that skips and logs
+  overflow steps. Not yet run on a GPU.
+* **Anime frame holds.** Ingest detects the drawing rate per clip (`hold`, `effective_fps`); `fps_cond` models condition on it; optional re-sampling at
+  the drawing rate. OCR credit / subtitle filtering: not done (needs a new dependency).
+* **EMA.** `train.ema_decay` (with a (1+n)/(10+n) warm-up); the pipeline exports the EMA weights as the bundle's DiT when it is on (it is on in every
+  shipped config; `nivra_hd_tiny` uses 0.99, which only averages a handful of steps). Before this pass the pipeline had no EMA at all and exported the
+  raw weights.
+* **Not done from the report:** DC-AE-1.5 structured latent channels, denoising decoder, R1 penalty on the discriminator, register tokens, sandwich norm,
+  post-hoc EMA, int8 deltas, few-step distillation, block-linear attention.
